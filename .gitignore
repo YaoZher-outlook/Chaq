@@ -1,0 +1,16 @@
+node_modules/
+dist/
+out/
+release/
+.vite/
+.turbo/
+.cache/
+.electron-cache/
+.npm-cache/
+coverage/
+*.log
+.env
+.env.local
+*.db
+*.db-shm
+*.db-wal

@@ -1,0 +1,27 @@
+{
+  "name": "chaq",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop-first virtual skill chat app with a marketplace, distillation, model routing, and token billing.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "env:prepare": "node scripts/prepare-env.js",
+    "dev:server": "npm run dev -w @chaq/server",
+    "dev:desktop": "npm run dev -w @chaq/desktop",
+    "build": "npm run build -w @chaq/shared && npm run build -w @chaq/server && npm run build -w @chaq/desktop",
+    "typecheck": "npm run typecheck -w @chaq/shared && npm run typecheck -w @chaq/server && npm run typecheck -w @chaq/desktop",
+    "electron:install": "node scripts/install-electron.js",
+    "prisma:generate": "npm run prisma:generate -w @chaq/server",
+    "prisma:migrate": "npm run prisma:migrate -w @chaq/server",
+    "prisma:seed": "npm run prisma:seed -w @chaq/server"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20.11"
+  }
+}

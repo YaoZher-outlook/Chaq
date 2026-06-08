@@ -1,0 +1,300 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  USER
+  CREATOR
+  ADMIN
+}
+
+enum AuthSessionStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum SkillVisibility {
+  PRIVATE
+  PUBLIC
+}
+
+enum SkillSourceKind {
+  MANUAL
+  WECHAT
+  QQ
+  TXT
+  CSV
+  JSON
+  HTML
+  MARKDOWN
+}
+
+enum DistillationStatus {
+  DRAFT
+  CONFIRMED
+  DISCARDED
+}
+
+enum ReactionTarget {
+  SKILL
+  COMMENT
+}
+
+enum ReactionValue {
+  UP
+  DOWN
+}
+
+enum TokenTransactionKind {
+  RECHARGE
+  CLOUD_MODEL_USAGE
+  REFUND
+  ADMIN_ADJUSTMENT
+}
+
+enum ProviderKind {
+  OPENAI
+  ANTHROPIC
+  GOOGLE
+  DEEPSEEK
+  DASHSCOPE
+  ZHIPU
+  OLLAMA
+  CUSTOM
+}
+
+model User {
+  id                String             @id
+  username          String             @unique
+  passwordHash      String             @default("")
+  displayName       String
+  avatarUrl         String?
+  role              UserRole           @default(USER)
+  tokenBalance      Int                @default(10000)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  skills            Skill[]
+  sources           SkillSource[]
+  marketplaceSkills MarketplaceSkill[]
+  comments          Comment[]
+  reactions         Reaction[]
+  favorites         Favorite[]
+  tokenTransactions TokenTransaction[]
+  modelCallLogs     ModelCallLog[]
+  sessions          AuthSession[]
+  settings          UserSetting?
+}
+
+model AuthSession {
+  id        String            @id @default(cuid())
+  userId    String
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String            @unique
+  status    AuthSessionStatus @default(ACTIVE)
+  expiresAt DateTime
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model UserSetting {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  language          String   @default("zh")
+  theme             String   @default("dark")
+  backgroundUrl     String?
+  backgroundOpacity Float    @default(0.42)
+  windowOpacity     Float    @default(1)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+model Skill {
+  id              String              @id @default(cuid())
+  ownerId         String
+  owner           User                @relation(fields: [ownerId], references: [id])
+  visibility      SkillVisibility     @default(PRIVATE)
+  name            String
+  avatarUrl       String?
+  description     String
+  persona         String
+  tone            String
+  knowledge       String              @default("")
+  boundaries      String              @default("")
+  examples        Json
+  tags            String[]
+  activeVersionId String?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  versions        SkillVersion[]
+  sources         SkillSource[]
+  marketplace     MarketplaceSkill?
+
+  @@index([ownerId])
+}
+
+model SkillVersion {
+  id          String             @id @default(cuid())
+  skillId     String
+  skill       Skill              @relation(fields: [skillId], references: [id], onDelete: Cascade)
+  version     Int
+  sourceKind  SkillSourceKind
+  status      DistillationStatus @default(CONFIRMED)
+  name        String
+  avatarUrl   String?
+  description String
+  persona     String
+  tone        String
+  knowledge   String             @default("")
+  boundaries  String             @default("")
+  examples    Json
+  tags        String[]
+  createdAt   DateTime           @default(now())
+
+  @@unique([skillId, version])
+  @@index([skillId])
+}
+
+model SkillSource {
+  id           String          @id @default(cuid())
+  userId       String
+  user         User            @relation(fields: [userId], references: [id])
+  skillId      String?
+  skill        Skill?          @relation(fields: [skillId], references: [id], onDelete: SetNull)
+  kind         SkillSourceKind
+  fileName     String
+  messageCount Int
+  rawPreview   Json?
+  createdAt    DateTime        @default(now())
+
+  @@index([userId])
+  @@index([skillId])
+}
+
+model MarketplaceSkill {
+  id            String     @id @default(cuid())
+  skillId       String     @unique
+  skill         Skill      @relation(fields: [skillId], references: [id], onDelete: Cascade)
+  versionId     String
+  publisherId   String
+  publisher     User       @relation(fields: [publisherId], references: [id])
+  name          String
+  description   String
+  avatarUrl     String?
+  persona       String
+  tone          String
+  knowledge     String     @default("")
+  boundaries    String     @default("")
+  examples      Json
+  tags          String[]
+  upvotes       Int        @default(0)
+  downvotes     Int        @default(0)
+  favorites     Int        @default(0)
+  importCount   Int        @default(0)
+  commentCount  Int        @default(0)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  comments      Comment[]
+  favoritesRows Favorite[]
+
+  @@index([publisherId])
+  @@index([createdAt])
+}
+
+model Comment {
+  id                 String           @id @default(cuid())
+  marketplaceSkillId String
+  marketplaceSkill   MarketplaceSkill @relation(fields: [marketplaceSkillId], references: [id], onDelete: Cascade)
+  userId             String
+  user               User             @relation(fields: [userId], references: [id])
+  content            String
+  upvotes            Int              @default(0)
+  downvotes          Int              @default(0)
+  deletedAt          DateTime?
+  createdAt          DateTime         @default(now())
+
+  @@index([marketplaceSkillId])
+  @@index([userId])
+}
+
+model Reaction {
+  id        String         @id @default(cuid())
+  userId    String
+  user      User           @relation(fields: [userId], references: [id])
+  target    ReactionTarget
+  targetId  String
+  value     ReactionValue
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  @@unique([userId, target, targetId])
+  @@index([target, targetId])
+}
+
+model Favorite {
+  id                 String           @id @default(cuid())
+  userId             String
+  user               User             @relation(fields: [userId], references: [id])
+  marketplaceSkillId String
+  marketplaceSkill   MarketplaceSkill @relation(fields: [marketplaceSkillId], references: [id], onDelete: Cascade)
+  createdAt          DateTime         @default(now())
+
+  @@unique([userId, marketplaceSkillId])
+  @@index([marketplaceSkillId])
+}
+
+model TokenTransaction {
+  id           String               @id @default(cuid())
+  userId       String
+  user         User                 @relation(fields: [userId], references: [id])
+  kind         TokenTransactionKind
+  amount       Int
+  balanceAfter Int
+  note         String?
+  metadata     Json?
+  createdAt    DateTime             @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model ModelProviderConfig {
+  id                   String       @id @default(cuid())
+  kind                 ProviderKind
+  name                 String
+  baseUrl              String
+  apiKeyCiphertext     String
+  models               Json
+  enabled              Boolean      @default(true)
+  promptTokenPrice     Float        @default(0)
+  completionTokenPrice Float        @default(0)
+  contextWindow        Int
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+  callLogs             ModelCallLog[]
+}
+
+model ModelCallLog {
+  id               String               @id @default(cuid())
+  userId           String
+  user             User                 @relation(fields: [userId], references: [id])
+  providerId       String?
+  provider         ModelProviderConfig? @relation(fields: [providerId], references: [id], onDelete: SetNull)
+  model            String
+  promptTokens     Int
+  completionTokens Int
+  chargedTokens    Int
+  success          Boolean
+  error            String?
+  createdAt        DateTime             @default(now())
+
+  @@index([userId, createdAt])
+  @@index([providerId])
+}
