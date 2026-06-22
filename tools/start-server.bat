@@ -5,7 +5,11 @@ chcp 65001 >nul
 set "ROOT=%~dp0.."
 cd /d "%ROOT%"
 
-echo [Chaq] Starting API server...
+echo [Chaq] Starting API server and Agent worker...
+echo [Chaq] Local environment files live in E:\Environment\Chaq
+
+set "npm_config_electron_mirror="
+set "npm_config_electron_config_cache="
 
 where node >nul 2>nul
 if errorlevel 1 (
@@ -24,6 +28,10 @@ if errorlevel 1 (
 call npm.cmd run env:prepare
 if errorlevel 1 goto :fail
 
+for /f "usebackq delims=" %%A in (`node scripts\local-env-cmd.js`) do %%A
+if errorlevel 1 goto :fail
+echo [Chaq] Loaded server env from %CHAQ_ENV_FILE%
+
 if not exist "apps\server\.env" (
   echo [Chaq] apps\server\.env not found. Creating it from apps\server\.env.example...
   copy "apps\server\.env.example" "apps\server\.env" >nul
@@ -35,26 +43,23 @@ if not exist "node_modules" (
   if errorlevel 1 goto :fail
 )
 
-where docker >nul 2>nul
-if errorlevel 1 (
-  echo [WARN] Docker was not found. Make sure PostgreSQL and Redis are already running.
-  call :clear_errorlevel
-) else (
-  echo [Chaq] Starting PostgreSQL and Redis with Docker Compose...
-  docker compose up -d
-  if errorlevel 1 (
-    echo [WARN] Docker Compose did not start successfully. Continuing in case services already exist.
-    call :clear_errorlevel
-  )
+echo [Chaq] Starting local PostgreSQL and Docker Redis...
+call npm.cmd run infra:local
+if errorlevel 1 goto :fail
+
+set "NEED_PRISMA_GENERATE=0"
+if "%FORCE_PRISMA_GENERATE%"=="1" set "NEED_PRISMA_GENERATE=1"
+if not exist "node_modules\.prisma\client\index.js" set "NEED_PRISMA_GENERATE=1"
+if exist "node_modules\.prisma\client\index.js" (
+  powershell.exe -NoProfile -Command "if ((Get-Item 'apps\server\prisma\schema.prisma').LastWriteTimeUtc -gt (Get-Item 'node_modules\.prisma\client\index.js').LastWriteTimeUtc) { exit 1 }"
+  if errorlevel 1 set "NEED_PRISMA_GENERATE=1"
 )
 
-if "%FORCE_PRISMA_GENERATE%"=="1" (
+if "%NEED_PRISMA_GENERATE%"=="1" (
   call :generate_prisma
-) else if exist "node_modules\.prisma\client\index.js" (
-  echo [Chaq] Prisma Client already exists. Skipping generate to avoid locked Prisma DLL files on Windows.
-  call :clear_errorlevel
 ) else (
-  call :generate_prisma
+  echo [Chaq] Prisma Client matches the current schema.
+  call :clear_errorlevel
 )
 if errorlevel 1 goto :fail
 
@@ -62,13 +67,15 @@ echo [Chaq] Applying existing database migrations...
 call npm.cmd exec -w @chaq/server -- prisma migrate deploy
 if errorlevel 1 goto :fail
 
-call npm.cmd run prisma:seed
-if errorlevel 1 goto :fail
+echo [Chaq] Demo seed data is manual. Run "npm.cmd run prisma:seed" once if you need admin/creator/demo accounts.
 
-echo [Chaq] API server will listen on http://localhost:4537/api
+echo [Chaq] API will listen on http://localhost:24537/api and the Agent worker will run beside it.
 call npm.cmd run dev:server
 if errorlevel 1 goto :fail
 
+exit /b 0
+
+:clear_errorlevel
 exit /b 0
 
 :fail
@@ -80,13 +87,7 @@ exit /b 1
 echo [Chaq] Generating Prisma Client...
 call npm.cmd run prisma:generate
 if errorlevel 1 (
-  if exist "node_modules\.prisma\client\index.js" (
-    echo [WARN] Prisma generate failed, but an existing Prisma Client was found. Continuing.
-    exit /b 0
-  )
+  echo [ERROR] Prisma Client generation failed. Close stale Chaq Node/Electron processes and retry.
   exit /b 1
 )
-exit /b 0
-
-:clear_errorlevel
 exit /b 0

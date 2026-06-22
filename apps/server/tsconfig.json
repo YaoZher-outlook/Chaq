@@ -5,12 +5,13 @@
     "moduleResolution": "Node",
     "outDir": "dist",
     "rootDir": ".",
+    "baseUrl": ".",
     "isolatedModules": false,
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
     "types": ["node"],
     "paths": {
-      "@chaq/shared": ["../../packages/shared/src/index.ts"]
+      "@chaq/shared": ["../../packages/shared/dist/index.d.ts"]
     }
   },
   "include": ["src/**/*.ts", "prisma/**/*.ts"]

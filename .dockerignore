@@ -1,0 +1,14 @@
+.git
+.codex
+.agents
+.electron-cache
+.npm-cache
+node_modules
+apps/desktop/out
+apps/desktop/release
+apps/server/dist
+packages/shared/dist
+*.log
+.env
+.env.*
+!.env.production.example

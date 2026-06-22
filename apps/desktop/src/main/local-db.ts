@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import initSqlJs, { Database } from "sql.js";
 import type {
   ChatMessage,
+  SkillAutoMessageSettings,
   SkillDraft,
   SkillSourceKind,
   SkillSummary,
@@ -44,12 +45,26 @@ type MessageRow = {
 
 type ModelConfigRow = {
   id: string;
+  user_id: string;
   kind: UserModelConfigPublic["kind"];
   name: string;
   base_url: string;
   api_key_ciphertext: string;
   default_model: string;
   created_at: string;
+  updated_at: string;
+};
+
+type SkillAutoSettingsRow = {
+  skill_id: string;
+  enabled: number;
+  mode: SkillAutoMessageSettings["mode"];
+  fixed_period: SkillAutoMessageSettings["fixedPeriod"];
+  fixed_count: number;
+  random_token_limit: number | null;
+  random_unlimited: number;
+  do_not_disturb: number;
+  last_synced_at: string | null;
   updated_at: string;
 };
 
@@ -78,9 +93,9 @@ export class LocalDatabase {
     return row ? this.toSkill(row) : null;
   }
 
-  createSkill(skill: SkillDraft, sourceKind: SkillSourceKind = "manual"): SkillSummary {
+  createSkill(skill: SkillDraft, sourceKind: SkillSourceKind = "manual", id?: string): SkillSummary {
     const now = new Date().toISOString();
-    const skillId = randomUUID();
+    const skillId = id || randomUUID();
     const versionId = randomUUID();
     this.transaction(() => {
       this.run(
@@ -107,6 +122,43 @@ export class LocalDatabase {
       this.insertVersion(versionId, skillId, 1, sourceKind, "confirmed", skill, now);
     });
     return this.getSkill(skillId)!;
+  }
+
+  getSkillAutoMessageSettings(skillId: string): SkillAutoMessageSettings {
+    const row = this.get<SkillAutoSettingsRow>("select * from skill_auto_message_settings where skill_id = ?", [skillId]);
+    return row ? this.toAutoSettings(row) : defaultAutoSettings(skillId);
+  }
+
+  saveSkillAutoMessageSettings(input: SkillAutoMessageSettings): SkillAutoMessageSettings {
+    const updatedAt = new Date().toISOString();
+    this.run(
+      `insert into skill_auto_message_settings (
+        skill_id, enabled, mode, fixed_period, fixed_count, random_token_limit,
+        random_unlimited, do_not_disturb, last_synced_at, updated_at
+      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      on conflict(skill_id) do update set
+        enabled = excluded.enabled,
+        mode = excluded.mode,
+        fixed_period = excluded.fixed_period,
+        fixed_count = excluded.fixed_count,
+        random_token_limit = excluded.random_token_limit,
+        random_unlimited = excluded.random_unlimited,
+        do_not_disturb = excluded.do_not_disturb,
+        last_synced_at = excluded.last_synced_at,
+        updated_at = excluded.updated_at`
+    , [
+      input.skillId,
+      input.enabled ? 1 : 0,
+      input.mode,
+      input.fixedPeriod,
+      input.fixedCount,
+      input.randomTokenLimit ?? null,
+      input.randomUnlimited ? 1 : 0,
+      input.doNotDisturb ? 1 : 0,
+      input.lastSyncedAt ?? null,
+      updatedAt
+    ]);
+    return this.getSkillAutoMessageSettings(input.skillId);
   }
 
   updateSkill(id: string, skill: SkillDraft, sourceKind: SkillSourceKind = "manual"): SkillSummary {
@@ -141,6 +193,10 @@ export class LocalDatabase {
       this.insertVersion(versionId, id, version + 1, sourceKind, "confirmed", skill, now);
     });
     return this.getSkill(id)!;
+  }
+
+  deleteSkill(id: string): void {
+    this.run("delete from skills where id = ?", [id]);
   }
 
   listVersions(skillId: string): SkillVersionSnapshot[] {
@@ -196,6 +252,10 @@ export class LocalDatabase {
     return message;
   }
 
+  clearMessages(skillId: string): void {
+    this.run("delete from messages where skill_id = ?", [skillId]);
+  }
+
   saveImport(input: {
     sourceKind: SkillSourceKind;
     fileName: string;
@@ -218,9 +278,10 @@ export class LocalDatabase {
     return row;
   }
 
-  listUserModelConfigs(): UserModelConfigPublic[] {
+  listUserModelConfigs(userId = "local"): UserModelConfigPublic[] {
     const rows = this.all<Omit<ModelConfigRow, "api_key_ciphertext">>(
-      "select id, kind, name, base_url, default_model, created_at, updated_at from user_model_configs order by updated_at desc"
+      "select id, user_id, kind, name, base_url, default_model, created_at, updated_at from user_model_configs where user_id = ? order by updated_at desc",
+      [userId]
     );
     return rows.map((row) => ({
       id: row.id,
@@ -234,6 +295,7 @@ export class LocalDatabase {
   }
 
   saveUserModelConfig(input: {
+    userId?: string;
     id?: string;
     kind: UserModelConfigPublic["kind"];
     name: string;
@@ -243,27 +305,29 @@ export class LocalDatabase {
   }): UserModelConfigPublic {
     const now = new Date().toISOString();
     const id = input.id || randomUUID();
+    const userId = input.userId || "local";
     const ciphertext = this.codec.encrypt(input.apiKey);
     this.run(
-      `insert into user_model_configs (id, kind, name, base_url, api_key_ciphertext, default_model, created_at, updated_at)
-       values (?, ?, ?, ?, ?, ?, ?, ?)
+      `insert into user_model_configs (id, user_id, kind, name, base_url, api_key_ciphertext, default_model, created_at, updated_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?)
        on conflict(id) do update set
+         user_id = excluded.user_id,
          kind = excluded.kind,
          name = excluded.name,
          base_url = excluded.base_url,
          api_key_ciphertext = excluded.api_key_ciphertext,
          default_model = excluded.default_model,
          updated_at = excluded.updated_at`
-    , [id, input.kind, input.name, input.baseUrl.replace(/\/$/, ""), ciphertext, input.defaultModel, now, now]);
-    return this.listUserModelConfigs().find((config) => config.id === id)!;
+    , [id, userId, input.kind, input.name, input.baseUrl.replace(/\/$/, ""), ciphertext, input.defaultModel, now, now]);
+    return this.listUserModelConfigs(userId).find((config) => config.id === id)!;
   }
 
-  deleteUserModelConfig(id: string): void {
-    this.run("delete from user_model_configs where id = ?", [id]);
+  deleteUserModelConfig(id: string, userId = "local"): void {
+    this.run("delete from user_model_configs where id = ? and user_id = ?", [id, userId]);
   }
 
-  getSecretModelConfig(id: string): SecretModelConfig {
-    const row = this.get<ModelConfigRow>("select * from user_model_configs where id = ?", [id]);
+  getSecretModelConfig(id: string, userId = "local"): SecretModelConfig {
+    const row = this.get<ModelConfigRow>("select * from user_model_configs where id = ? and user_id = ?", [id, userId]);
     if (!row) {
       throw new Error("User model config not found.");
     }
@@ -339,6 +403,7 @@ export class LocalDatabase {
 
       create table if not exists user_model_configs (
         id text primary key,
+        user_id text not null default 'local',
         kind text not null,
         name text not null,
         base_url text not null,
@@ -348,9 +413,28 @@ export class LocalDatabase {
         updated_at text not null
       );
 
+      create table if not exists skill_auto_message_settings (
+        skill_id text primary key references skills(id) on delete cascade,
+        enabled integer not null default 0,
+        mode text not null default 'fixed',
+        fixed_period text not null default 'day',
+        fixed_count integer not null default 1,
+        random_token_limit integer,
+        random_unlimited integer not null default 0,
+        do_not_disturb integer not null default 0,
+        last_synced_at text,
+        updated_at text not null
+      );
+
       create index if not exists idx_messages_skill on messages(skill_id, created_at);
       create index if not exists idx_versions_skill on skill_versions(skill_id, version);
     `);
+    try {
+      this.run("alter table user_model_configs add column user_id text not null default 'local'");
+    } catch {
+      // Existing local databases already have this column.
+    }
+    this.run("create index if not exists idx_user_model_configs_user on user_model_configs(user_id, updated_at)");
     this.persist();
   }
 
@@ -408,6 +492,21 @@ export class LocalDatabase {
     };
   }
 
+  private toAutoSettings(row: SkillAutoSettingsRow): SkillAutoMessageSettings {
+    return {
+      skillId: row.skill_id,
+      enabled: Boolean(row.enabled),
+      mode: row.mode,
+      fixedPeriod: row.fixed_period,
+      fixedCount: row.fixed_count,
+      randomTokenLimit: row.random_token_limit,
+      randomUnlimited: Boolean(row.random_unlimited),
+      doNotDisturb: Boolean(row.do_not_disturb),
+      lastSyncedAt: row.last_synced_at,
+      updatedAt: row.updated_at
+    };
+  }
+
   private all<T>(sql: string, params: unknown[] = []): T[] {
     const stmt = this.db.prepare(sql);
     try {
@@ -456,4 +555,19 @@ function safeJson<T>(value: string, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function defaultAutoSettings(skillId: string): SkillAutoMessageSettings {
+  return {
+    skillId,
+    enabled: false,
+    mode: "fixed",
+    fixedPeriod: "day",
+    fixedCount: 1,
+    randomTokenLimit: 1000,
+    randomUnlimited: false,
+    doNotDisturb: false,
+    lastSyncedAt: null,
+    updatedAt: new Date().toISOString()
+  };
 }

@@ -12,79 +12,98 @@ if (existsSync(envPath)) {
   }
 }
 
+if ((process.env.NODE_ENV ?? "").toLowerCase() === "production") {
+  throw new Error("Refusing to seed demo data while NODE_ENV=production. Run migrations only in production.");
+}
+
 const prisma = new PrismaClient();
 
-async function main(): Promise<void> {
-  const adminId = process.env.DEMO_ADMIN_USER_ID ?? "admin-local";
-  const users = [
-    {
-      id: adminId,
-      username: "admin",
-      displayName: "Chaq 管理员",
-      role: "ADMIN" as const,
-      avatarUrl: "/avatars/admin.png",
-      tokenBalance: 100000
-    },
-    {
-      id: "creator-local",
-      username: "creator",
-      displayName: "Skill 创作者",
-      role: "CREATOR" as const,
-      avatarUrl: "/avatars/creator.png",
-      tokenBalance: 50000
-    },
-    {
-      id: "user-local",
-      username: "demo",
-      displayName: "Chaq 用户",
-      role: "USER" as const,
-      avatarUrl: "/avatars/user.png",
-      tokenBalance: 10000
-    }
-  ];
+const defaultSettings = {
+  language: "zh",
+  theme: "dark",
+  backgroundUrl: "/assets/chaq-cover.png",
+  backgroundOpacity: 0.42,
+  windowOpacity: 1,
+  notificationSound: true,
+  iconFlash: true,
+  localChatDataPath: "E:\\Environment\\Chaq\\user-data",
+  fileStoragePath: "E:\\Environment\\Chaq\\files"
+};
 
-  for (const user of users) {
-    await prisma.user.upsert({
-      where: { id: user.id },
-      create: {
+const demoUsers = [
+  {
+    id: process.env.DEMO_ADMIN_USER_ID ?? "admin-local",
+    username: "admin",
+    displayName: "Chaq Admin",
+    role: "ADMIN" as const,
+    avatarUrl: "/avatars/admin.png",
+    tokenBalance: 100000
+  },
+  {
+    id: "creator-local",
+    username: "creator",
+    displayName: "Skill Creator",
+    role: "CREATOR" as const,
+    avatarUrl: "/avatars/creator.png",
+    tokenBalance: 50000
+  },
+  {
+    id: "user-local",
+    username: "demo",
+    displayName: "Chaq User",
+    role: "USER" as const,
+    avatarUrl: "/avatars/user.png",
+    tokenBalance: 10000
+  }
+];
+
+async function ensureDemoUser(user: (typeof demoUsers)[number]): Promise<void> {
+  const existingUser = await prisma.user.findFirst({
+    where: {
+      OR: [
+        { id: user.id },
+        { username: user.username }
+      ]
+    },
+    select: { id: true, username: true }
+  });
+
+  if (!existingUser) {
+    await prisma.user.create({
+      data: {
         ...user,
         passwordHash: demoPasswordHash,
-        settings: {
-          create: {
-            language: "zh",
-            theme: "dark",
-            backgroundUrl: "/assets/chaq-cover.png",
-            backgroundOpacity: 0.42,
-            windowOpacity: 1
-          }
-        }
-      },
-      update: {
-        username: user.username,
-        displayName: user.displayName,
-        role: user.role,
-        avatarUrl: user.avatarUrl,
-        passwordHash: demoPasswordHash,
-        tokenBalance: user.tokenBalance
+        settings: { create: defaultSettings as any }
       }
     });
-    await prisma.userSetting.upsert({
-      where: { userId: user.id },
-      create: {
-        userId: user.id,
-        language: "zh",
-        theme: "dark",
-        backgroundUrl: "/assets/chaq-cover.png",
-        backgroundOpacity: 0.42,
-        windowOpacity: 1
-      },
-      update: {}
-    });
+    console.log(`[seed] Created demo user ${user.username}.`);
+    return;
   }
 
-  await prisma.modelProviderConfig.upsert({
-    where: { id: "demo-openai-compatible" },
+  await prisma.userSetting.upsert({
+    where: { userId: existingUser.id },
     create: {
+      userId: existingUser.id,
+      ...(defaultSettings as any)
+    },
+    update: {}
+  });
+  console.log(`[seed] Demo user ${existingUser.username} already exists; leaving fields unchanged.`);
+}
+
+async function ensureDemoProvider(): Promise<void> {
+  const existingProvider = await prisma.modelProviderConfig.findUnique({
+    where: { id: "demo-openai-compatible" },
+    select: { id: true }
+  });
+
+  if (existingProvider) {
+    console.log("[seed] Demo provider already exists; leaving fields unchanged.");
+    return;
+  }
+
+  await prisma.modelProviderConfig.create({
+    data: {
       id: "demo-openai-compatible",
       kind: "OPENAI",
       name: "Demo OpenAI Compatible",
@@ -97,9 +116,17 @@ async function main(): Promise<void> {
       promptTokenPrice: 0.001,
       completionTokenPrice: 0.004,
       contextWindow: 128000
-    },
-    update: {}
+    }
   });
+  console.log("[seed] Created demo provider.");
+}
+
+async function main(): Promise<void> {
+  for (const user of demoUsers) {
+    await ensureDemoUser(user);
+  }
+
+  await ensureDemoProvider();
 }
 
 main()

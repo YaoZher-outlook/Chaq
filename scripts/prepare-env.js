@@ -1,11 +1,82 @@
 const fs = require("node:fs");
-const { chaqEnvironmentRoot, electronCache, npmCache, userData } = require("./env-paths");
+const {
+  chaqEnvironmentRoot,
+  electronCache,
+  npmCache,
+  postgresData,
+  runtimeCache,
+  serverEnv,
+  userData
+} = require("./env-paths");
 
-for (const dir of [chaqEnvironmentRoot, electronCache, npmCache, userData]) {
+const requiredEnv = {
+  NODE_ENV: "development",
+  DATABASE_URL: "postgresql://chaq:chaq@127.0.0.1:45432/chaq?schema=public",
+  REDIS_URL: "redis://127.0.0.1:46379",
+  SERVER_PORT: "24537",
+  SERVER_HOST: "127.0.0.1",
+  CLIENT_ORIGIN: "http://localhost:27337",
+  DEMO_ADMIN_USER_ID: "admin-local",
+  AGENT_WORKER_CONCURRENCY: "4",
+  MODEL_REQUEST_TIMEOUT_MS: "60000",
+  CHAQ_PG_BIN: "E:\\Environment\\pgsql\\bin",
+  CHAQ_PG_DATA_DIR: postgresData,
+  CHAQ_PG_USER: "chaq",
+  CHAQ_PG_PASSWORD: "chaq",
+  CHAQ_PG_DATABASE: "chaq",
+  CHAQ_PG_PORT: "45432",
+  CHAQ_PG_SERVICE_NAME: "ChaqPostgreSQL",
+  CHAQ_REDIS_PORT: "46379"
+};
+
+for (const dir of [chaqEnvironmentRoot, electronCache, runtimeCache, npmCache, postgresData, userData]) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
+function formatEnvValue(value) {
+  return value.includes(" ") ? `"${value}"` : value;
+}
+
+function writeServerEnv() {
+  const existingLines = fs.existsSync(serverEnv) ? fs.readFileSync(serverEnv, "utf8").split(/\r?\n/) : [];
+  const seen = new Set();
+  const nextLines = [];
+
+  for (const line of existingLines) {
+    const trimmed = line.trim();
+    const index = trimmed.indexOf("=");
+    if (!trimmed || trimmed.startsWith("#") || index < 1) {
+      nextLines.push(line);
+      continue;
+    }
+
+    const key = trimmed.slice(0, index).trim();
+    if (key in requiredEnv) {
+      nextLines.push(`${key}=${formatEnvValue(requiredEnv[key])}`);
+      seen.add(key);
+    } else if (key !== "CHAQ_REDIS_SERVER") {
+      nextLines.push(line);
+    }
+  }
+
+  if (nextLines.length === 0) {
+    nextLines.push("# Chaq local development environment");
+  }
+
+  for (const [key, value] of Object.entries(requiredEnv)) {
+    if (!seen.has(key)) {
+      nextLines.push(`${key}=${formatEnvValue(value)}`);
+    }
+  }
+
+  fs.writeFileSync(serverEnv, `${nextLines.filter((line, index, lines) => line.trim() || index < lines.length - 1).join("\r\n")}\r\n`, "utf8");
+}
+
+writeServerEnv();
+
 console.log(`Chaq environment root: ${chaqEnvironmentRoot}`);
 console.log(`Electron cache: ${electronCache}`);
+console.log(`Electron runtime cache: ${runtimeCache}`);
 console.log(`npm cache: ${npmCache}`);
 console.log(`Electron user data: ${userData}`);
+console.log(`Server env: ${serverEnv}`);

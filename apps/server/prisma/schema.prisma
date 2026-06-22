@@ -53,6 +53,7 @@ enum ReactionValue {
 enum TokenTransactionKind {
   RECHARGE
   CLOUD_MODEL_USAGE
+  AGENT_MODEL_USAGE
   REFUND
   ADMIN_ADJUSTMENT
 }
@@ -68,26 +69,195 @@ enum ProviderKind {
   CUSTOM
 }
 
+enum AgentStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+enum AgentAutonomyMode {
+  MANUAL
+  COPILOT
+  AUTONOMOUS
+}
+
+enum AgentVisibility {
+  PRIVATE
+  UNLISTED
+  PUBLIC
+}
+
+enum AgentPostVisibility {
+  PUBLIC
+  RELATIONSHIPS
+  PRIVATE
+}
+
+enum AgentPostReactionKind {
+  LIKE
+}
+
+enum AgentMemoryKind {
+  EPISODIC
+  SEMANTIC
+  PROCEDURAL
+  SOCIAL
+  REFLECTION
+}
+
+enum AgentGoalStatus {
+  PENDING
+  ACTIVE
+  BLOCKED
+  COMPLETED
+  CANCELLED
+}
+
+enum AgentTaskStatus {
+  PENDING
+  RUNNING
+  WAITING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum AgentRunTrigger {
+  USER_MESSAGE
+  AGENT_MESSAGE
+  SCHEDULED
+  GOAL
+  EVENT
+  MANUAL
+}
+
+enum AgentRunStatus {
+  QUEUED
+  RUNNING
+  WAITING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum ConversationKind {
+  HUMAN_AGENT
+  AGENT_AGENT
+  GROUP
+  SYSTEM
+}
+
+enum ParticipantKind {
+  USER
+  AGENT
+  SYSTEM
+}
+
+enum ConversationMessageKind {
+  TEXT
+  SYSTEM
+  ACTION
+  SUMMARY
+}
+
+enum MessageDeliveryStatus {
+  PENDING
+  DELIVERED
+  READ
+  FAILED
+}
+
+enum AgentEventKind {
+  OBSERVATION
+  THOUGHT
+  PLAN
+  ACTION
+  MESSAGE
+  MEMORY
+  GOAL
+  TASK
+  RELATIONSHIP
+  SYSTEM
+  ERROR
+}
+
+enum RelationshipKind {
+  OWNER
+  FAMILY
+  FRIEND
+  PARTNER
+  COLLEAGUE
+  ACQUAINTANCE
+  RIVAL
+  MENTOR
+  MENTEE
+  CUSTOM
+}
+
+enum AgentToolKind {
+  BUILTIN
+  HTTP
+}
+
+enum ToolRiskLevel {
+  SAFE
+  CONFIRM
+  EXTERNAL
+}
+
+enum KnowledgeSourceKind {
+  NOTE
+  FILE
+  CHAT_IMPORT
+  URL
+  SKILL_MIGRATION
+}
+
+enum KnowledgeSourceStatus {
+  PROCESSING
+  READY
+  FAILED
+}
+
 model User {
-  id                String             @id
-  username          String             @unique
-  passwordHash      String             @default("")
-  displayName       String
-  avatarUrl         String?
-  role              UserRole           @default(USER)
-  tokenBalance      Int                @default(10000)
-  createdAt         DateTime           @default(now())
-  updatedAt         DateTime           @updatedAt
-  skills            Skill[]
-  sources           SkillSource[]
-  marketplaceSkills MarketplaceSkill[]
-  comments          Comment[]
-  reactions         Reaction[]
-  favorites         Favorite[]
-  tokenTransactions TokenTransaction[]
-  modelCallLogs     ModelCallLog[]
-  sessions          AuthSession[]
-  settings          UserSetting?
+  id                 String              @id
+  username           String              @unique
+  email              String?             @unique
+  passwordHash       String              @default("")
+  displayName        String
+  avatarUrl          String?
+  role               UserRole            @default(USER)
+  tokenBalance       Int                 @default(10000)
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  skills             Skill[]
+  sources            SkillSource[]
+  marketplaceSkills  MarketplaceSkill[]
+  comments           Comment[]
+  reactions          Reaction[]
+  favorites          Favorite[]
+  tokenTransactions  TokenTransaction[]
+  modelCallLogs      ModelCallLog[]
+  sessions           AuthSession[]
+  settings           UserSetting?
+  skillReports       SkillReport[]
+  agents             Agent[]
+  agentPostReactions AgentPostReaction[]
+  agentPostComments  AgentPostComment[]
+}
+
+model EmailVerificationCode {
+  id         String    @id @default(cuid())
+  email      String
+  purpose    String
+  codeHash   String
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([email, purpose, createdAt])
+  @@index([expiresAt])
 }
 
 model AuthSession {
@@ -113,32 +283,51 @@ model UserSetting {
   backgroundUrl     String?
   backgroundOpacity Float    @default(0.42)
   windowOpacity     Float    @default(1)
+  notificationSound Boolean  @default(true)
+  iconFlash         Boolean  @default(true)
+  localChatDataPath String?
+  fileStoragePath   String?
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 }
 
 model Skill {
-  id              String              @id @default(cuid())
+  id              String            @id @default(cuid())
   ownerId         String
-  owner           User                @relation(fields: [ownerId], references: [id])
-  visibility      SkillVisibility     @default(PRIVATE)
+  owner           User              @relation(fields: [ownerId], references: [id])
+  visibility      SkillVisibility   @default(PRIVATE)
   name            String
   avatarUrl       String?
   description     String
   persona         String
   tone            String
-  knowledge       String              @default("")
-  boundaries      String              @default("")
+  knowledge       String            @default("")
+  boundaries      String            @default("")
   examples        Json
   tags            String[]
   activeVersionId String?
-  createdAt       DateTime            @default(now())
-  updatedAt       DateTime            @updatedAt
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
   versions        SkillVersion[]
   sources         SkillSource[]
   marketplace     MarketplaceSkill?
+  reports         SkillReport[]
+  agent           Agent?
 
   @@index([ownerId])
+}
+
+model SkillReport {
+  id         String   @id @default(cuid())
+  reporterId String
+  skillId    String
+  reason     String
+  createdAt  DateTime @default(now())
+  reporter   User     @relation(fields: [reporterId], references: [id], onDelete: Cascade)
+  skill      Skill    @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@index([reporterId])
+  @@index([skillId])
 }
 
 model SkillVersion {
@@ -266,23 +455,25 @@ model TokenTransaction {
 }
 
 model ModelProviderConfig {
-  id                   String       @id @default(cuid())
+  id                   String         @id @default(cuid())
   kind                 ProviderKind
   name                 String
   baseUrl              String
   apiKeyCiphertext     String
   models               Json
-  enabled              Boolean      @default(true)
-  promptTokenPrice     Float        @default(0)
-  completionTokenPrice Float        @default(0)
+  enabled              Boolean        @default(true)
+  promptTokenPrice     Float          @default(0)
+  completionTokenPrice Float          @default(0)
   contextWindow        Int
-  createdAt            DateTime     @default(now())
-  updatedAt            DateTime     @updatedAt
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
   callLogs             ModelCallLog[]
+  agents               Agent[]
 }
 
 model ModelCallLog {
   id               String               @id @default(cuid())
+  agentRunId       String?              @unique
   userId           String
   user             User                 @relation(fields: [userId], references: [id])
   providerId       String?
@@ -293,8 +484,379 @@ model ModelCallLog {
   chargedTokens    Int
   success          Boolean
   error            String?
+  responseContent  String?
   createdAt        DateTime             @default(now())
 
   @@index([userId, createdAt])
   @@index([providerId])
+}
+
+model Agent {
+  id                   String                 @id @default(cuid())
+  ownerId              String
+  owner                User                   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  legacySkillId        String?                @unique
+  legacySkill          Skill?                 @relation(fields: [legacySkillId], references: [id], onDelete: SetNull)
+  modelProviderId      String?
+  modelProvider        ModelProviderConfig?   @relation(fields: [modelProviderId], references: [id], onDelete: SetNull)
+  model                String?
+  name                 String
+  handle               String
+  avatarUrl            String?
+  coverUrl             String?
+  tagline              String                 @default("")
+  biography            String                 @default("")
+  profileStatus        String                 @default("")
+  mood                 String                 @default("")
+  persona              String
+  tone                 String
+  values               String[]
+  worldview            String                 @default("")
+  boundaries           String                 @default("")
+  identity             Json
+  tags                 String[]
+  status               AgentStatus            @default(DRAFT)
+  autonomyMode         AgentAutonomyMode      @default(COPILOT)
+  visibility           AgentVisibility        @default(PRIVATE)
+  temperature          Float                  @default(0.7)
+  initiative           Int                    @default(55)
+  reflectionDepth      Int                    @default(2)
+  scheduleEveryMinutes Int                    @default(60)
+  nextRunAt            DateTime?
+  lastRunAt            DateTime?
+  dailyTokenBudget     Int                    @default(5000)
+  dailyActionBudget    Int                    @default(30)
+  tokensUsedToday      Int                    @default(0)
+  actionsUsedToday     Int                    @default(0)
+  budgetResetAt        DateTime               @default(now())
+  metadata             Json?
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+  versions             AgentVersion[]
+  knowledgeSources     AgentKnowledgeSource[]
+  memories             AgentMemory[]
+  relationships        SocialRelationship[]
+  goals                AgentGoal[]
+  tasks                AgentTask[]
+  tools                AgentTool[]
+  runs                 AgentRun[]
+  events               AgentEvent[]
+  posts                AgentPost[]
+
+  @@unique([ownerId, handle])
+  @@index([ownerId, status])
+  @@index([status, autonomyMode, nextRunAt])
+  @@index([modelProviderId])
+}
+
+model AgentPost {
+  id         String              @id @default(cuid())
+  agentId    String
+  agent      Agent               @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  content    String
+  mediaUrls  String[]
+  mood       String              @default("")
+  location   String              @default("")
+  visibility AgentPostVisibility @default(PUBLIC)
+  pinned     Boolean             @default(false)
+  metadata   Json?
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
+  reactions  AgentPostReaction[]
+  comments   AgentPostComment[]
+
+  @@index([agentId, createdAt])
+  @@index([visibility, createdAt])
+}
+
+model AgentPostReaction {
+  id        String                @id @default(cuid())
+  postId    String
+  post      AgentPost             @relation(fields: [postId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      AgentPostReactionKind @default(LIKE)
+  createdAt DateTime              @default(now())
+
+  @@unique([postId, userId, kind])
+  @@index([userId, createdAt])
+}
+
+model AgentPostComment {
+  id        String    @id @default(cuid())
+  postId    String
+  post      AgentPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content   String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([postId, createdAt])
+  @@index([userId, createdAt])
+}
+
+model AgentVersion {
+  id        String   @id @default(cuid())
+  agentId   String
+  agent     Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  version   Int
+  reason    String?
+  snapshot  Json
+  createdAt DateTime @default(now())
+
+  @@unique([agentId, version])
+  @@index([agentId, createdAt])
+}
+
+model AgentKnowledgeSource {
+  id          String                @id @default(cuid())
+  agentId     String
+  agent       Agent                 @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  kind        KnowledgeSourceKind
+  status      KnowledgeSourceStatus @default(PROCESSING)
+  title       String
+  originUri   String?
+  contentHash String?
+  summary     String                @default("")
+  error       String?
+  metadata    Json?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+  chunks      AgentKnowledgeChunk[]
+
+  @@index([agentId, status])
+  @@index([contentHash])
+}
+
+model AgentKnowledgeChunk {
+  id             String               @id @default(cuid())
+  sourceId       String
+  source         AgentKnowledgeSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  position       Int
+  content        String
+  tokenCount     Int                  @default(0)
+  keywords       String[]
+  embedding      Json?
+  embeddingModel String?
+  metadata       Json?
+  createdAt      DateTime             @default(now())
+
+  @@unique([sourceId, position])
+  @@index([sourceId])
+}
+
+model AgentMemory {
+  id               String          @id @default(cuid())
+  agentId          String
+  agent            Agent           @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  kind             AgentMemoryKind
+  content          String
+  summary          String          @default("")
+  salience         Float           @default(0.5)
+  confidence       Float           @default(0.8)
+  emotionalValence Float           @default(0)
+  sourceType       String?
+  sourceId         String?
+  keywords         String[]
+  embedding        Json?
+  accessCount      Int             @default(0)
+  lastAccessedAt   DateTime?
+  expiresAt        DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  @@index([agentId, kind, salience])
+  @@index([agentId, createdAt])
+}
+
+model SocialRelationship {
+  id                String           @id @default(cuid())
+  sourceAgentId     String
+  sourceAgent       Agent            @relation(fields: [sourceAgentId], references: [id], onDelete: Cascade)
+  targetKind        ParticipantKind
+  targetId          String
+  targetLabel       String
+  kind              RelationshipKind @default(ACQUAINTANCE)
+  customKind        String?
+  affinity          Float            @default(0)
+  trust             Float            @default(0.5)
+  familiarity       Float            @default(0)
+  sentiment         Float            @default(0)
+  interactionCount  Int              @default(0)
+  notes             String           @default("")
+  metadata          Json?
+  lastInteractionAt DateTime?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  @@unique([sourceAgentId, targetKind, targetId])
+  @@index([sourceAgentId, affinity])
+  @@index([targetKind, targetId])
+}
+
+model AgentGoal {
+  id           String          @id @default(cuid())
+  agentId      String
+  agent        Agent           @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  parentGoalId String?
+  parentGoal   AgentGoal?      @relation("AgentGoalHierarchy", fields: [parentGoalId], references: [id], onDelete: SetNull)
+  childGoals   AgentGoal[]     @relation("AgentGoalHierarchy")
+  title        String
+  description  String          @default("")
+  status       AgentGoalStatus @default(PENDING)
+  priority     Int             @default(50)
+  progress     Float           @default(0)
+  success      String          @default("")
+  dueAt        DateTime?
+  completedAt  DateTime?
+  metadata     Json?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  tasks        AgentTask[]
+
+  @@index([agentId, status, priority])
+  @@index([parentGoalId])
+}
+
+model AgentTask {
+  id           String          @id @default(cuid())
+  agentId      String
+  agent        Agent           @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  goalId       String?
+  goal         AgentGoal?      @relation(fields: [goalId], references: [id], onDelete: SetNull)
+  title        String
+  description  String          @default("")
+  status       AgentTaskStatus @default(PENDING)
+  priority     Int             @default(50)
+  scheduledFor DateTime?
+  startedAt    DateTime?
+  completedAt  DateTime?
+  attempts     Int             @default(0)
+  maxAttempts  Int             @default(3)
+  toolName     String?
+  input        Json?
+  output       Json?
+  error        String?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  @@index([agentId, status, scheduledFor])
+  @@index([goalId])
+}
+
+model AgentTool {
+  id          String        @id @default(cuid())
+  agentId     String
+  agent       Agent         @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  name        String
+  kind        AgentToolKind @default(BUILTIN)
+  description String
+  enabled     Boolean       @default(true)
+  riskLevel   ToolRiskLevel @default(SAFE)
+  config      Json?
+  permissions Json?
+  usageCount  Int           @default(0)
+  lastUsedAt  DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@unique([agentId, name])
+  @@index([agentId, enabled])
+}
+
+model Conversation {
+  id            String                    @id @default(cuid())
+  kind          ConversationKind
+  title         String                    @default("")
+  createdByKind ParticipantKind
+  createdById   String
+  lastMessageAt DateTime?
+  metadata      Json?
+  createdAt     DateTime                  @default(now())
+  updatedAt     DateTime                  @updatedAt
+  participants  ConversationParticipant[]
+  messages      ConversationMessage[]
+  runs          AgentRun[]
+
+  @@index([lastMessageAt])
+  @@index([createdByKind, createdById])
+}
+
+model ConversationParticipant {
+  id                  String          @id @default(cuid())
+  conversationId      String
+  conversation        Conversation    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  participantKind     ParticipantKind
+  participantId       String
+  displayNameSnapshot String
+  joinedAt            DateTime        @default(now())
+  lastReadAt          DateTime?
+  muted               Boolean         @default(false)
+  metadata            Json?
+
+  @@unique([conversationId, participantKind, participantId])
+  @@index([participantKind, participantId])
+}
+
+model ConversationMessage {
+  id             String                  @id @default(cuid())
+  idempotencyKey String?                 @unique
+  conversationId String
+  conversation   Conversation            @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  authorKind     ParticipantKind
+  authorId       String?
+  kind           ConversationMessageKind @default(TEXT)
+  content        String
+  status         MessageDeliveryStatus   @default(DELIVERED)
+  replyToId      String?
+  metadata       Json?
+  createdAt      DateTime                @default(now())
+
+  @@index([conversationId, createdAt])
+  @@index([authorKind, authorId])
+}
+
+model AgentRun {
+  id               String          @id @default(cuid())
+  agentId          String
+  agent            Agent           @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  conversationId   String?
+  conversation     Conversation?   @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  trigger          AgentRunTrigger
+  status           AgentRunStatus  @default(QUEUED)
+  triggerPayload   Json?
+  state            Json?
+  plan             Json?
+  outcome          Json?
+  error            String?
+  promptTokens     Int             @default(0)
+  completionTokens Int             @default(0)
+  chargedTokens    Int             @default(0)
+  startedAt        DateTime?
+  completedAt      DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  events           AgentEvent[]
+
+  @@index([agentId, status, createdAt])
+  @@index([conversationId])
+}
+
+model AgentEvent {
+  id             String         @id @default(cuid())
+  idempotencyKey String?        @unique
+  agentId        String
+  agent          Agent          @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  runId          String?
+  run            AgentRun?      @relation(fields: [runId], references: [id], onDelete: SetNull)
+  kind           AgentEventKind
+  title          String
+  content        String         @default("")
+  data           Json?
+  visible        Boolean        @default(true)
+  createdAt      DateTime       @default(now())
+
+  @@index([agentId, createdAt])
+  @@index([runId])
 }

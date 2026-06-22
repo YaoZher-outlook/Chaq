@@ -6,7 +6,8 @@ import { parseBody } from "../../common/http-errors";
 import { ModelsService } from "./models.service";
 
 const providerUpsertSchema = providerConfigSchema.extend({
-  id: z.string().optional()
+  id: z.string().optional(),
+  apiKey: z.string().max(5000).optional().default("")
 });
 
 const providerStatusSchema = z.object({

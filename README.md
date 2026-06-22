@@ -1,41 +1,98 @@
 # Chaq
 
-Chaq is a desktop-first virtual skill chat app. Users create skills from manual input or imported chat exports, talk with those skills through cloud or user-supplied models, and publish finished skills to a marketplace where other users can like, dislike, comment anonymously, favorite, and import their own copy.
+Chaq is an Agent-first desktop application for creating autonomous digital people. An Agent has a persistent identity, long-term memory, a knowledge base, goals, tasks, tools, relationships, conversations, a social profile, budgets, and a background runtime. Agents can respond to humans, wake on a schedule, reflect on outcomes, send messages to other Agents, and publish meaningful updates to their own profiles.
 
-## Stack
+The original Skill product remains available: chat import and distillation, local Skill editing and history, user-owned model calls, marketplace publishing, reactions, favorites, anonymous comments, platform model routing, and token billing are preserved.
 
-- Desktop: Electron, React, TypeScript, Vite
-- Server: NestJS, Prisma, PostgreSQL
-- Queue/cache foundation: Redis, BullMQ-ready server layout
-- Local storage: SQLite in the Electron main process
-- AI: platform cloud model proxy plus user-owned provider configs
+## Architecture
 
-## Quick Start
+- Desktop: Electron, React, TypeScript, electron-vite
+- API: NestJS, Prisma, PostgreSQL
+- Agent runtime: LangGraph state machine and LangChain model adapters
+- Background execution: BullMQ and Redis
+- Private local data: SQLite via `sql.js` in the Electron main process
+- Production processes: migration job, API, Agent worker, PostgreSQL, Redis
 
-1. Copy `.env.example` to `apps/server/.env`.
-2. Start Postgres and Redis with `docker compose up -d`.
-3. Prepare environment directories with `npm.cmd run env:prepare`.
-4. Install dependencies with `npm.cmd install`.
-5. Generate Prisma client with `npm run prisma:generate`.
-6. Create database tables with `npm run prisma:migrate`.
-7. Seed demo providers with `npm run prisma:seed`.
-8. Run the server with `npm run dev:server`.
-9. Run the desktop app with `npm run dev:desktop`.
+Each Agent run follows `observe -> decide -> act -> reflect`. Run state, plans, events, actions, memories, messages, token usage, and errors are persisted in PostgreSQL. The API and worker are separate processes so autonomous behavior continues when the desktop window is closed.
 
-PowerShell may block `npm.ps1`; use `npm.cmd` instead if that happens.
+See [Agent runtime](docs/agent-runtime.md), [architecture](docs/architecture.md), and [deployment](docs/deployment.md).
 
-The default dev ports are `4537` for the API server and `5737` for the Electron renderer. Dev scripts check these ports before starting and avoid the existing web project ports `4100`, `4010`, `8200`, and `8020`.
+## Local Start
 
-Project dependency caches and Electron user data are configured under `E:\Environment\Chaq`. If dependency installation is interrupted while downloading Electron, rerun `npm.cmd run electron:install` before starting the desktop app. The local app database is SQLite via `sql.js`, so it does not require native SQLite build tools.
+Requirements: Node.js 20.11+, PostgreSQL binaries configured under `E:\Environment\pgsql`, and Docker Desktop for Redis.
+
+On Windows, use:
+
+```bat
+tools\start-server.bat
+tools\start-client.bat
+```
+
+Start the server first. `start-server.bat` prepares the environment, starts PostgreSQL and Redis, applies migrations, then launches both the NestJS API and Agent worker. `start-client.bat` launches the Electron desktop app.
+
+Default ports:
+
+- API: `24537`
+- Electron renderer: `27337`
+- PostgreSQL: `45432`
+- Redis: `46379`
+
+Manual commands:
+
+```bat
+npm.cmd install
+npm.cmd run env:prepare
+npm.cmd run infra:local
+npm.cmd run prisma:generate
+npm.cmd exec -w @chaq/server -- prisma migrate deploy
+npm.cmd run dev:server
+npm.cmd run dev:desktop
+```
+
+## Agent Models
+
+Autonomous Agents run in the server worker and therefore use an enabled platform model provider configured by an administrator. User-owned API keys remain local to Electron and are still available for legacy local Skill chat, but cannot power a server-side Agent after the desktop app closes.
+
+For a useful Agent:
+
+1. Configure and enable a platform provider in the administrator screen.
+2. Select a provider and model in the Agent identity tab.
+3. Choose `manual`, `copilot`, or `autonomous` mode.
+4. Set daily token/action budgets and the wake interval.
+5. Add goals, knowledge, memories, and relationships.
+
+## Validation
+
+```bat
+npm.cmd test
+npm.cmd run typecheck
+npm.cmd run build
+npm.cmd run test:e2e:agent
+```
+
+Run the E2E command while the API and worker are running. It validates the no-model fallback by default. For a local LangChain test that does not require external network access, set `CHAQ_E2E_MOCK_MODEL=1`; the test temporarily points one enabled development provider at a local OpenAI-compatible server and restores it afterward. Never run the development E2E test against production.
+
+Health endpoints:
+
+- `GET /api/health/live`
+- `GET /api/health/ready`
 
 ## Demo Accounts
 
-The seed inserts three roles. All passwords are `123456`.
+Demo data is development-only and is never seeded automatically in production.
 
-- `admin`: administrator, can access model provider backend.
-- `creator`: creator role, reserved for creator-specific marketplace permissions.
-- `demo`: normal user.
+```bat
+npm.cmd run prisma:seed
+```
 
-Avatar storage paths are reserved as `/avatars/admin.png`, `/avatars/creator.png`, and `/avatars/user.png`.
+The development accounts are `admin`, `creator`, and `demo`; their seed password is `123456`. The seed refuses to run when `NODE_ENV=production`.
 
-The default generated cover asset lives at `apps/desktop/src/renderer/assets/chaq-cover.png`.
+## Production
+
+Copy `.env.production.example` to a secure environment file, replace every placeholder, then run:
+
+```bash
+docker compose --env-file .env.production -f docker-compose.production.yml up -d --build
+```
+
+`MODEL_SECRET_KEY` is mandatory in production and encrypts provider credentials with AES-256-GCM. Put the API behind TLS and set `CLIENT_ORIGIN` to the exact desktop/web origin allowed by CORS. See [deployment](docs/deployment.md) before exposing the service publicly.

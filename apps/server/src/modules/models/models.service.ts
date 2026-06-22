@@ -1,5 +1,8 @@
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { BadRequestException, ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
-import { ModelProviderConfig, ProviderKind } from "@prisma/client";
+import { ModelCallLog, ModelProviderConfig, Prisma, ProviderKind, TokenTransactionKind } from "@prisma/client";
+import { HumanMessage, SystemMessage } from "@langchain/core/messages";
+import { ChatOpenAI } from "@langchain/openai";
 import type { CloudChatRequest, CloudChatResponse, DistillRequest, DistillResponse, ModelProviderPublic, SkillDraft } from "@chaq/shared";
 import { PrismaService } from "../../common/prisma.service";
 import { UsersService } from "../users/users.service";
@@ -9,7 +12,7 @@ type ProviderInput = {
   kind: string;
   name: string;
   baseUrl: string;
-  apiKey: string;
+  apiKey?: string;
   models: Array<{ id: string; label: string; contextWindow: number }>;
   enabled: boolean;
   promptTokenPrice: number;
@@ -21,6 +24,12 @@ type ProviderCallResult = {
   content: string;
   promptTokens: number;
   completionTokens: number;
+};
+
+export type AgentCompletionResult = ProviderCallResult & {
+  chargedTokens: number;
+  balanceAfter: number;
+  modelLabel: string;
 };
 
 @Injectable()
@@ -46,11 +55,18 @@ export class ModelsService {
 
   async upsertProvider(userId: string, input: ProviderInput): Promise<ModelProviderPublic> {
     await this.users.assertAdmin(userId);
+    const trimmedApiKey = input.apiKey?.trim() ?? "";
+    const existing = input.id
+      ? await this.prisma.modelProviderConfig.findUnique({ where: { id: input.id } })
+      : null;
+    if (!existing && !trimmedApiKey) {
+      throw new BadRequestException("Provider API key is required when creating a cloud model provider.");
+    }
     const data = {
       kind: this.toPrismaProviderKind(input.kind),
       name: input.name,
       baseUrl: input.baseUrl.replace(/\/$/, ""),
-      apiKeyCiphertext: this.sealApiKey(input.apiKey),
+      apiKeyCiphertext: trimmedApiKey ? this.sealApiKey(trimmedApiKey) : existing?.apiKeyCiphertext ?? "",
       models: input.models,
       enabled: input.enabled,
       promptTokenPrice: input.promptTokenPrice,
@@ -126,6 +142,128 @@ export class ModelsService {
       const elapsed = Date.now() - started;
       throw new BadRequestException(`Cloud model call failed after ${elapsed}ms: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  async agentCompletion(userId: string, input: {
+    providerId: string;
+    model: string;
+    system: string;
+    prompt: string;
+    temperature?: number;
+    agentId: string;
+    runId: string;
+  }): Promise<AgentCompletionResult> {
+    const replay = await this.prisma.modelCallLog.findUnique({
+      where: { agentRunId: input.runId },
+      include: { provider: { select: { name: true } } }
+    });
+    if (replay?.success && replay.responseContent !== null) {
+      return this.replayAgentCompletion(replay, replay.provider?.name, await this.currentBalance(userId));
+    }
+    const provider = await this.getEnabledProvider(input.providerId);
+    const messages = [
+      { role: "system", content: input.system },
+      { role: "user", content: input.prompt }
+    ];
+    const estimatedPrompt = this.estimateTokens(`${input.system}\n${input.prompt}`);
+    const estimatedCompletion = Math.max(256, Math.ceil(estimatedPrompt * 0.6));
+    const estimatedCharge = this.calculateCharge(provider, estimatedPrompt, estimatedCompletion);
+    const user = await this.users.ensureUser(userId);
+    if (user.tokenBalance < estimatedCharge) {
+      throw new ForbiddenException("Token balance is insufficient for the estimated agent run.");
+    }
+
+    try {
+      const result = this.isLangChainCompatible(provider.kind)
+        ? await this.callLangChainCompatible(provider, input.model, messages, input.temperature ?? 0.7)
+        : await this.callProvider(provider, input.model, messages, input.temperature ?? 0.7);
+      const chargedTokens = this.calculateCharge(provider, result.promptTokens, result.completionTokens);
+      const persisted = await this.persistAgentCompletion(userId, input, provider, result, chargedTokens);
+      if (persisted.replayed) {
+        return this.replayAgentCompletion(persisted.log, provider.name, persisted.balanceAfter);
+      }
+      return {
+        ...result,
+        chargedTokens,
+        balanceAfter: persisted.balanceAfter,
+        modelLabel: `${provider.name} / ${input.model}`
+      };
+    } catch (error) {
+      await this.prisma.modelCallLog.create({
+        data: {
+          userId,
+          providerId: provider.id,
+          model: input.model,
+          promptTokens: estimatedPrompt,
+          completionTokens: 0,
+          chargedTokens: 0,
+          success: false,
+          error: error instanceof Error ? error.message : String(error)
+        }
+      });
+      throw error;
+    }
+  }
+
+  private async persistAgentCompletion(
+    userId: string,
+    input: { providerId: string; model: string; agentId: string; runId: string },
+    provider: ModelProviderConfig,
+    result: ProviderCallResult,
+    chargedTokens: number
+  ): Promise<{ log: ModelCallLog; balanceAfter: number; replayed: boolean }> {
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const existing = await tx.modelCallLog.findUnique({ where: { agentRunId: input.runId } });
+        if (existing) {
+          return { log: existing, balanceAfter: await this.currentBalance(userId, tx), replayed: true };
+        }
+        const balanceAfter = await this.users.chargeForModelUsageInTransaction(
+          tx,
+          userId,
+          chargedTokens,
+          `Agent run via ${provider.name}`,
+          { providerId: provider.id, model: input.model, agentId: input.agentId, runId: input.runId },
+          TokenTransactionKind.AGENT_MODEL_USAGE
+        );
+        const log = await tx.modelCallLog.create({
+          data: {
+            agentRunId: input.runId,
+            userId,
+            providerId: provider.id,
+            model: input.model,
+            promptTokens: result.promptTokens,
+            completionTokens: result.completionTokens,
+            chargedTokens,
+            success: true,
+            responseContent: result.content
+          }
+        });
+        return { log, balanceAfter, replayed: false };
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        const existing = await this.prisma.modelCallLog.findUnique({ where: { agentRunId: input.runId } });
+        if (existing) return { log: existing, balanceAfter: await this.currentBalance(userId), replayed: true };
+      }
+      throw error;
+    }
+  }
+
+  private replayAgentCompletion(log: ModelCallLog, providerName: string | undefined, balanceAfter: number): AgentCompletionResult {
+    return {
+      content: log.responseContent ?? "",
+      promptTokens: log.promptTokens,
+      completionTokens: log.completionTokens,
+      chargedTokens: log.chargedTokens,
+      balanceAfter,
+      modelLabel: `${providerName ?? "Model"} / ${log.model}`
+    };
+  }
+
+  private async currentBalance(userId: string, tx: Prisma.TransactionClient | PrismaService = this.prisma): Promise<number> {
+    const user = await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { tokenBalance: true } });
+    return user.tokenBalance;
   }
 
   async distill(userId: string, input: DistillRequest): Promise<DistillResponse> {
@@ -274,7 +412,8 @@ export class ModelsService {
   private async callProvider(
     provider: ModelProviderConfig,
     model: string,
-    messages: Array<{ role: string; content: string }>
+    messages: Array<{ role: string; content: string }>,
+    temperature = 0.7
   ): Promise<ProviderCallResult> {
     const apiKey = this.unsealApiKey(provider.apiKeyCiphertext);
     if (!apiKey || apiKey === "replace-me") {
@@ -288,19 +427,52 @@ export class ModelsService {
       return this.callGoogle(provider, apiKey, model, messages);
     }
     if (provider.kind === ProviderKind.OLLAMA) {
-      return this.callOpenAICompatible(provider, "", model, messages);
+      return this.callOpenAICompatible(provider, "", model, messages, temperature);
     }
-    return this.callOpenAICompatible(provider, apiKey, model, messages);
+    return this.callOpenAICompatible(provider, apiKey, model, messages, temperature);
+  }
+
+  private isLangChainCompatible(kind: ProviderKind): boolean {
+    return kind !== ProviderKind.ANTHROPIC && kind !== ProviderKind.GOOGLE && kind !== ProviderKind.OLLAMA;
+  }
+
+  private async callLangChainCompatible(
+    provider: ModelProviderConfig,
+    modelName: string,
+    messages: Array<{ role: string; content: string }>,
+    temperature: number
+  ): Promise<ProviderCallResult> {
+    const apiKey = this.unsealApiKey(provider.apiKeyCiphertext);
+    const chat = new ChatOpenAI({
+      apiKey,
+      model: modelName,
+      temperature,
+      timeout: this.modelRequestTimeoutMs(),
+      configuration: { baseURL: provider.baseUrl.replace(/\/$/, "") }
+    });
+    const response = await chat.invoke(messages.map((message) =>
+      message.role === "system" ? new SystemMessage(message.content) : new HumanMessage(message.content)
+    ));
+    const content = typeof response.content === "string"
+      ? response.content
+      : response.content.map((part) => typeof part === "string" ? part : "text" in part ? String(part.text) : "").join("");
+    return {
+      content,
+      promptTokens: Number(response.usage_metadata?.input_tokens ?? this.estimateTokens(JSON.stringify(messages))),
+      completionTokens: Number(response.usage_metadata?.output_tokens ?? this.estimateTokens(content))
+    };
   }
 
   private async callOpenAICompatible(
     provider: ModelProviderConfig,
     apiKey: string,
     model: string,
-    messages: Array<{ role: string; content: string }>
+    messages: Array<{ role: string; content: string }>,
+    temperature = 0.7
   ): Promise<ProviderCallResult> {
     const response = await fetch(`${provider.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
+      signal: AbortSignal.timeout(this.modelRequestTimeoutMs()),
       headers: {
         "content-type": "application/json",
         ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {})
@@ -308,7 +480,7 @@ export class ModelsService {
       body: JSON.stringify({
         model,
         messages,
-        temperature: 0.7
+        temperature
       })
     });
     const data = await response.json() as any;
@@ -338,6 +510,7 @@ export class ModelsService {
       }));
     const response = await fetch(`${provider.baseUrl.replace(/\/$/, "")}/messages`, {
       method: "POST",
+      signal: AbortSignal.timeout(this.modelRequestTimeoutMs()),
       headers: {
         "content-type": "application/json",
         "x-api-key": apiKey,
@@ -377,6 +550,7 @@ export class ModelsService {
     const systemInstruction = messages.find((message) => message.role === "system")?.content;
     const response = await fetch(`${provider.baseUrl.replace(/\/$/, "")}/models/${model}:generateContent?key=${apiKey}`, {
       method: "POST",
+      signal: AbortSignal.timeout(this.modelRequestTimeoutMs()),
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         contents,
@@ -397,6 +571,11 @@ export class ModelsService {
 
   private calculateCharge(provider: ModelProviderConfig, promptTokens: number, completionTokens: number): number {
     return Math.max(1, Math.ceil(promptTokens * provider.promptTokenPrice + completionTokens * provider.completionTokenPrice));
+  }
+
+  private modelRequestTimeoutMs(): number {
+    const configured = Number(process.env.MODEL_REQUEST_TIMEOUT_MS ?? 60_000);
+    return Math.min(300_000, Math.max(5_000, Number.isFinite(configured) ? configured : 60_000));
   }
 
   private estimateTokens(text: string): number {
@@ -426,14 +605,44 @@ export class ModelsService {
   }
 
   private sealApiKey(apiKey: string): string {
-    return Buffer.from(apiKey, "utf8").toString("base64");
+    const key = this.modelSecretKey();
+    if (!key) {
+      if ((process.env.NODE_ENV ?? "").toLowerCase() === "production") {
+        throw new BadRequestException("MODEL_SECRET_KEY must be configured before saving provider credentials in production.");
+      }
+      return `base64:${Buffer.from(apiKey, "utf8").toString("base64")}`;
+    }
+    const iv = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", key, iv);
+    const encrypted = Buffer.concat([cipher.update(apiKey, "utf8"), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return `v1:${iv.toString("base64")}:${tag.toString("base64")}:${encrypted.toString("base64")}`;
   }
 
   private unsealApiKey(ciphertext: string): string {
+    if (ciphertext === "replace-me") return ciphertext;
+    if (ciphertext.startsWith("v1:")) {
+      try {
+        const key = this.modelSecretKey();
+        if (!key) throw new Error("MODEL_SECRET_KEY is missing.");
+        const [, iv, tag, encrypted] = ciphertext.split(":");
+        const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(iv, "base64"));
+        decipher.setAuthTag(Buffer.from(tag, "base64"));
+        return Buffer.concat([decipher.update(Buffer.from(encrypted, "base64")), decipher.final()]).toString("utf8");
+      } catch {
+        throw new BadRequestException("Provider credential could not be decrypted. Check MODEL_SECRET_KEY.");
+      }
+    }
     try {
-      return Buffer.from(ciphertext, "base64").toString("utf8");
+      const encoded = ciphertext.startsWith("base64:") ? ciphertext.slice(7) : ciphertext;
+      return Buffer.from(encoded, "base64").toString("utf8");
     } catch {
       return ciphertext;
     }
+  }
+
+  private modelSecretKey(): Buffer | null {
+    const secret = process.env.MODEL_SECRET_KEY?.trim();
+    return secret ? createHash("sha256").update(secret).digest() : null;
   }
 }

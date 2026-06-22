@@ -22,11 +22,21 @@ if errorlevel 1 (
   exit /b 1
 )
 
+set "npm_config_electron_mirror="
+set "npm_config_electron_config_cache="
 set "ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/"
-set "electron_config_cache=%ROOT%\.electron-cache"
+set "ELECTRON_CACHE=E:\Environment\Chaq\electron-cache"
+set "electron_config_cache=E:\Environment\Chaq\electron-cache"
+set "CHAQ_RUNTIME_CACHE=E:\Environment\Chaq\runtime-cache-v2"
 
 call npm.cmd run env:prepare
 if errorlevel 1 goto :fail
+
+node scripts\check-ports.js desktop 27337 --running >nul 2>nul
+if not errorlevel 1 (
+  echo [Chaq] Desktop client is already running. No second instance was started.
+  exit /b 0
+)
 
 if not exist "node_modules" (
   echo [Chaq] node_modules not found. Installing dependencies...
@@ -40,7 +50,7 @@ if not exist "node_modules\electron\dist\electron.exe" (
   if errorlevel 1 goto :fail
 )
 
-echo [Chaq] Desktop renderer will use http://localhost:5737
+echo [Chaq] Desktop renderer will use http://localhost:27337
 call npm.cmd run dev:desktop
 if errorlevel 1 goto :fail
 

@@ -5,6 +5,7 @@ release/
 .vite/
 .turbo/
 .cache/
+.tmp/
 .electron-cache/
 .npm-cache/
 coverage/

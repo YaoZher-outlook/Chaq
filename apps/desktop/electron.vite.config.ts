@@ -15,13 +15,17 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()],
     build: {
       rollupOptions: {
-        input: resolve(__dirname, "src/preload/index.ts")
+        input: resolve(__dirname, "src/preload/index.ts"),
+        output: {
+          format: "cjs",
+          entryFileNames: "index.cjs"
+        }
       }
     }
   },
   renderer: {
     server: {
-      port: 5737,
+      port: 27337,
       strictPort: true
     },
     resolve: {

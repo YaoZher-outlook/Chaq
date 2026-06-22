@@ -5,8 +5,10 @@
     "rootDir": "src",
     "declaration": true,
     "emitDeclarationOnly": false,
-    "module": "ESNext",
-    "moduleResolution": "Bundler"
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "isolatedModules": false
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.spec.ts"]
 }

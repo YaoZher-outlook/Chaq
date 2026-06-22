@@ -2,31 +2,33 @@
   "name": "@chaq/desktop",
   "version": "0.1.0",
   "private": true,
+  "description": "Chaq Agent-first desktop client",
+  "author": "Chaq",
   "type": "module",
   "main": "out/main/index.js",
   "scripts": {
-    "predev": "node ../../scripts/check-ports.js desktop 5737",
+    "predev": "node ../../scripts/check-ports.js desktop 27337",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "package": "electron-builder --dir",
+    "package": "electron-builder --dir -c.win.signAndEditExecutable=false",
     "dist": "electron-builder"
   },
   "dependencies": {
-    "@chaq/shared": "file:../../packages/shared",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "sql.js": "^1.12.0",
-    "zod": "^3.23.8"
+    "zod": "^3.25.32"
   },
   "devDependencies": {
+    "@chaq/shared": "file:../../packages/shared",
     "@types/node": "^22.7.4",
     "@types/react": "^18.3.11",
     "@types/react-dom": "^18.3.1",
     "@types/sql.js": "^1.4.9",
     "@vitejs/plugin-react": "^4.3.2",
-    "electron": "^32.1.2",
+    "electron": "32.3.3",
     "electron-builder": "^25.1.8",
     "electron-vite": "^2.3.0",
     "typescript": "^5.6.3",
@@ -35,12 +37,15 @@
   "build": {
     "appId": "app.chaq.desktop",
     "productName": "Chaq",
+    "electronDist": "../../node_modules/electron/dist",
     "directories": {
       "output": "release"
     },
     "files": [
       "out/**/*",
-      "package.json"
+      "package.json",
+      "!node_modules/@chaq/shared/src{,/**/*}",
+      "!node_modules/@chaq/shared/tsconfig.json"
     ],
     "asarUnpack": []
   }

@@ -7,7 +7,16 @@ import { UsersService } from "./users.service";
 
 const updateMeSchema = z.object({
   displayName: z.string().min(1).max(80).optional(),
-  avatarUrl: z.string().url().nullable().optional()
+  avatarUrl: z.string().max(8_000_000).nullable().optional(),
+  email: z.string().email().max(160).optional(),
+  emailCode: z.string().min(4).max(12).optional(),
+  currentPassword: z.string().max(120).optional(),
+  newPassword: z.string().max(120).optional(),
+  confirmPassword: z.string().max(120).optional()
+});
+
+const emailCodeSchema = z.object({
+  email: z.string().email().max(160)
 });
 
 const adjustTokensSchema = z.object({
@@ -19,9 +28,13 @@ const adjustTokensSchema = z.object({
 const settingsSchema = z.object({
   language: z.enum(["zh", "en"]).optional(),
   theme: z.enum(["light", "dark", "system"]).optional(),
-  backgroundUrl: z.string().max(500).nullable().optional(),
+  backgroundUrl: z.string().max(8_000_000).nullable().optional(),
   backgroundOpacity: z.number().min(0).max(1).optional(),
-  windowOpacity: z.number().min(0.7).max(1).optional()
+  windowOpacity: z.number().min(0.7).max(1).optional(),
+  notificationSound: z.boolean().optional(),
+  iconFlash: z.boolean().optional(),
+  localChatDataPath: z.string().max(1000).nullable().optional(),
+  fileStoragePath: z.string().max(1000).nullable().optional()
 });
 
 @Controller("users")
@@ -36,6 +49,11 @@ export class UsersController {
   @Post("me")
   updateMe(@CurrentUserId() userId: string, @Body() body: unknown) {
     return this.users.updateMe(userId, parseBody(updateMeSchema, body));
+  }
+
+  @Post("me/email-code")
+  emailCode(@CurrentUserId() userId: string, @Body() body: unknown) {
+    return this.users.requestEmailCode(userId, parseBody(emailCodeSchema, body).email);
   }
 
   @Get("me/tokens")
