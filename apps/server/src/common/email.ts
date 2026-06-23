@@ -19,10 +19,16 @@ export function isValidPassword(password: string): boolean {
 
 export async function sendVerificationEmail(email: string, code: string, purpose: "register" | "bind_email"): Promise<void> {
   const subject = purpose === "register" ? "Chaq 注册验证码" : "Chaq 邮箱绑定验证码";
+  const title = purpose === "register" ? "欢迎注册 Chaq" : "确认绑定 Chaq 邮箱";
   const text = [
-    `你的验证码是：${code}`,
+    title,
     "",
-    "验证码 10 分钟内有效。如果不是你本人操作，可以忽略这封邮件。"
+    `验证码：${code}`,
+    "",
+    "验证码 10 分钟内有效，请勿转发给任何人。",
+    "如果不是你本人操作，可以忽略这封邮件。",
+    "",
+    "Chaq Team"
   ].join("\n");
   await sendMail({ to: email, subject, text });
 }

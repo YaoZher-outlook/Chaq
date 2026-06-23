@@ -12,6 +12,7 @@ import {
   agentGoalUpdateSchema,
   agentTaskInputSchema,
   agentTaskUpdateSchema,
+  agentToolCreateSchema,
   agentToolUpdateSchema
 } from "@chaq/shared";
 import type { AgentDraft } from "@chaq/shared";
@@ -38,6 +39,21 @@ export class AgentsController {
   @Get("discover")
   discover(@CurrentUserId() userId: string, @Query("query") query?: string) {
     return this.agents.discover(userId, query);
+  }
+
+  @Get("contacts")
+  contacts(@CurrentUserId() userId: string) {
+    return this.agents.contacts(userId);
+  }
+
+  @Post(":id/contact")
+  addContact(@CurrentUserId() userId: string, @Param("id") id: string) {
+    return this.agents.addContact(userId, id);
+  }
+
+  @Post(":id/contact/remove")
+  removeContact(@CurrentUserId() userId: string, @Param("id") id: string) {
+    return this.agents.removeContact(userId, id);
   }
 
   @Post()
@@ -120,6 +136,11 @@ export class AgentsController {
   @Post(":id/tools/:toolId")
   updateTool(@CurrentUserId() userId: string, @Param("id") id: string, @Param("toolId") toolId: string, @Body() body: unknown) {
     return this.agents.updateTool(userId, id, toolId, parseBody(agentToolUpdateSchema, body));
+  }
+
+  @Post(":id/tools")
+  addTool(@CurrentUserId() userId: string, @Param("id") id: string, @Body() body: unknown) {
+    return this.agents.addTool(userId, id, parseBody(agentToolCreateSchema, body));
   }
 
   @Post(":id/knowledge")

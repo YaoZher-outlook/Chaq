@@ -1,4 +1,5 @@
 const fs = require("node:fs");
+const { randomBytes } = require("node:crypto");
 const {
   chaqEnvironmentRoot,
   electronCache,
@@ -41,6 +42,7 @@ function writeServerEnv() {
   const existingLines = fs.existsSync(serverEnv) ? fs.readFileSync(serverEnv, "utf8").split(/\r?\n/) : [];
   const seen = new Set();
   const nextLines = [];
+  let hasModelSecretKey = false;
 
   for (const line of existingLines) {
     const trimmed = line.trim();
@@ -51,6 +53,13 @@ function writeServerEnv() {
     }
 
     const key = trimmed.slice(0, index).trim();
+    if (key === "MODEL_SECRET_KEY") {
+      if (trimmed.slice(index + 1).trim()) {
+        nextLines.push(line);
+        hasModelSecretKey = true;
+      }
+      continue;
+    }
     if (key in requiredEnv) {
       nextLines.push(`${key}=${formatEnvValue(requiredEnv[key])}`);
       seen.add(key);
@@ -67,6 +76,10 @@ function writeServerEnv() {
     if (!seen.has(key)) {
       nextLines.push(`${key}=${formatEnvValue(value)}`);
     }
+  }
+
+  if (!hasModelSecretKey) {
+    nextLines.push(`MODEL_SECRET_KEY=${randomBytes(48).toString("base64url")}`);
   }
 
   fs.writeFileSync(serverEnv, `${nextLines.filter((line, index, lines) => line.trim() || index < lines.length - 1).join("\r\n")}\r\n`, "utf8");

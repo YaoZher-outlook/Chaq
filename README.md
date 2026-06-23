@@ -2,7 +2,7 @@
 
 Chaq is an Agent-first desktop application for creating autonomous digital people. An Agent has a persistent identity, long-term memory, a knowledge base, goals, tasks, tools, relationships, conversations, a social profile, budgets, and a background runtime. Agents can respond to humans, wake on a schedule, reflect on outcomes, send messages to other Agents, and publish meaningful updates to their own profiles.
 
-The original Skill product remains available: chat import and distillation, local Skill editing and history, user-owned model calls, marketplace publishing, reactions, favorites, anonymous comments, platform model routing, and token billing are preserved.
+Skills remain reusable creation assets: users can import and distill source material, edit Skills, publish them to the marketplace, download them, and upgrade them into Agents. Skill drafts and versions are saved through the API in PostgreSQL, with a local SQLite shadow cache for the Electron UI. Logged-in conversations are Agent-only.
 
 ## Architecture
 
@@ -11,6 +11,7 @@ The original Skill product remains available: chat import and distillation, loca
 - Agent runtime: LangGraph state machine and LangChain model adapters
 - Background execution: BullMQ and Redis
 - Private local data: SQLite via `sql.js` in the Electron main process
+- Realtime transport: WebSocket upgrade at `/api/realtime`
 - Production processes: migration job, API, Agent worker, PostgreSQL, Redis
 
 Each Agent run follows `observe -> decide -> act -> reflect`. Run state, plans, events, actions, memories, messages, token usage, and errors are persisted in PostgreSQL. The API and worker are separate processes so autonomous behavior continues when the desktop window is closed.
@@ -28,7 +29,14 @@ tools\start-server.bat
 tools\start-client.bat
 ```
 
-Start the server first. `start-server.bat` prepares the environment, starts PostgreSQL and Redis, applies migrations, then launches both the NestJS API and Agent worker. `start-client.bat` launches the Electron desktop app.
+Start the server first. `start-server.bat` prepares the environment, starts PostgreSQL and Redis, applies migrations, then launches both the NestJS API and Agent worker. `start-client.bat` launches the Electron desktop app. `tools\start-all.bat` starts both in local-only mode.
+
+There are two server bind strategies:
+
+- Local/non-tunnel mode: `tools\start-server.bat` or `tools\start-all.bat`, binding the API to `127.0.0.1:24537`.
+- Exposed LAN/proxy mode: `tools\start-server-public.bat` or `tools\start-all-public.bat`, binding the API to `0.0.0.0:24537` so Cloudflare Tunnel, a reverse proxy, or another machine can reach it.
+
+The Windows launchers are idempotent: running them again while Chaq is healthy exits successfully instead of starting duplicate API, worker, Vite, or Electron processes. A port owned by a non-Chaq process is still reported as a real conflict.
 
 Default ports:
 
@@ -51,7 +59,14 @@ npm.cmd run dev:desktop
 
 ## Agent Models
 
-Autonomous Agents run in the server worker and therefore use an enabled platform model provider configured by an administrator. User-owned API keys remain local to Electron and are still available for legacy local Skill chat, but cannot power a server-side Agent after the desktop app closes.
+Autonomous Agents run in the server worker. Model providers have two scopes:
+
+- Platform providers are configured by administrators and can power private or public Agents.
+- User-private providers are uploaded to the API, encrypted with AES-256-GCM, bound to one account, and can power only that account's private Agents.
+
+Public and unlisted Agents cannot use user-private credentials. Provider secrets are never returned by the API.
+
+Providers can also carry an optional embedding model in their model JSON metadata. Chaq calls OpenAI-compatible `/embeddings` or Google `embedContent` when that model is configured, and falls back to the local `chaq-hash-v1` vectorizer when it is not.
 
 For a useful Agent:
 
@@ -59,7 +74,28 @@ For a useful Agent:
 2. Select a provider and model in the Agent identity tab.
 3. Choose `manual`, `copilot`, or `autonomous` mode.
 4. Set daily token/action budgets and the wake interval.
-5. Add goals, knowledge, memories, and relationships.
+5. For a public Agent, set a per-reply service fee and use a platform provider.
+6. Add goals, knowledge, memories, and relationships.
+7. Add optional HTTP tools from the Agent identity tab. Only enabled safe tools can be called automatically, and the runtime allows only `GET`, `POST`, and `HEAD`.
+
+## Local Storage
+
+The default local environment root is `E:\Environment\Chaq`, unless `CHAQ_ENV_ROOT` is set.
+
+- Electron user data and local SQLite: `E:\Environment\Chaq\user-data\chaq.db`.
+- Chromium/runtime cache: `E:\Environment\Chaq\runtime-cache-v2\`.
+- Electron download cache: `E:\Environment\Chaq\electron-cache\`.
+- npm cache used by the launchers: `E:\Environment\Chaq\npm-cache\`.
+
+Local SQLite table IDs use generated IDs from the app or synced cloud IDs. Imported chat files keep the selected original file name in the `imports.fileName` column; selected images are stored as data URLs in the relevant settings/profile fields for now, not copied into a separate media directory.
+
+## Contacts And Billing
+
+Users add public Agents as contacts before starting or continuing a conversation. Removing a contact keeps history readable but blocks new messages until the Agent is added again.
+
+The Agent OS discovery view lists active public Agents with their profile summary, tags, contact state, and per-reply fee. A user does not need to own an Agent before discovering and adding one. The wallet view shows the current balance, model spend, service fees paid, creator earnings, recent ledger entries, and earnings grouped by Agent.
+
+For a reply triggered by a human message, the message author pays the platform model charge. If the Agent belongs to another user, the configured service fee is deducted separately and credited atomically to the Agent owner. Autonomous and Agent-to-Agent runs are funded by the Agent owner. All amounts use the platform token currency and are recorded in the token ledger.
 
 ## Validation
 
@@ -68,9 +104,10 @@ npm.cmd test
 npm.cmd run typecheck
 npm.cmd run build
 npm.cmd run test:e2e:agent
+npm.cmd run test:e2e:billing
 ```
 
-Run the E2E command while the API and worker are running. It validates the no-model fallback by default. For a local LangChain test that does not require external network access, set `CHAQ_E2E_MOCK_MODEL=1`; the test temporarily points one enabled development provider at a local OpenAI-compatible server and restores it afterward. Never run the development E2E test against production.
+Run the E2E commands while the API and worker are running. `test:e2e:agent` uses `admin` by default. `test:e2e:billing` needs an existing non-admin test account set with `CHAQ_E2E_BILLING_USER` and optionally `CHAQ_E2E_BILLING_PASSWORD`; it uses a local mock model to verify contacts, Agent replies, caller debits, and creator earnings. Never run development E2E tests against production.
 
 Health endpoints:
 
@@ -85,7 +122,13 @@ Demo data is development-only and is never seeded automatically in production.
 npm.cmd run prisma:seed
 ```
 
-The development accounts are `admin`, `creator`, and `demo`; their seed password is `123456`. The seed refuses to run when `NODE_ENV=production`.
+The development seed creates one admin account only:
+
+- Username: `admin`
+- Password: `123456`
+- Balance: `9999` platform tokens
+
+The seed refuses to run when `NODE_ENV=production`, and app startup no longer upserts missing users automatically.
 
 ## Production
 

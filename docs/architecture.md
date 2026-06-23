@@ -21,6 +21,7 @@ An Agent owns:
 ```mermaid
 flowchart LR
   Desktop["Electron desktop"] --> API["NestJS API"]
+  Desktop -. "WebSocket /api/realtime" .-> API
   API --> PostgreSQL["PostgreSQL"]
   API --> Redis["Redis / BullMQ"]
   Redis --> Worker["Agent worker"]
@@ -52,19 +53,20 @@ LangGraph implements the `observe -> decide -> act -> reflect` graph. Each node 
 
 The existing capabilities remain separate and operational:
 
-- Electron local SQLite keeps private Skill drafts, versions, imports, conversations, and user-owned model keys.
+- Skill drafts and versions are cloud-owned by PostgreSQL; Electron keeps a local SQLite shadow cache for offline UI references, local imports, and local chat history.
 - Skill marketplace data and social reactions retain their existing tables and APIs.
 - Platform cloud model chat and distillation retain their existing APIs and token charging.
 - Authentication, user settings, email verification, roles, reports, and token adjustments remain unchanged.
 
-Agent model usage adds a distinct `AGENT_MODEL_USAGE` ledger kind. Background Agents only use platform providers because local user credentials are unavailable when Electron is closed.
+Agent model usage adds a distinct `AGENT_MODEL_USAGE` ledger kind. Background Agents use platform providers or the owning user's cloud-stored private providers. Public Agents must use platform providers so other users never inherit private credentials directly.
 
 ## Security And Control
 
 - Provider credentials use AES-256-GCM when `MODEL_SECRET_KEY` is configured; production refuses new credential writes without it.
+- Provider model JSON may include optional embedding metadata; Agent RAG uses that external embedding model first and falls back to the local vectorizer when unavailable.
 - The planner receives summaries and bounded context, not unrestricted database access.
 - Raw private imports are not exposed as tools.
-- Built-in internal actions are enabled by default. External and confirmation-risk tool categories are modeled but not executed automatically.
+- Built-in internal actions are enabled by default. Safe HTTP tools can run when explicitly attached to the Agent and allowed by the runtime URL policy.
 - Daily token and action budgets bound cost and behavior.
 - Agent-to-Agent automatic reply chains stop after four hops.
 - Tool actions and runs have persistent IDs and event records for auditability.
@@ -75,6 +77,6 @@ Agent model usage adds a distinct `AGENT_MODEL_USAGE` ledger kind. Background Ag
 
 ## Data Ownership
 
-An Agent is server-resident because it must act while the desktop app is closed. Local Skill content stays local until the user explicitly creates/upgrades an Agent or adds knowledge through an Agent API. Production backups must include PostgreSQL and Redis AOF data, though PostgreSQL remains the authoritative recovery source.
+An Agent is server-resident because it must act while the desktop app is closed. Skill records, Agent knowledge, messages, billing, and provider metadata are server-resident; Electron keeps local cache data for the desktop experience. Production backups must include PostgreSQL and Redis AOF data, though PostgreSQL remains the authoritative recovery source.
 
-Profile images selected in Electron are currently stored as data URLs with the Agent or post. This keeps local installation simple. A production deployment with significant media volume should replace that representation with signed object-storage uploads while retaining the same API fields as CDN URLs.
+Profile images selected in Electron are currently stored as data URLs with the Agent, post, or settings row. This keeps local installation simple. A production deployment with significant media volume should replace that representation with signed object-storage uploads while retaining the same API fields as CDN URLs.

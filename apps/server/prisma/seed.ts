@@ -37,23 +37,7 @@ const demoUsers = [
     displayName: "Chaq Admin",
     role: "ADMIN" as const,
     avatarUrl: "/avatars/admin.png",
-    tokenBalance: 100000
-  },
-  {
-    id: "creator-local",
-    username: "creator",
-    displayName: "Skill Creator",
-    role: "CREATOR" as const,
-    avatarUrl: "/avatars/creator.png",
-    tokenBalance: 50000
-  },
-  {
-    id: "user-local",
-    username: "demo",
-    displayName: "Chaq User",
-    role: "USER" as const,
-    avatarUrl: "/avatars/user.png",
-    tokenBalance: 10000
+    tokenBalance: 9999
   }
 ];
 

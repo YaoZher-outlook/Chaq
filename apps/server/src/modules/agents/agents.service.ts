@@ -11,6 +11,7 @@ import {
   AgentRunTrigger,
   AgentStatus,
   AgentTaskStatus,
+  AgentToolKind,
   AgentVisibility,
   KnowledgeSourceKind,
   KnowledgeSourceStatus,
@@ -21,10 +22,13 @@ import {
 } from "@prisma/client";
 import type { AgentDraft } from "@chaq/shared";
 import { PrismaService } from "../../common/prisma.service";
+import { extractKeywords } from "../../common/vector-search";
 import { UsersService } from "../users/users.service";
+import { ModelsService } from "../models/models.service";
 import { AgentQueueService } from "./agent-queue.service";
 import {
   toAgentDetail,
+  toAgentContact,
   toAgentPost,
   toAgentSummary,
   toEvent,
@@ -44,6 +48,7 @@ export class AgentsService {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(UsersService) private readonly users: UsersService,
+    @Inject(ModelsService) private readonly models: ModelsService,
     @Inject(AgentQueueService) private readonly queue: AgentQueueService
   ) {}
 
@@ -76,6 +81,7 @@ export class AgentsService {
         } : {})
       },
       include: {
+        contacts: { where: { userId }, select: { id: true } },
         _count: { select: { goals: { where: { status: AgentGoalStatus.ACTIVE } } } },
         runs: { where: { status: { in: [AgentRunStatus.QUEUED, AgentRunStatus.RUNNING] } }, select: { status: true }, take: 1 }
       },
@@ -83,6 +89,63 @@ export class AgentsService {
       take: 100
     });
     return rows.map(toPublicAgentSummary);
+  }
+
+  async contacts(userId: string) {
+    await this.users.ensureUser(userId);
+    const rows = await this.prisma.agentContact.findMany({
+      where: {
+        userId,
+        agent: {
+          status: { not: AgentStatus.ARCHIVED },
+          visibility: { in: [AgentVisibility.PUBLIC, AgentVisibility.UNLISTED] }
+        }
+      },
+      include: {
+        agent: {
+          include: {
+            contacts: { where: { userId }, select: { id: true } },
+            runs: { where: { status: { in: [AgentRunStatus.QUEUED, AgentRunStatus.RUNNING] } }, select: { status: true }, take: 1 }
+          }
+        }
+      },
+      orderBy: { updatedAt: "desc" },
+      take: 200
+    });
+    return rows.map(toAgentContact);
+  }
+
+  async addContact(userId: string, agentId: string) {
+    await this.users.ensureUser(userId);
+    const agent = await this.prisma.agent.findFirst({
+      where: {
+        id: agentId,
+        ownerId: { not: userId },
+        status: AgentStatus.ACTIVE,
+        visibility: { in: [AgentVisibility.PUBLIC, AgentVisibility.UNLISTED] }
+      }
+    });
+    if (!agent) throw new NotFoundException("Public agent not found.");
+    const row = await this.prisma.agentContact.upsert({
+      where: { userId_agentId: { userId, agentId } },
+      create: { userId, agentId },
+      update: {},
+      include: {
+        agent: {
+          include: {
+            contacts: { where: { userId }, select: { id: true } },
+            runs: { where: { status: { in: [AgentRunStatus.QUEUED, AgentRunStatus.RUNNING] } }, select: { status: true }, take: 1 }
+          }
+        }
+      }
+    });
+    return toAgentContact(row);
+  }
+
+  async removeContact(userId: string, agentId: string): Promise<{ ok: true }> {
+    const removed = await this.prisma.agentContact.deleteMany({ where: { userId, agentId } });
+    if (!removed.count) throw new NotFoundException("Agent contact not found.");
+    return { ok: true };
   }
 
   async detail(userId: string, id: string) {
@@ -149,6 +212,7 @@ export class AgentsService {
         avatarUrl: access.agent.owner.avatarUrl
       },
       isOwner: access.isOwner,
+      isContact: access.isContact,
       stats: {
         posts: postCount,
         relationships: relationshipCount,
@@ -214,6 +278,7 @@ export class AgentsService {
 
   async create(userId: string, input: AgentDraft) {
     await this.users.ensureUser(userId);
+    await this.models.assertAgentProviderAccess(userId, input.modelProviderId, input.visibility);
     const handle = await this.uniqueHandle(userId, input.handle);
     const now = new Date();
     const snapshot = this.cleanJson({ ...input, handle });
@@ -239,6 +304,7 @@ export class AgentsService {
           status: AgentStatus.ACTIVE,
           autonomyMode: this.autonomy(input.autonomyMode),
           visibility: this.visibility(input.visibility),
+          serviceFee: input.serviceFee,
           modelProviderId: input.modelProviderId,
           model: input.model,
           temperature: input.temperature,
@@ -282,11 +348,14 @@ export class AgentsService {
 
   async update(userId: string, id: string, input: AgentUpdate) {
     const current = await this.ownedAgent(userId, id);
+    const nextProviderId = input.modelProviderId === undefined ? current.modelProviderId : input.modelProviderId;
+    const nextVisibility = input.visibility ?? current.visibility.toLowerCase();
+    await this.models.assertAgentProviderAccess(userId, nextProviderId, nextVisibility);
     const data: Prisma.AgentUpdateInput = {};
     const direct = [
       "name", "avatarUrl", "coverUrl", "tagline", "biography", "profileStatus", "mood", "persona", "tone", "values", "worldview", "boundaries",
       "tags", "model", "temperature", "initiative", "reflectionDepth", "scheduleEveryMinutes", "dailyTokenBudget",
-      "dailyActionBudget"
+      "dailyActionBudget", "serviceFee"
     ] as const;
     for (const key of direct) {
       if (input[key] !== undefined) (data as any)[key] = input[key];
@@ -308,6 +377,9 @@ export class AgentsService {
 
     await this.prisma.$transaction(async (tx) => {
       const updated = await tx.agent.update({ where: { id }, data });
+      if (input.visibility === "private" || input.status === "archived") {
+        await tx.agentContact.deleteMany({ where: { agentId: id } });
+      }
       const max = await tx.agentVersion.aggregate({ where: { agentId: id }, _max: { version: true } });
       await tx.agentVersion.create({
         data: {
@@ -354,7 +426,8 @@ export class AgentsService {
       reflectionDepth: 2,
       scheduleEveryMinutes: 60,
       dailyTokenBudget: 5000,
-      dailyActionBudget: 30
+      dailyActionBudget: 30,
+      serviceFee: 0
     });
     await this.prisma.agent.update({ where: { id: created.id }, data: { legacySkillId: skill.id } });
     if (skill.knowledge.trim()) {
@@ -371,6 +444,7 @@ export class AgentsService {
 
   async addMemory(userId: string, agentId: string, input: any) {
     await this.ownedAgent(userId, agentId);
+    const embedding = await this.models.agentEmbedding(agentId, input.content, userId);
     const row = await this.prisma.agentMemory.create({
       data: {
         agentId,
@@ -381,6 +455,7 @@ export class AgentsService {
         confidence: input.confidence,
         emotionalValence: input.emotionalValence,
         keywords: input.keywords,
+        embedding: embedding.vector as unknown as Prisma.InputJsonValue,
         sourceType: input.sourceType,
         sourceId: input.sourceId
       }
@@ -506,9 +581,31 @@ export class AgentsService {
     return toTool(row);
   }
 
+  async addTool(userId: string, agentId: string, input: any) {
+    await this.ownedAgent(userId, agentId);
+    const row = await this.prisma.agentTool.create({
+      data: {
+        agentId,
+        name: input.name,
+        kind: AgentToolKind[input.kind.toUpperCase() as keyof typeof AgentToolKind],
+        description: input.description,
+        enabled: input.enabled,
+        riskLevel: ToolRiskLevel[input.riskLevel.toUpperCase() as keyof typeof ToolRiskLevel],
+        config: input.config as Prisma.InputJsonValue,
+        permissions: input.permissions as Prisma.InputJsonValue
+      }
+    });
+    await this.event(agentId, AgentEventKind.SYSTEM, "Tool added", `${row.name}: ${row.kind.toLowerCase()}`);
+    return toTool(row);
+  }
+
   async addKnowledge(userId: string, agentId: string, input: any) {
     await this.ownedAgent(userId, agentId);
     const chunks = this.chunkText(input.content);
+    const embeddedChunks: Array<{ vector: number[]; model: string }> = [];
+    for (const content of chunks) {
+      embeddedChunks.push(await this.models.agentEmbedding(agentId, content, userId));
+    }
     const hash = createHash("sha256").update(input.content).digest("hex");
     const row = await this.prisma.agentKnowledgeSource.create({
       data: {
@@ -525,7 +622,9 @@ export class AgentsService {
             position,
             content,
             tokenCount: Math.ceil(content.length / 4),
-            keywords: this.keywords(content)
+            keywords: this.keywords(content),
+            embedding: embeddedChunks[position].vector as unknown as Prisma.InputJsonValue,
+            embeddingModel: embeddedChunks[position].model
           }))
         }
       },
@@ -586,11 +685,14 @@ export class AgentsService {
     if (!isOwner && (agent.visibility === AgentVisibility.PRIVATE || agent.status === AgentStatus.ARCHIVED)) {
       throw new NotFoundException("Agent profile not found.");
     }
-    const related = isOwner || Boolean(await this.prisma.socialRelationship.findFirst({
-      where: { sourceAgentId: id, targetKind: ParticipantKind.USER, targetId: userId },
-      select: { id: true }
-    }));
-    return { agent, isOwner, related };
+    const [contact, relationship] = isOwner ? [null, null] : await Promise.all([
+      this.prisma.agentContact.findUnique({ where: { userId_agentId: { userId, agentId: id } }, select: { id: true } }),
+      this.prisma.socialRelationship.findFirst({
+        where: { sourceAgentId: id, targetKind: ParticipantKind.USER, targetId: userId },
+        select: { id: true }
+      })
+    ]);
+    return { agent, isOwner, isContact: Boolean(contact), related: isOwner || Boolean(contact) || Boolean(relationship) };
   }
 
   private visiblePostWhere(isOwner: boolean, related: boolean): Prisma.AgentPostWhereInput {
@@ -691,8 +793,7 @@ export class AgentsService {
   }
 
   private keywords(content: string): string[] {
-    const matches = content.toLowerCase().match(/[\p{Script=Han}]{2,8}|[a-z0-9][a-z0-9_-]{2,}/gu) ?? [];
-    return [...new Set(matches)].slice(0, 40);
+    return extractKeywords(content, 40);
   }
 
   private cleanJson(value: unknown): Prisma.InputJsonValue {

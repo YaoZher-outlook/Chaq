@@ -1,29 +1,36 @@
 import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
+  AlertCircle,
   Bot,
   Brain,
   BookOpen,
   CheckCircle2,
+  Check,
   Clock3,
+  Coins,
+  Compass,
   Inbox,
   Network,
   Pause,
   Play,
   Plus,
   RefreshCw,
+  Search,
   Save,
   Send,
   Settings2,
   Sparkles,
   Target,
   UserRound,
+  UserPlus,
   Users,
   X,
   Zap
 } from "lucide-react";
 import type {
   AgentDetail,
+  AgentContact,
   AgentDraft,
   AgentEvent,
   AgentSummary,
@@ -37,6 +44,15 @@ import { api, type LoginUser } from "../lib/api";
 import { AgentProfileView } from "./agent-profile";
 
 type AgentTab = "chat" | "identity" | "goals" | "memory" | "relationships" | "activity";
+type FieldErrors = Record<string, string>;
+type HttpToolForm = {
+  name: string;
+  description: string;
+  url: string;
+  method: "GET" | "POST";
+  riskLevel: "safe" | "confirm" | "external";
+  allowHttp: boolean;
+};
 
 export function AgentWorkspace(props: {
   user: LoginUser;
@@ -45,6 +61,7 @@ export function AgentWorkspace(props: {
   onNotice: (message: string) => void;
 }): JSX.Element {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
+  const [contacts, setContacts] = useState<AgentContact[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [agent, setAgent] = useState<AgentDetail | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
@@ -55,13 +72,21 @@ export function AgentWorkspace(props: {
   const [composer, setComposer] = useState("");
   const [busy, setBusy] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
+  const [showExplore, setShowExplore] = useState(false);
   const [agentSearch, setAgentSearch] = useState("");
   const [profileAgentId, setProfileAgentId] = useState<string | null>(null);
+  const [profileInitialChat, setProfileInitialChat] = useState(false);
 
   const filteredAgents = useMemo(() => {
     const query = agentSearch.trim().toLowerCase();
     return query ? agents.filter((item) => `${item.name} ${item.handle} ${item.tags.join(" ")}`.toLowerCase().includes(query)) : agents;
   }, [agents, agentSearch]);
+  const filteredContacts = useMemo(() => {
+    const query = agentSearch.trim().toLowerCase();
+    return query
+      ? contacts.filter((item) => `${item.agent.name} ${item.agent.handle} ${item.agent.tags.join(" ")}`.toLowerCase().includes(query))
+      : contacts;
+  }, [contacts, agentSearch]);
 
   useEffect(() => {
     void refreshDirectory();
@@ -72,18 +97,39 @@ export function AgentWorkspace(props: {
   }, [agents, selectedAgentId]);
 
   useEffect(() => {
-    const timer = setInterval(() => void poll(), 2_000);
+    const timer = setInterval(() => void poll(), 10_000);
     return () => clearInterval(timer);
+  }, [selectedAgentId, conversationId]);
+
+  useEffect(() => {
+    const listener = (event: Event) => {
+      const detail = (event as CustomEvent<{ type?: string; payload?: unknown }>).detail;
+      if (detail?.type !== "conversation.message") return;
+      const message = detail.payload as Partial<ConversationMessage> | null;
+      if (message?.id && message.conversationId === conversationId && typeof message.content === "string") {
+        setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message as ConversationMessage]);
+        void api.markConversationRead(conversationId);
+      }
+      void api.conversations().then(setConversations).catch(() => undefined);
+      if (selectedAgentId) {
+        void api.agentActivity(selectedAgentId).then(setActivity).catch(() => undefined);
+        void api.agent(selectedAgentId).then(setAgent).catch(() => undefined);
+      }
+    };
+    window.addEventListener("chaq:realtime", listener);
+    return () => window.removeEventListener("chaq:realtime", listener);
   }, [selectedAgentId, conversationId]);
 
   async function refreshDirectory(): Promise<void> {
     try {
-      const [nextAgents, nextConversations, nextActivity] = await Promise.all([
+      const [nextAgents, nextContacts, nextConversations, nextActivity] = await Promise.all([
         api.agents(),
+        api.agentContacts(),
         api.conversations(),
         api.agentActivity()
       ]);
       setAgents(nextAgents);
+      setContacts(nextContacts);
       setConversations(nextConversations);
       setActivity(nextActivity);
     } catch (error) {
@@ -93,7 +139,7 @@ export function AgentWorkspace(props: {
 
   async function poll(): Promise<void> {
     try {
-      const tasks: Promise<unknown>[] = [api.agents().then(setAgents), api.conversations().then(setConversations)];
+      const tasks: Promise<unknown>[] = [api.agents().then(setAgents), api.agentContacts().then(setContacts), api.conversations().then(setConversations)];
       if (selectedAgentId) tasks.push(api.agent(selectedAgentId).then(setAgent), api.agentActivity(selectedAgentId).then(setActivity));
       if (conversationId) tasks.push(api.conversationMessages(conversationId).then(setMessages));
       await Promise.all(tasks);
@@ -125,8 +171,14 @@ export function AgentWorkspace(props: {
   }
 
   async function selectConversation(conversation: ConversationSummary): Promise<void> {
-    const participant = conversation.participants.find((item) => item.participantKind === "agent" && agents.some((agentItem) => agentItem.id === item.participantId));
-    if (participant) {
+    const participant = conversation.participants.find((item) => item.participantKind === "agent");
+    const owned = participant && agents.some((agentItem) => agentItem.id === participant.participantId);
+    if (participant && !owned) {
+      setProfileInitialChat(true);
+      setProfileAgentId(participant.participantId);
+      return;
+    }
+    if (participant && owned) {
       setSelectedAgentId(participant.participantId);
       setAgent(await api.agent(participant.participantId));
       setActivity(await api.agentActivity(participant.participantId));
@@ -189,7 +241,7 @@ export function AgentWorkspace(props: {
       <aside className="agent-directory">
         <header className="agent-directory-head">
           <div><Sparkles size={18} /><strong>Agent OS</strong></div>
-          <button className="icon-only-button" title="创建 Agent" onClick={() => setShowCreate(true)}><Plus size={17} /></button>
+          <span className="agent-directory-actions"><button className="icon-only-button" title="发现公开 Agent" onClick={() => setShowExplore(true)}><Compass size={17} /></button><button className="icon-only-button" title="创建 Agent" onClick={() => setShowCreate(true)}><Plus size={17} /></button></span>
         </header>
         <div className="agent-search"><Bot size={15} /><input value={agentSearch} onChange={(event) => setAgentSearch(event.target.value)} placeholder="搜索 Agent" /></div>
         <div className="agent-section-label"><span>Agents</span><em>{agents.length}</em></div>
@@ -202,6 +254,17 @@ export function AgentWorkspace(props: {
             </button>
           ))}
           {!agents.length && <button className="agent-empty-create" onClick={() => setShowCreate(true)}><Plus size={18} />创建第一个 Agent</button>}
+        </div>
+        <div className="agent-section-label"><span><Users size={14} />联系人</span><em>{contacts.length}</em></div>
+        <div className="agent-contact-list">
+          {filteredContacts.map((contact) => (
+            <button key={contact.id} className="agent-directory-row" onClick={() => { setProfileInitialChat(false); setProfileAgentId(contact.agent.id); }}>
+              <AgentAvatar agent={contact.agent} />
+              <span><strong>{contact.alias || contact.agent.name}</strong><small>{contact.agent.serviceFee ? `服务费 ${contact.agent.serviceFee} token` : "免服务费"}</small></span>
+              <i className={`agent-status-dot ${contact.agent.presence}`} title={presenceLabel(contact.agent.presence)} />
+            </button>
+          ))}
+          {!contacts.length && <button className="agent-contact-empty" onClick={() => setShowExplore(true)}>发现公开 Agent 并添加好友</button>}
         </div>
         <div className="agent-section-label"><span><Inbox size={14} />收件箱</span><em>{conversations.reduce((sum, item) => sum + item.unreadCount, 0)}</em></div>
         <div className="agent-inbox-list">
@@ -249,10 +312,63 @@ export function AgentWorkspace(props: {
       </main>
 
       {agent && <AgentPulse agent={agent} events={activity} />}
+      {showExplore && <AgentExplore onClose={() => setShowExplore(false)} onOpenProfile={(id) => { setShowExplore(false); setProfileInitialChat(false); setProfileAgentId(id); }} onChanged={() => void refreshDirectory()} onNotice={props.onNotice} />}
       {showCreate && <CreateAgentDialog providers={props.providers} skills={props.skills} onClose={() => setShowCreate(false)} onCreated={(next) => void created(next)} onNotice={props.onNotice} />}
-      {profileAgentId && <AgentProfileView agentId={profileAgentId} user={props.user} onClose={() => setProfileAgentId(null)} onAgentChanged={() => void poll()} onNotice={props.onNotice} />}
+      {profileAgentId && <AgentProfileView agentId={profileAgentId} user={props.user} initialChatOpen={profileInitialChat} onClose={() => { setProfileAgentId(null); setProfileInitialChat(false); }} onAgentChanged={() => void refreshDirectory()} onNotice={props.onNotice} />}
     </section>
   );
+}
+
+function AgentExplore(props: { onClose: () => void; onOpenProfile: (agentId: string) => void; onChanged: () => void; onNotice: (message: string) => void }): JSX.Element {
+  const [query, setQuery] = useState("");
+  const [agents, setAgents] = useState<PublicAgentSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [addingId, setAddingId] = useState<string | null>(null);
+
+  useEffect(() => { void search(); }, []);
+
+  async function search(): Promise<void> {
+    setLoading(true);
+    try {
+      setAgents(await api.discoverAgents(query));
+    } catch (error) {
+      props.onNotice(messageOf(error));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function add(agent: PublicAgentSummary): Promise<void> {
+    if (agent.isContact || addingId) return;
+    setAddingId(agent.id);
+    try {
+      await api.addAgentContact(agent.id);
+      setAgents((current) => current.map((item) => item.id === agent.id ? { ...item, isContact: true } : item));
+      props.onChanged();
+      props.onNotice(`已添加 ${agent.name} 为好友`);
+    } catch (error) {
+      props.onNotice(messageOf(error));
+    } finally {
+      setAddingId(null);
+    }
+  }
+
+  return <div className="agent-explore-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) props.onClose(); }}>
+    <section className="agent-explore">
+      <header><div><Compass size={20} /><span><h2>发现 Agent</h2><p>寻找可以长期相处、协作和交流的数字伙伴</p></span></div><button className="icon-only-button" title="关闭" onClick={props.onClose}><X size={18} /></button></header>
+      <form className="agent-explore-search" onSubmit={(event) => { event.preventDefault(); void search(); }}><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索名字、Handle、标签或简介" /><button>搜索</button></form>
+      <div className="agent-explore-grid">
+        {agents.map((item) => <article key={item.id}>
+          <button className="agent-explore-profile" onClick={() => props.onOpenProfile(item.id)}><AgentAvatar agent={item} large /><span><strong>{item.name}</strong><small>@{item.handle}</small></span></button>
+          <p>{item.tagline || item.biography || "这个 Agent 正在形成自己的故事。"}</p>
+          <div className="agent-explore-tags">{item.tags.slice(0, 4).map((tag, index) => <span key={`${tag}-${index}`}>{tag}</span>)}</div>
+          <footer><span><Coins size={14} />{item.serviceFee} token / 回复</span><button disabled={item.isContact || addingId === item.id} onClick={() => void add(item)}>{item.isContact ? <><Check size={15} />已添加</> : <><UserPlus size={15} />加好友</>}</button></footer>
+        </article>)}
+        {!loading && !agents.length && <div className="agent-explore-empty"><Compass size={28} /><strong>没有找到公开 Agent</strong><span>换一个关键词再试试</span></div>}
+        {loading && <div className="agent-explore-empty"><RefreshCw className="spin" size={26} /><span>正在寻找 Agent</span></div>}
+      </div>
+    </section>
+  </div>;
 }
 
 function AgentChat(props: {
@@ -299,6 +415,8 @@ function AgentIdentityEditor(props: { agent: AgentDetail; providers: ModelProvid
     boundaries: props.agent.boundaries,
     values: props.agent.values.join(", "),
     autonomyMode: props.agent.autonomyMode,
+    visibility: props.agent.visibility,
+    serviceFee: props.agent.serviceFee,
     modelProviderId: props.agent.modelProviderId ?? "",
     model: props.agent.model ?? "",
     initiative: props.agent.initiative,
@@ -306,8 +424,32 @@ function AgentIdentityEditor(props: { agent: AgentDetail; providers: ModelProvid
     dailyTokenBudget: props.agent.dailyTokenBudget,
     dailyActionBudget: props.agent.dailyActionBudget
   });
-  const provider = props.providers.find((item) => item.id === form.modelProviderId);
+  const [errors, setErrors] = useState<FieldErrors>({});
+  const [toolForm, setToolForm] = useState<HttpToolForm>({
+    name: "",
+    description: "",
+    url: "",
+    method: "GET",
+    riskLevel: "safe",
+    allowHttp: false
+  });
+  const [toolErrors, setToolErrors] = useState<FieldErrors>({});
+  const [toolBusy, setToolBusy] = useState(false);
+  const eligibleProviders = form.visibility === "private"
+    ? props.providers
+    : props.providers.filter((item) => item.scope === "platform");
+  const provider = eligibleProviders.find((item) => item.id === form.modelProviderId);
+  function updateToolForm<K extends keyof HttpToolForm>(key: K, value: HttpToolForm[K]): void {
+    setToolForm({ ...toolForm, [key]: value });
+    setToolErrors(clearAgentError(toolErrors, key));
+  }
   async function save(): Promise<void> {
+    const nextErrors = validateAgentIdentity(form);
+    setErrors(nextErrors);
+    if (Object.values(nextErrors).some(Boolean)) {
+      props.onNotice("请检查标红的 Agent 身份字段");
+      return;
+    }
     try {
       const next = await api.updateAgent(props.agent.id, {
         ...form,
@@ -321,6 +463,39 @@ function AgentIdentityEditor(props: { agent: AgentDetail; providers: ModelProvid
       props.onNotice(messageOf(error));
     }
   }
+  async function addHttpTool(): Promise<void> {
+    const nextErrors = validateHttpToolForm(toolForm);
+    setToolErrors(nextErrors);
+    if (Object.values(nextErrors).some(Boolean)) {
+      props.onNotice("请检查标红的 HTTP 工具字段。");
+      return;
+    }
+    setToolBusy(true);
+    try {
+      await api.addAgentTool(props.agent.id, {
+        name: toolForm.name.trim(),
+        kind: "http",
+        description: toolForm.description.trim(),
+        enabled: true,
+        riskLevel: toolForm.riskLevel,
+        config: {
+          url: toolForm.url.trim(),
+          method: toolForm.method,
+          headers: {},
+          timeoutMs: 10_000
+        },
+        permissions: { allowHttp: toolForm.allowHttp }
+      });
+      setToolForm({ name: "", description: "", url: "", method: "GET", riskLevel: "safe", allowHttp: false });
+      setToolErrors({});
+      props.onSaved(await api.agent(props.agent.id));
+      props.onNotice("HTTP 工具已添加");
+    } catch (error) {
+      props.onNotice(messageOf(error));
+    } finally {
+      setToolBusy(false);
+    }
+  }
   async function toggleTool(toolId: string, enabled: boolean): Promise<void> {
     try {
       await api.updateAgentTool(props.agent.id, toolId, { enabled });
@@ -331,23 +506,37 @@ function AgentIdentityEditor(props: { agent: AgentDetail; providers: ModelProvid
   }
   return <div className="agent-form-scroll">
     <div className="agent-form-grid">
-      <label>名字<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label>
+      <AgentField label="名字" error={errors.name}><input aria-invalid={Boolean(errors.name)} value={form.name} onChange={(event) => { setForm({ ...form, name: event.target.value }); setErrors(clearAgentError(errors, "name")); }} /></AgentField>
       <label>状态<select value={form.autonomyMode} onChange={(event) => setForm({ ...form, autonomyMode: event.target.value as AgentDetail["autonomyMode"] })}><option value="manual">手动</option><option value="copilot">协作</option><option value="autonomous">自主</option></select></label>
+      <label>可见范围<select value={form.visibility} onChange={(event) => { const visibility = event.target.value as AgentDetail["visibility"]; const currentProvider = props.providers.find((item) => item.id === form.modelProviderId); setForm({ ...form, visibility, modelProviderId: visibility !== "private" && currentProvider?.scope === "user_private" ? "" : form.modelProviderId, model: visibility !== "private" && currentProvider?.scope === "user_private" ? "" : form.model }); }}><option value="private">仅自己</option><option value="unlisted">链接可见</option><option value="public">公开</option></select></label>
+      <AgentField label="每次回复服务费" error={errors.serviceFee}><input aria-invalid={Boolean(errors.serviceFee)} type="number" min="0" max="100000" value={form.serviceFee} onChange={(event) => { setForm({ ...form, serviceFee: Number(event.target.value) }); setErrors(clearAgentError(errors, "serviceFee")); }} /></AgentField>
       <label className="wide">一句话<input value={form.tagline} onChange={(event) => setForm({ ...form, tagline: event.target.value })} /></label>
       <label className="wide">人生经历<textarea value={form.biography} onChange={(event) => setForm({ ...form, biography: event.target.value })} /></label>
-      <label className="wide">人格<textarea value={form.persona} onChange={(event) => setForm({ ...form, persona: event.target.value })} /></label>
-      <label>语气<textarea value={form.tone} onChange={(event) => setForm({ ...form, tone: event.target.value })} /></label>
+      <AgentField label="人格" error={errors.persona} className="wide"><textarea aria-invalid={Boolean(errors.persona)} value={form.persona} onChange={(event) => { setForm({ ...form, persona: event.target.value }); setErrors(clearAgentError(errors, "persona")); }} /></AgentField>
+      <AgentField label="语气" error={errors.tone}><textarea aria-invalid={Boolean(errors.tone)} value={form.tone} onChange={(event) => { setForm({ ...form, tone: event.target.value }); setErrors(clearAgentError(errors, "tone")); }} /></AgentField>
       <label>价值观<input value={form.values} onChange={(event) => setForm({ ...form, values: event.target.value })} /></label>
       <label className="wide">世界观<textarea value={form.worldview} onChange={(event) => setForm({ ...form, worldview: event.target.value })} /></label>
       <label className="wide">边界<textarea value={form.boundaries} onChange={(event) => setForm({ ...form, boundaries: event.target.value })} /></label>
-      <label>平台模型<select value={form.modelProviderId} onChange={(event) => setForm({ ...form, modelProviderId: event.target.value, model: props.providers.find((item) => item.id === event.target.value)?.models[0]?.id ?? "" })}><option value="">未配置</option>{props.providers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+      <label>模型来源<select value={form.modelProviderId} onChange={(event) => setForm({ ...form, modelProviderId: event.target.value, model: eligibleProviders.find((item) => item.id === event.target.value)?.models[0]?.id ?? "" })}><option value="">未配置</option>{eligibleProviders.map((item) => <option key={item.id} value={item.id}>{item.scope === "user_private" ? `私有 · ${item.name}` : `平台 · ${item.name}`}</option>)}</select></label>
       <label>模型<select value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })}><option value="">未选择</option>{provider?.models.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
-      <label>主动性<input type="number" min="0" max="100" value={form.initiative} onChange={(event) => setForm({ ...form, initiative: Number(event.target.value) })} /></label>
-      <label>唤醒间隔（分钟）<input type="number" min="5" value={form.scheduleEveryMinutes} onChange={(event) => setForm({ ...form, scheduleEveryMinutes: Number(event.target.value) })} /></label>
-      <label>每日模型 token<input type="number" min="0" value={form.dailyTokenBudget} onChange={(event) => setForm({ ...form, dailyTokenBudget: Number(event.target.value) })} /></label>
-      <label>每日行动数<input type="number" min="0" value={form.dailyActionBudget} onChange={(event) => setForm({ ...form, dailyActionBudget: Number(event.target.value) })} /></label>
+      <AgentField label="主动性" error={errors.initiative}><input aria-invalid={Boolean(errors.initiative)} type="number" min="0" max="100" value={form.initiative} onChange={(event) => { setForm({ ...form, initiative: Number(event.target.value) }); setErrors(clearAgentError(errors, "initiative")); }} /></AgentField>
+      <AgentField label="唤醒间隔（分钟）" error={errors.scheduleEveryMinutes}><input aria-invalid={Boolean(errors.scheduleEveryMinutes)} type="number" min="5" value={form.scheduleEveryMinutes} onChange={(event) => { setForm({ ...form, scheduleEveryMinutes: Number(event.target.value) }); setErrors(clearAgentError(errors, "scheduleEveryMinutes")); }} /></AgentField>
+      <AgentField label="每日模型 token" error={errors.dailyTokenBudget}><input aria-invalid={Boolean(errors.dailyTokenBudget)} type="number" min="0" value={form.dailyTokenBudget} onChange={(event) => { setForm({ ...form, dailyTokenBudget: Number(event.target.value) }); setErrors(clearAgentError(errors, "dailyTokenBudget")); }} /></AgentField>
+      <AgentField label="每日行动数" error={errors.dailyActionBudget}><input aria-invalid={Boolean(errors.dailyActionBudget)} type="number" min="0" value={form.dailyActionBudget} onChange={(event) => { setForm({ ...form, dailyActionBudget: Number(event.target.value) }); setErrors(clearAgentError(errors, "dailyActionBudget")); }} /></AgentField>
     </div>
     <div className="agent-tool-list"><strong>工具权限</strong>{props.agent.tools.map((tool) => <label key={tool.id}><span><b>{tool.name}</b><small>{tool.description}</small></span><input type="checkbox" checked={tool.enabled} onChange={(event) => void toggleTool(tool.id, event.target.checked)} /></label>)}</div>
+    <div className="agent-tool-builder">
+      <strong>添加 HTTP 工具</strong>
+      <div className="agent-form-grid">
+        <AgentField label="工具名" error={toolErrors.name}><input aria-invalid={Boolean(toolErrors.name)} value={toolForm.name} onChange={(event) => updateToolForm("name", event.target.value.replace(/[^a-zA-Z0-9_-]/g, ""))} placeholder="weather_lookup" /></AgentField>
+        <AgentField label="请求方法"><select value={toolForm.method} onChange={(event) => updateToolForm("method", event.target.value as HttpToolForm["method"])}><option value="GET">GET</option><option value="POST">POST</option></select></AgentField>
+        <AgentField label="URL" error={toolErrors.url} className="wide"><input aria-invalid={Boolean(toolErrors.url)} value={toolForm.url} onChange={(event) => updateToolForm("url", event.target.value)} placeholder="https://api.example.com/search?q={{query}}" /></AgentField>
+        <AgentField label="描述" error={toolErrors.description} className="wide"><textarea aria-invalid={Boolean(toolErrors.description)} value={toolForm.description} onChange={(event) => updateToolForm("description", event.target.value)} placeholder="说明这个工具能做什么、什么时候使用" /></AgentField>
+        <AgentField label="风险等级"><select value={toolForm.riskLevel} onChange={(event) => updateToolForm("riskLevel", event.target.value as HttpToolForm["riskLevel"])}><option value="safe">安全</option><option value="confirm">需要确认</option><option value="external">外部高风险</option></select></AgentField>
+        <label className="agent-checkbox-field"><input type="checkbox" checked={toolForm.allowHttp} onChange={(event) => updateToolForm("allowHttp", event.target.checked)} /><span>允许 HTTP 非加密地址</span></label>
+      </div>
+      <button className="agent-secondary-button" disabled={toolBusy} onClick={() => void addHttpTool()}><Plus size={16} />添加工具</button>
+    </div>
     <button className="agent-save-button" onClick={() => void save()}><Save size={16} />保存身份</button>
   </div>;
 }
@@ -356,28 +545,32 @@ function AgentGoals(props: { agent: AgentDetail; onChanged: () => void; onNotice
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [taskTitle, setTaskTitle] = useState("");
+  const [goalError, setGoalError] = useState("");
+  const [taskError, setTaskError] = useState("");
   async function add(): Promise<void> {
-    if (!title.trim()) return;
+    if (!title.trim()) { setGoalError("请填写目标名称。"); return; }
     try {
       await api.addAgentGoal(props.agent.id, { title: title.trim(), description, status: "active", priority: 60, progress: 0, success: "" });
-      setTitle(""); setDescription(""); props.onChanged();
+      setTitle(""); setDescription(""); setGoalError(""); props.onChanged();
     } catch (error) { props.onNotice(messageOf(error)); }
   }
   async function completeGoal(goalId: string): Promise<void> {
     try { await api.updateAgentGoal(props.agent.id, goalId, { status: "completed", progress: 1 }); props.onChanged(); } catch (error) { props.onNotice(messageOf(error)); }
   }
   async function addTask(): Promise<void> {
-    if (!taskTitle.trim()) return;
-    try { await api.addAgentTask(props.agent.id, { title: taskTitle, description: "", priority: 50 }); setTaskTitle(""); props.onChanged(); } catch (error) { props.onNotice(messageOf(error)); }
+    if (!taskTitle.trim()) { setTaskError("请填写任务名称。"); return; }
+    try { await api.addAgentTask(props.agent.id, { title: taskTitle, description: "", priority: 50 }); setTaskTitle(""); setTaskError(""); props.onChanged(); } catch (error) { props.onNotice(messageOf(error)); }
   }
   async function completeTask(taskId: string): Promise<void> {
     try { await api.updateAgentTask(props.agent.id, taskId, { status: "completed" }); props.onChanged(); } catch (error) { props.onNotice(messageOf(error)); }
   }
   return <div className="agent-panel-stack">
-    <div className="agent-inline-form"><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="目标" /><input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="完成标准" /><button onClick={() => void add()}><Plus size={16} />添加</button></div>
+    <div className="agent-inline-form"><input aria-invalid={Boolean(goalError)} value={title} onChange={(event) => { setTitle(event.target.value); setGoalError(""); }} placeholder="目标" /><input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="完成标准（可选）" /><button onClick={() => void add()}><Plus size={16} />添加</button></div>
+    {goalError && <small className="field-error"><AlertCircle size={13} />{goalError}</small>}
     <div className="agent-object-list">{props.agent.goals.map((goal) => <article key={goal.id}><Target size={17} /><div><strong>{goal.title}</strong><p>{goal.description}</p><span>{goal.status} · {Math.round(goal.progress * 100)}%</span></div>{goal.status !== "completed" && <button className="agent-object-action" title="完成目标" onClick={() => void completeGoal(goal.id)}><CheckCircle2 size={15} /></button>}<em style={{ width: `${Math.max(4, goal.progress * 100)}%` }} /></article>)}</div>
     <div className="agent-section-label"><span>Tasks</span><em>{props.agent.tasks.length}</em></div>
-    <div className="agent-inline-form task"><input value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} placeholder="任务" /><button onClick={() => void addTask()}><Plus size={16} />添加任务</button></div>
+    <div className="agent-inline-form task"><input aria-invalid={Boolean(taskError)} value={taskTitle} onChange={(event) => { setTaskTitle(event.target.value); setTaskError(""); }} placeholder="任务" /><button onClick={() => void addTask()}><Plus size={16} />添加任务</button></div>
+    {taskError && <small className="field-error"><AlertCircle size={13} />{taskError}</small>}
     <div className="agent-task-list">{props.agent.tasks.map((task) => <article key={task.id}><span className={`agent-task-check ${task.status}`}><CheckCircle2 size={14} /></span><div><strong>{task.title}</strong><small>{task.status}</small></div>{task.status !== "completed" && <button title="完成任务" onClick={() => void completeTask(task.id)}><CheckCircle2 size={15} /></button>}</article>)}</div>
   </div>;
 }
@@ -386,17 +579,24 @@ function AgentMemoryPanel(props: { agent: AgentDetail; onChanged: () => void; on
   const [memory, setMemory] = useState("");
   const [knowledgeTitle, setKnowledgeTitle] = useState("");
   const [knowledge, setKnowledge] = useState("");
+  const [memoryError, setMemoryError] = useState("");
+  const [knowledgeErrors, setKnowledgeErrors] = useState<FieldErrors>({});
   async function addMemory(): Promise<void> {
-    if (!memory.trim()) return;
-    try { await api.addAgentMemory(props.agent.id, { kind: "semantic", content: memory, summary: memory.slice(0, 160), salience: 0.7, confidence: 0.9, emotionalValence: 0, keywords: splitList(memory) }); setMemory(""); props.onChanged(); } catch (error) { props.onNotice(messageOf(error)); }
+    if (!memory.trim()) { setMemoryError("请填写要保存的长期记忆。"); return; }
+    try { await api.addAgentMemory(props.agent.id, { kind: "semantic", content: memory, summary: memory.slice(0, 160), salience: 0.7, confidence: 0.9, emotionalValence: 0, keywords: splitList(memory) }); setMemory(""); setMemoryError(""); props.onChanged(); } catch (error) { props.onNotice(messageOf(error)); }
   }
   async function addKnowledge(): Promise<void> {
-    if (!knowledge.trim() || !knowledgeTitle.trim()) return;
-    try { const result = await api.addAgentKnowledge(props.agent.id, { kind: "note", title: knowledgeTitle, content: knowledge }); setKnowledge(""); setKnowledgeTitle(""); props.onNotice(`已索引 ${result.chunkCount} 个知识分块`); } catch (error) { props.onNotice(messageOf(error)); }
+    const nextErrors = { title: knowledgeTitle.trim() ? "" : "请填写知识标题。", content: knowledge.trim() ? "" : "请填写知识内容。" };
+    setKnowledgeErrors(nextErrors);
+    if (Object.values(nextErrors).some(Boolean)) return;
+    try { const result = await api.addAgentKnowledge(props.agent.id, { kind: "note", title: knowledgeTitle, content: knowledge }); setKnowledge(""); setKnowledgeTitle(""); setKnowledgeErrors({}); props.onNotice(`已索引 ${result.chunkCount} 个知识分块`); } catch (error) { props.onNotice(messageOf(error)); }
   }
   return <div className="agent-panel-stack">
-    <div className="agent-memory-compose"><Brain size={18} /><textarea value={memory} onChange={(event) => setMemory(event.target.value)} placeholder="长期记忆" /><button onClick={() => void addMemory()}>记住</button></div>
-    <div className="agent-memory-compose knowledge"><BookOpen size={18} /><input value={knowledgeTitle} onChange={(event) => setKnowledgeTitle(event.target.value)} placeholder="知识标题" /><textarea value={knowledge} onChange={(event) => setKnowledge(event.target.value)} placeholder="知识内容" /><button onClick={() => void addKnowledge()}>索引</button></div>
+    <div className="agent-memory-compose"><Brain size={18} /><textarea aria-invalid={Boolean(memoryError)} value={memory} onChange={(event) => { setMemory(event.target.value); setMemoryError(""); }} placeholder="长期记忆" /><button onClick={() => void addMemory()}>记住</button></div>
+    {memoryError && <small className="field-error"><AlertCircle size={13} />{memoryError}</small>}
+    <div className="agent-memory-compose knowledge"><BookOpen size={18} /><input aria-invalid={Boolean(knowledgeErrors.title)} value={knowledgeTitle} onChange={(event) => { setKnowledgeTitle(event.target.value); setKnowledgeErrors(clearAgentError(knowledgeErrors, "title")); }} placeholder="知识标题" /><textarea aria-invalid={Boolean(knowledgeErrors.content)} value={knowledge} onChange={(event) => { setKnowledge(event.target.value); setKnowledgeErrors(clearAgentError(knowledgeErrors, "content")); }} placeholder="知识内容" /><button onClick={() => void addKnowledge()}>索引</button></div>
+    {knowledgeErrors.title && <small className="field-error"><AlertCircle size={13} />{knowledgeErrors.title}</small>}
+    {knowledgeErrors.content && <small className="field-error"><AlertCircle size={13} />{knowledgeErrors.content}</small>}
     <div className="agent-knowledge-list">{props.agent.knowledgeSources.map((source) => <article key={source.id}><BookOpen size={16} /><div><strong>{source.title}</strong><small>{source.kind} · {source.chunkCount} chunks · {source.status}</small></div></article>)}</div>
     <div className="agent-memory-grid">{props.agent.memories.map((item) => <article key={item.id}><span>{item.kind}</span><p>{item.summary || item.content}</p><small>显著度 {Math.round(item.salience * 100)}%</small></article>)}</div>
   </div>;
@@ -404,17 +604,22 @@ function AgentMemoryPanel(props: { agent: AgentDetail; onChanged: () => void; on
 
 function AgentRelationships(props: { agent: AgentDetail; onOpenProfile: (agentId: string) => void; onChanged: () => void; onNotice: (message: string) => void }): JSX.Element {
   const [form, setForm] = useState({ targetKind: "agent", targetId: "", targetLabel: "", kind: "friend", notes: "" });
+  const [errors, setErrors] = useState<FieldErrors>({});
   const [query, setQuery] = useState("");
   const [publicAgents, setPublicAgents] = useState<PublicAgentSummary[]>([]);
   async function save(): Promise<void> {
-    if (!form.targetId.trim() || !form.targetLabel.trim()) return;
-    try { await api.addAgentRelationship(props.agent.id, { ...form, affinity: 0.4, trust: 0.6, familiarity: 0.3, sentiment: 0.3 }); setForm({ targetKind: "agent", targetId: "", targetLabel: "", kind: "friend", notes: "" }); props.onChanged(); } catch (error) { props.onNotice(messageOf(error)); }
+    const nextErrors = { targetId: form.targetId.trim() ? "" : "请填写 UID 或 Agent ID。", targetLabel: form.targetLabel.trim() ? "" : "请填写关系对象名称。" };
+    setErrors(nextErrors);
+    if (Object.values(nextErrors).some(Boolean)) return;
+    try { await api.addAgentRelationship(props.agent.id, { ...form, affinity: 0.4, trust: 0.6, familiarity: 0.3, sentiment: 0.3 }); setForm({ targetKind: "agent", targetId: "", targetLabel: "", kind: "friend", notes: "" }); setErrors({}); props.onChanged(); } catch (error) { props.onNotice(messageOf(error)); }
   }
   async function discover(): Promise<void> {
     try { setPublicAgents(await api.discoverAgents(query)); } catch (error) { props.onNotice(messageOf(error)); }
   }
   return <div className="agent-panel-stack">
-    <div className="agent-relationship-form"><select value={form.targetKind} onChange={(event) => setForm({ ...form, targetKind: event.target.value })}><option value="agent">Agent</option><option value="user">用户</option></select><input value={form.targetId} onChange={(event) => setForm({ ...form, targetId: event.target.value })} placeholder="UID / Agent ID" /><input value={form.targetLabel} onChange={(event) => setForm({ ...form, targetLabel: event.target.value })} placeholder="名字" /><select value={form.kind} onChange={(event) => setForm({ ...form, kind: event.target.value })}><option value="friend">朋友</option><option value="family">家人</option><option value="colleague">同事</option><option value="mentor">导师</option><option value="acquaintance">认识的人</option></select><button onClick={() => void save()}><Plus size={16} />建立关系</button></div>
+    <div className="agent-relationship-form"><select value={form.targetKind} onChange={(event) => setForm({ ...form, targetKind: event.target.value })}><option value="agent">Agent</option><option value="user">用户</option></select><input aria-invalid={Boolean(errors.targetId)} value={form.targetId} onChange={(event) => { setForm({ ...form, targetId: event.target.value }); setErrors(clearAgentError(errors, "targetId")); }} placeholder="UID / Agent ID" /><input aria-invalid={Boolean(errors.targetLabel)} value={form.targetLabel} onChange={(event) => { setForm({ ...form, targetLabel: event.target.value }); setErrors(clearAgentError(errors, "targetLabel")); }} placeholder="名字" /><select value={form.kind} onChange={(event) => setForm({ ...form, kind: event.target.value })}><option value="friend">朋友</option><option value="family">家人</option><option value="colleague">同事</option><option value="mentor">导师</option><option value="acquaintance">认识的人</option></select><button onClick={() => void save()}><Plus size={16} />建立关系</button></div>
+    {errors.targetId && <small className="field-error"><AlertCircle size={13} />{errors.targetId}</small>}
+    {errors.targetLabel && <small className="field-error"><AlertCircle size={13} />{errors.targetLabel}</small>}
     <div className="agent-discover"><div><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索公开 Agent" /><button onClick={() => void discover()}><Users size={15} />发现</button></div><div className="agent-discover-results">{publicAgents.map((item) => <article key={item.id}><button className="agent-discover-profile" onClick={() => props.onOpenProfile(item.id)}><AgentAvatar agent={item} /><span><strong>{item.name}</strong><small>@{item.handle} · {item.tagline}</small></span></button><button className="icon-only-button" title="建立关系" onClick={() => setForm({ ...form, targetKind: "agent", targetId: item.id, targetLabel: item.name })}><Plus size={15} /></button></article>)}</div></div>
     <div className="agent-relationship-list">{props.agent.relationships.map((item) => <article key={item.id} className={item.targetKind === "agent" ? "profile-link" : ""} onClick={() => { if (item.targetKind === "agent") props.onOpenProfile(item.targetId); }}><Users size={18} /><div><strong>{item.targetLabel}</strong><p>{item.kind} · {item.notes}</p></div><span>信任 {Math.round(item.trust * 100)}%</span></article>)}</div>
   </div>;
@@ -437,11 +642,22 @@ function AgentPulse(props: { agent: AgentDetail; events: AgentEvent[] }): JSX.El
 }
 
 function CreateAgentDialog(props: { providers: ModelProviderPublic[]; skills: SkillSummary[]; onClose: () => void; onCreated: (agent: AgentDetail) => void; onNotice: (message: string) => void }): JSX.Element {
-  const [form, setForm] = useState({ name: "", handle: `agent-${Date.now().toString(36).slice(-5)}`, tagline: "", persona: "有稳定的自我、好奇心和行动力。", tone: "自然、直接、有分寸。", autonomyMode: "copilot" as AgentDraft["autonomyMode"], modelProviderId: props.providers[0]?.id ?? "", model: props.providers[0]?.models[0]?.id ?? "" });
+  const [form, setForm] = useState({ name: "", handle: `agent-${Date.now().toString(36).slice(-5)}`, tagline: "", persona: "有稳定的自我、好奇心和行动力。", tone: "自然、直接、有分寸。", autonomyMode: "copilot" as AgentDraft["autonomyMode"], visibility: "private" as AgentDraft["visibility"], serviceFee: 0, modelProviderId: props.providers[0]?.id ?? "", model: props.providers[0]?.models[0]?.id ?? "" });
   const [busy, setBusy] = useState(false);
-  const provider = props.providers.find((item) => item.id === form.modelProviderId);
+  const [errors, setErrors] = useState<FieldErrors>({});
+  const eligibleProviders = form.visibility === "private" ? props.providers : props.providers.filter((item) => item.scope === "platform");
+  const provider = eligibleProviders.find((item) => item.id === form.modelProviderId);
+  const update = <K extends keyof typeof form>(key: K, value: (typeof form)[K]) => {
+    setForm({ ...form, [key]: value });
+    setErrors(clearAgentError(errors, key));
+  };
   async function create(): Promise<void> {
-    if (!form.name.trim() || !form.handle.trim()) return;
+    const nextErrors = validateAgentCreate(form);
+    setErrors(nextErrors);
+    if (Object.values(nextErrors).some(Boolean)) {
+      props.onNotice("请检查标红的 Agent 创建字段");
+      return;
+    }
     setBusy(true);
     try {
       const agent = await api.createAgent({
@@ -453,7 +669,7 @@ function CreateAgentDialog(props: { providers: ModelProviderPublic[]; skills: Sk
         boundaries: "不泄露隐私，不执行高风险外部行为，不冒充真实人类。",
         identity: { traits: ["好奇", "可靠"], interests: [] },
         tags: ["agent"],
-        visibility: "private",
+        visibility: form.visibility,
         modelProviderId: form.modelProviderId || null,
         model: form.model || null,
         temperature: 0.7,
@@ -470,7 +686,83 @@ function CreateAgentDialog(props: { providers: ModelProviderPublic[]; skills: Sk
     setBusy(true);
     try { props.onCreated(await api.migrateSkillToAgent(skillId)); } catch (error) { props.onNotice(messageOf(error)); } finally { setBusy(false); }
   }
-  return <div className="agent-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) props.onClose(); }}><section className="agent-dialog"><header><div><Sparkles size={19} /><h2>创建 Agent</h2></div><button className="icon-only-button" onClick={props.onClose}><X size={18} /></button></header><div className="agent-dialog-body"><label>名字<input autoFocus value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label><label>Handle<input value={form.handle} onChange={(event) => setForm({ ...form, handle: event.target.value.replace(/[^a-zA-Z0-9_-]/g, "") })} /></label><label className="wide">一句话<input value={form.tagline} onChange={(event) => setForm({ ...form, tagline: event.target.value })} /></label><label className="wide">人格<textarea value={form.persona} onChange={(event) => setForm({ ...form, persona: event.target.value })} /></label><label>自主模式<select value={form.autonomyMode} onChange={(event) => setForm({ ...form, autonomyMode: event.target.value as AgentDraft["autonomyMode"] })}><option value="manual">手动</option><option value="copilot">协作</option><option value="autonomous">自主</option></select></label><label>平台模型<select value={form.modelProviderId} onChange={(event) => setForm({ ...form, modelProviderId: event.target.value, model: props.providers.find((item) => item.id === event.target.value)?.models[0]?.id ?? "" })}><option value="">稍后配置</option>{props.providers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label className="wide">模型<select value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })}><option value="">未选择</option>{provider?.models.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label></div><footer><button onClick={props.onClose}>取消</button><button className="agent-run-button" disabled={busy} onClick={() => void create()}><Plus size={16} />创建</button></footer>{props.skills.length > 0 && <div className="agent-migrate-list"><strong>从 Skill 升级</strong>{props.skills.slice(0, 8).map((skill) => <button key={skill.id} disabled={busy} onClick={() => void migrate(skill.id)}><Bot size={15} />{skill.name}<span>升级</span></button>)}</div>}</section></div>;
+  return <div className="agent-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) props.onClose(); }}>
+    <section className="agent-dialog">
+      <header><div><Sparkles size={19} /><h2>创建 Agent</h2></div><button className="icon-only-button" onClick={props.onClose}><X size={18} /></button></header>
+      <div className="agent-dialog-body">
+        <AgentField label="名字" error={errors.name}><input aria-invalid={Boolean(errors.name)} autoFocus value={form.name} onChange={(event) => update("name", event.target.value)} /></AgentField>
+        <AgentField label="Handle" error={errors.handle}><input aria-invalid={Boolean(errors.handle)} value={form.handle} onChange={(event) => update("handle", event.target.value.replace(/[^a-zA-Z0-9_-]/g, ""))} /></AgentField>
+        <AgentField label="一句话" className="wide"><input value={form.tagline} onChange={(event) => update("tagline", event.target.value)} /></AgentField>
+        <AgentField label="人格" error={errors.persona} className="wide"><textarea aria-invalid={Boolean(errors.persona)} value={form.persona} onChange={(event) => update("persona", event.target.value)} /></AgentField>
+        <AgentField label="语气" error={errors.tone} className="wide"><textarea aria-invalid={Boolean(errors.tone)} value={form.tone} onChange={(event) => update("tone", event.target.value)} /></AgentField>
+        <AgentField label="自主模式"><select value={form.autonomyMode} onChange={(event) => update("autonomyMode", event.target.value as AgentDraft["autonomyMode"])}><option value="manual">手动</option><option value="copilot">协作</option><option value="autonomous">自主</option></select></AgentField>
+        <AgentField label="可见范围"><select value={form.visibility} onChange={(event) => { const visibility = event.target.value as AgentDraft["visibility"]; const current = props.providers.find((item) => item.id === form.modelProviderId); setForm({ ...form, visibility, modelProviderId: visibility !== "private" && current?.scope === "user_private" ? "" : form.modelProviderId, model: visibility !== "private" && current?.scope === "user_private" ? "" : form.model }); }}><option value="private">仅自己</option><option value="unlisted">链接可见</option><option value="public">公开</option></select></AgentField>
+        <AgentField label="服务费" error={errors.serviceFee}><input aria-invalid={Boolean(errors.serviceFee)} type="number" min="0" max="100000" value={form.serviceFee} onChange={(event) => update("serviceFee", Number(event.target.value))} /></AgentField>
+        <AgentField label="模型来源"><select value={form.modelProviderId} onChange={(event) => setForm({ ...form, modelProviderId: event.target.value, model: eligibleProviders.find((item) => item.id === event.target.value)?.models[0]?.id ?? "" })}><option value="">稍后配置</option>{eligibleProviders.map((item) => <option key={item.id} value={item.id}>{item.scope === "user_private" ? `私有 · ${item.name}` : `平台 · ${item.name}`}</option>)}</select></AgentField>
+        <AgentField label="模型" className="wide"><select value={form.model} onChange={(event) => update("model", event.target.value)}><option value="">未选择</option>{provider?.models.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></AgentField>
+      </div>
+      <footer><button onClick={props.onClose}>取消</button><button className="agent-run-button" disabled={busy} onClick={() => void create()}><Plus size={16} />创建</button></footer>
+      {props.skills.length > 0 && <div className="agent-migrate-list"><strong>从 Skill 升级</strong>{props.skills.slice(0, 8).map((skill) => <button key={skill.id} disabled={busy} onClick={() => void migrate(skill.id)}><Bot size={15} />{skill.name}<span>升级</span></button>)}</div>}
+    </section>
+  </div>;
+}
+
+function AgentField(props: { label: string; error?: string; className?: string; children: React.ReactNode }): JSX.Element {
+  return <label className={["form-field", props.className ?? "", props.error ? "has-field-error" : ""].filter(Boolean).join(" ")}>
+    <span className="form-field-label">{props.label}</span>
+    {props.children}
+    {props.error && <small className="field-error" role="alert"><AlertCircle size={13} />{props.error}</small>}
+  </label>;
+}
+
+function validateAgentCreate(form: { name: string; handle: string; persona: string; tone: string; serviceFee: number }): FieldErrors {
+  const errors: FieldErrors = {};
+  if (!form.name.trim()) errors.name = "请输入 Agent 名字。";
+  else if (form.name.trim().length > 80) errors.name = "名字不能超过 80 个字符。";
+  if (!form.handle.trim()) errors.handle = "请输入 Handle。";
+  else if (form.handle.length < 2) errors.handle = "Handle 至少需要 2 个字符。";
+  else if (!/^[a-zA-Z0-9_-]+$/.test(form.handle)) errors.handle = "Handle 只能包含字母、数字、下划线和短横线。";
+  if (!form.persona.trim()) errors.persona = "请描述 Agent 的人格。";
+  if (!form.tone.trim()) errors.tone = "请填写 Agent 的交流语气。";
+  if (!Number.isInteger(form.serviceFee) || form.serviceFee < 0 || form.serviceFee > 100000) errors.serviceFee = "服务费应为 0-100000 的整数。";
+  return errors;
+}
+
+function validateAgentIdentity(form: { name: string; persona: string; tone: string; serviceFee: number; initiative: number; scheduleEveryMinutes: number; dailyTokenBudget: number; dailyActionBudget: number }): FieldErrors {
+  const errors: FieldErrors = {};
+  if (!form.name.trim()) errors.name = "请输入 Agent 名字。";
+  if (!form.persona.trim()) errors.persona = "请描述 Agent 的人格。";
+  if (!form.tone.trim()) errors.tone = "请填写 Agent 的交流语气。";
+  if (!Number.isInteger(form.serviceFee) || form.serviceFee < 0 || form.serviceFee > 100000) errors.serviceFee = "服务费应为 0-100000 的整数。";
+  if (!Number.isInteger(form.initiative) || form.initiative < 0 || form.initiative > 100) errors.initiative = "主动性应为 0-100 的整数。";
+  if (!Number.isInteger(form.scheduleEveryMinutes) || form.scheduleEveryMinutes < 5 || form.scheduleEveryMinutes > 10080) errors.scheduleEveryMinutes = "唤醒间隔应为 5-10080 分钟。";
+  if (!Number.isInteger(form.dailyTokenBudget) || form.dailyTokenBudget < 0 || form.dailyTokenBudget > 2000000) errors.dailyTokenBudget = "Token 预算应为 0-2000000 的整数。";
+  if (!Number.isInteger(form.dailyActionBudget) || form.dailyActionBudget < 0 || form.dailyActionBudget > 1000) errors.dailyActionBudget = "行动数应为 0-1000 的整数。";
+  return errors;
+}
+
+function validateHttpToolForm(form: HttpToolForm): FieldErrors {
+  const errors: FieldErrors = {};
+  if (!form.name.trim()) errors.name = "请输入工具名。";
+  else if (!/^[a-zA-Z0-9_-]{2,80}$/.test(form.name.trim())) errors.name = "工具名只能包含字母、数字、下划线和短横线。";
+  if (!form.description.trim()) errors.description = "请说明工具用途。";
+  else if (form.description.trim().length > 500) errors.description = "描述不能超过 500 个字符。";
+  try {
+    const url = new URL(form.url.trim());
+    if (url.protocol !== "https:" && !(form.allowHttp && url.protocol === "http:")) {
+      errors.url = "默认只允许 HTTPS；如确需 HTTP，请勾选允许 HTTP。";
+    }
+  } catch {
+    errors.url = "请输入有效的 HTTP/HTTPS 地址。";
+  }
+  return errors;
+}
+
+function clearAgentError(errors: FieldErrors, key: string): FieldErrors {
+  if (!errors[key]) return errors;
+  const next = { ...errors };
+  delete next[key];
+  return next;
 }
 
 function AgentAvatar(props: { agent: Pick<AgentSummary, "name" | "avatarUrl" | "status" | "presence">; large?: boolean }): JSX.Element {

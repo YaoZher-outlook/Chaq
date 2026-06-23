@@ -51,6 +51,7 @@ type ModelConfigRow = {
   base_url: string;
   api_key_ciphertext: string;
   default_model: string;
+  embedding_model: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -91,6 +92,51 @@ export class LocalDatabase {
   getSkill(id: string): SkillSummary | null {
     const row = this.get<SkillRow>("select * from skills where id = ?", [id]);
     return row ? this.toSkill(row) : null;
+  }
+
+  cacheSkills(skills: SkillSummary[]): void {
+    const now = new Date().toISOString();
+    this.transaction(() => {
+      for (const skill of skills) {
+        const versionId = skill.activeVersionId ?? randomUUID();
+        this.run(
+          `insert into skills (
+            id, name, avatar_url, description, persona, tone, knowledge, boundaries,
+            examples_json, tags_json, visibility, active_version_id, created_at, updated_at
+          ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          on conflict(id) do update set
+            name = excluded.name,
+            avatar_url = excluded.avatar_url,
+            description = excluded.description,
+            persona = excluded.persona,
+            tone = excluded.tone,
+            knowledge = excluded.knowledge,
+            boundaries = excluded.boundaries,
+            examples_json = excluded.examples_json,
+            tags_json = excluded.tags_json,
+            visibility = excluded.visibility,
+            active_version_id = excluded.active_version_id,
+            updated_at = excluded.updated_at`,
+          [
+            skill.id,
+            skill.name,
+            skill.avatarUrl ?? null,
+            skill.description,
+            skill.persona,
+            skill.tone,
+            skill.knowledge,
+            skill.boundaries,
+            JSON.stringify(skill.examples),
+            JSON.stringify(skill.tags),
+            skill.visibility,
+            versionId,
+            skill.createdAt || now,
+            skill.updatedAt || now
+          ],
+          false
+        );
+      }
+    });
   }
 
   createSkill(skill: SkillDraft, sourceKind: SkillSourceKind = "manual", id?: string): SkillSummary {
@@ -280,7 +326,7 @@ export class LocalDatabase {
 
   listUserModelConfigs(userId = "local"): UserModelConfigPublic[] {
     const rows = this.all<Omit<ModelConfigRow, "api_key_ciphertext">>(
-      "select id, user_id, kind, name, base_url, default_model, created_at, updated_at from user_model_configs where user_id = ? order by updated_at desc",
+      "select id, user_id, kind, name, base_url, default_model, embedding_model, created_at, updated_at from user_model_configs where user_id = ? order by updated_at desc",
       [userId]
     );
     return rows.map((row) => ({
@@ -289,6 +335,7 @@ export class LocalDatabase {
       name: row.name,
       baseUrl: row.base_url,
       defaultModel: row.default_model,
+      embeddingModel: row.embedding_model ?? "",
       createdAt: row.created_at,
       updatedAt: row.updated_at
     }));
@@ -302,14 +349,15 @@ export class LocalDatabase {
     baseUrl: string;
     apiKey: string;
     defaultModel: string;
+    embeddingModel?: string | null;
   }): UserModelConfigPublic {
     const now = new Date().toISOString();
     const id = input.id || randomUUID();
     const userId = input.userId || "local";
     const ciphertext = this.codec.encrypt(input.apiKey);
     this.run(
-      `insert into user_model_configs (id, user_id, kind, name, base_url, api_key_ciphertext, default_model, created_at, updated_at)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `insert into user_model_configs (id, user_id, kind, name, base_url, api_key_ciphertext, default_model, embedding_model, created_at, updated_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        on conflict(id) do update set
          user_id = excluded.user_id,
          kind = excluded.kind,
@@ -317,8 +365,9 @@ export class LocalDatabase {
          base_url = excluded.base_url,
          api_key_ciphertext = excluded.api_key_ciphertext,
          default_model = excluded.default_model,
+          embedding_model = excluded.embedding_model,
          updated_at = excluded.updated_at`
-    , [id, userId, input.kind, input.name, input.baseUrl.replace(/\/$/, ""), ciphertext, input.defaultModel, now, now]);
+    , [id, userId, input.kind, input.name, input.baseUrl.replace(/\/$/, ""), ciphertext, input.defaultModel, input.embeddingModel ?? "", now, now]);
     return this.listUserModelConfigs(userId).find((config) => config.id === id)!;
   }
 
@@ -337,6 +386,7 @@ export class LocalDatabase {
       name: row.name,
       baseUrl: row.base_url,
       defaultModel: row.default_model,
+      embeddingModel: row.embedding_model ?? "",
       apiKey: this.codec.decrypt(row.api_key_ciphertext),
       createdAt: row.created_at,
       updatedAt: row.updated_at
@@ -409,6 +459,7 @@ export class LocalDatabase {
         base_url text not null,
         api_key_ciphertext text not null,
         default_model text not null,
+        embedding_model text,
         created_at text not null,
         updated_at text not null
       );
@@ -431,6 +482,11 @@ export class LocalDatabase {
     `);
     try {
       this.run("alter table user_model_configs add column user_id text not null default 'local'");
+    } catch {
+      // Existing local databases already have this column.
+    }
+    try {
+      this.run("alter table user_model_configs add column embedding_model text");
     } catch {
       // Existing local databases already have this column.
     }

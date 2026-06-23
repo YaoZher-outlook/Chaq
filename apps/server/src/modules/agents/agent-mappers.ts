@@ -1,5 +1,6 @@
 import type {
   AgentDetail,
+  AgentContact,
   AgentEvent,
   AgentGoal,
   AgentKnowledgeSource,
@@ -41,6 +42,7 @@ export function toAgentSummary(row: any): AgentSummary {
     presence: toAgentPresence(row),
     autonomyMode: lower(row.autonomyMode),
     visibility: lower(row.visibility),
+    serviceFee: row.serviceFee,
     modelProviderId: row.modelProviderId,
     model: row.model,
     temperature: row.temperature,
@@ -83,6 +85,19 @@ export function toPublicAgentSummary(row: any): PublicAgentSummary {
     tags: row.tags,
     status: lower(row.status),
     autonomyMode: lower(row.autonomyMode),
+    serviceFee: row.serviceFee,
+    isContact: Boolean(row.contacts?.length),
+    updatedAt: row.updatedAt.toISOString()
+  };
+}
+
+export function toAgentContact(row: any): AgentContact {
+  return {
+    id: row.id,
+    agent: toPublicAgentSummary(row.agent),
+    alias: row.alias,
+    muted: row.muted,
+    createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString()
   };
 }

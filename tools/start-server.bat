@@ -25,12 +25,23 @@ if errorlevel 1 (
   exit /b 1
 )
 
+node scripts\check-server-ready.js
+if errorlevel 2 goto :port_conflict
+if not errorlevel 1 (
+  echo [Chaq] Server startup skipped because the API is already running.
+  exit /b 0
+)
+
 call npm.cmd run env:prepare
 if errorlevel 1 goto :fail
 
 for /f "usebackq delims=" %%A in (`node scripts\local-env-cmd.js`) do %%A
 if errorlevel 1 goto :fail
 echo [Chaq] Loaded server env from %CHAQ_ENV_FILE%
+
+if "%CHAQ_SERVER_BIND%"=="" set "CHAQ_SERVER_BIND=127.0.0.1"
+set "SERVER_HOST=%CHAQ_SERVER_BIND%"
+echo [Chaq] API bind host: %SERVER_HOST%
 
 if not exist "apps\server\.env" (
   echo [Chaq] apps\server\.env not found. Creating it from apps\server\.env.example...
@@ -50,8 +61,9 @@ if errorlevel 1 goto :fail
 set "NEED_PRISMA_GENERATE=0"
 if "%FORCE_PRISMA_GENERATE%"=="1" set "NEED_PRISMA_GENERATE=1"
 if not exist "node_modules\.prisma\client\index.js" set "NEED_PRISMA_GENERATE=1"
+if not exist "node_modules\.prisma\client\schema.prisma" set "NEED_PRISMA_GENERATE=1"
 if exist "node_modules\.prisma\client\index.js" (
-  powershell.exe -NoProfile -Command "if ((Get-Item 'apps\server\prisma\schema.prisma').LastWriteTimeUtc -gt (Get-Item 'node_modules\.prisma\client\index.js').LastWriteTimeUtc) { exit 1 }"
+  powershell.exe -NoProfile -Command "$source = (Get-FileHash 'apps\server\prisma\schema.prisma' -Algorithm SHA256).Hash; $client = if (Test-Path 'node_modules\.prisma\client\schema.prisma') { (Get-FileHash 'node_modules\.prisma\client\schema.prisma' -Algorithm SHA256).Hash } else { '' }; if ($source -ne $client) { exit 1 }"
   if errorlevel 1 set "NEED_PRISMA_GENERATE=1"
 )
 
@@ -67,9 +79,9 @@ echo [Chaq] Applying existing database migrations...
 call npm.cmd exec -w @chaq/server -- prisma migrate deploy
 if errorlevel 1 goto :fail
 
-echo [Chaq] Demo seed data is manual. Run "npm.cmd run prisma:seed" once if you need admin/creator/demo accounts.
+echo [Chaq] Development seed is manual. Run "npm.cmd run prisma:seed" once if you need the admin account.
 
-echo [Chaq] API will listen on http://localhost:24537/api and the Agent worker will run beside it.
+echo [Chaq] API will listen on %SERVER_HOST%:24537/api and the Agent worker will run beside it.
 call npm.cmd run dev:server
 if errorlevel 1 goto :fail
 
@@ -83,8 +95,14 @@ echo [ERROR] Chaq server startup failed.
 pause
 exit /b 1
 
+:port_conflict
+echo [ERROR] Stop the process using port 24537, then run this script again.
+pause
+exit /b 1
+
 :generate_prisma
 echo [Chaq] Generating Prisma Client...
+powershell.exe -NoProfile -Command "Remove-Item 'node_modules\.prisma\client\query_engine-windows.dll.node.tmp*' -Force -ErrorAction SilentlyContinue"
 call npm.cmd run prisma:generate
 if errorlevel 1 (
   echo [ERROR] Prisma Client generation failed. Close stale Chaq Node/Electron processes and retry.

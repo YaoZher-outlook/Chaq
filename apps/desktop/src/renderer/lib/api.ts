@@ -1,5 +1,6 @@
 import type {
   AgentDetail,
+  AgentContact,
   AgentDraft,
   AgentEvent,
   AgentGoal,
@@ -18,7 +19,10 @@ import type {
   MarketplaceSkill,
   ModelProviderPublic,
   SkillDraft,
+  SkillSummary,
+  SkillVersionSnapshot,
   TokenTransaction,
+  WalletSummary,
   ConversationMessage,
   ConversationSummary
 } from "@chaq/shared";
@@ -56,6 +60,43 @@ export function getServerUrl(): string {
     return (import.meta.env.VITE_SERVER_URL as string | undefined)?.replace(/\/$/, "") || "http://localhost:24537/api";
   }
   return stored;
+}
+
+export function getRealtimeUrl(sessionToken: string): string {
+  const url = new URL(getServerUrl());
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/realtime`;
+  url.searchParams.set("token", sessionToken);
+  return url.toString();
+}
+
+export function connectRealtime(onEvent: (event: { type: string; payload: unknown; at?: string }) => void): () => void {
+  const sessionToken = sessionStorage.getItem("chaq.sessionToken") || localStorage.getItem("chaq.sessionToken");
+  if (!sessionToken) return () => undefined;
+  let closed = false;
+  let socket: WebSocket | null = null;
+  const open = () => {
+    socket = new WebSocket(getRealtimeUrl(sessionToken));
+    socket.onmessage = (message) => {
+      try {
+        onEvent(JSON.parse(String(message.data)));
+      } catch {
+        // Ignore malformed realtime frames.
+      }
+    };
+    socket.onclose = () => {
+      if (closed) return;
+      window.setTimeout(() => {
+        if (!closed) open();
+      }, 2500);
+    };
+  };
+  open();
+  return () => {
+    closed = true;
+    socket?.close();
+    socket = null;
+  };
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -167,7 +208,22 @@ export const api = {
     body: JSON.stringify(payload)
   }),
   tokenLedger: () => request<TokenTransaction[]>("/users/me/tokens"),
+  wallet: () => request<WalletSummary>("/users/me/wallet"),
   providers: () => request<ModelProviderPublic[]>("/models/providers"),
+  availableProviders: () => request<ModelProviderPublic[]>("/models/available"),
+  privateProviders: () => request<ModelProviderPublic[]>("/models/private/providers"),
+  savePrivateProvider: (payload: unknown) => request<ModelProviderPublic>("/models/private/providers", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  }),
+  deletePrivateProvider: (id: string) => request<{ ok: true }>(`/models/private/providers/${id}/delete`, {
+    method: "POST",
+    body: JSON.stringify({})
+  }),
+  testPrivateProvider: (payload: unknown) => request<{ ok: true; message: string }>("/models/private/test", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  }),
   adminProviders: () => request<ModelProviderPublic[]>("/models/admin/providers"),
   saveProvider: (payload: unknown) => request<ModelProviderPublic>("/models/admin/providers", {
     method: "POST",
@@ -185,10 +241,21 @@ export const api = {
     method: "POST",
     body: JSON.stringify(payload)
   }),
-  createSkill: (skill: SkillDraft, sourceKind = "manual") => request<{ id: string }>("/skills", {
+  skills: () => request<SkillSummary[]>("/skills"),
+  skill: (id: string) => request<SkillSummary>(`/skills/${id}`),
+  createSkill: (skill: SkillDraft, sourceKind = "manual") => request<SkillSummary>("/skills", {
     method: "POST",
     body: JSON.stringify({ skill, sourceKind })
   }),
+  saveSkill: (id: string, skill: SkillDraft, sourceKind = "manual") => request<SkillSummary>(`/skills/${id}`, {
+    method: "POST",
+    body: JSON.stringify({ skill, sourceKind })
+  }),
+  deleteSkill: (id: string) => request<{ ok: true }>(`/skills/${id}/delete`, {
+    method: "POST",
+    body: JSON.stringify({})
+  }),
+  skillVersions: (id: string) => request<SkillVersionSnapshot[]>(`/skills/${id}/versions`),
   logSource: (payload: unknown) => request("/skills/sources", {
     method: "POST",
     body: JSON.stringify(payload)
@@ -224,6 +291,15 @@ export const api = {
     body: JSON.stringify({ value })
   }),
   agents: () => request<AgentSummary[]>("/agents"),
+  agentContacts: () => request<AgentContact[]>("/agents/contacts"),
+  addAgentContact: (id: string) => request<AgentContact>(`/agents/${id}/contact`, {
+    method: "POST",
+    body: JSON.stringify({})
+  }),
+  removeAgentContact: (id: string) => request<{ ok: true }>(`/agents/${id}/contact/remove`, {
+    method: "POST",
+    body: JSON.stringify({})
+  }),
   discoverAgents: (query?: string) => request<PublicAgentSummary[]>(`/agents/discover${query ? `?query=${encodeURIComponent(query)}` : ""}`),
   agent: (id: string) => request<AgentDetail>(`/agents/${id}`),
   agentProfile: (id: string) => request<AgentProfile>(`/agents/${id}/profile`),
@@ -280,6 +356,10 @@ export const api = {
     body: JSON.stringify(payload)
   }),
   updateAgentTool: (agentId: string, toolId: string, payload: unknown) => request(`/agents/${agentId}/tools/${toolId}`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  }),
+  addAgentTool: (agentId: string, payload: unknown) => request(`/agents/${agentId}/tools`, {
     method: "POST",
     body: JSON.stringify(payload)
   }),

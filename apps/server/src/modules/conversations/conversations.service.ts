@@ -11,6 +11,7 @@ import {
   Prisma
 } from "@prisma/client";
 import { PrismaService } from "../../common/prisma.service";
+import { RealtimeService } from "../../common/realtime.service";
 import { AgentQueueService } from "../agents/agent-queue.service";
 import { toConversationMessage, toConversationSummary } from "./conversation-mappers";
 
@@ -18,7 +19,8 @@ import { toConversationMessage, toConversationSummary } from "./conversation-map
 export class ConversationsService {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
-    @Inject(AgentQueueService) private readonly queue: AgentQueueService
+    @Inject(AgentQueueService) private readonly queue: AgentQueueService,
+    @Inject(RealtimeService) private readonly realtime: RealtimeService
   ) {}
 
   async list(userId: string) {
@@ -52,6 +54,13 @@ export class ConversationsService {
       }
     });
     if (!agent) throw new NotFoundException("Agent not found.");
+    if (agent.ownerId !== userId) {
+      const contact = await this.prisma.agentContact.findUnique({
+        where: { userId_agentId: { userId, agentId } },
+        select: { id: true }
+      });
+      if (!contact) throw new ForbiddenException("Add this agent as a contact before starting a conversation.");
+    }
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw new NotFoundException("User not found.");
     const row = await this.findDirect(ParticipantKind.USER, userId, ParticipantKind.AGENT, agentId)
@@ -85,6 +94,7 @@ export class ConversationsService {
 
   async sendUserMessage(userId: string, conversationId: string, content: string, replyToId?: string | null) {
     const conversation = await this.assertAccess(userId, conversationId);
+    await this.assertCanMessageAgents(userId, conversation.participants);
     const result = await this.prisma.$transaction(async (tx) => {
       const message = await tx.conversationMessage.create({
         data: {
@@ -116,7 +126,9 @@ export class ConversationsService {
       return { message, runs };
     });
     await Promise.all(result.runs.map((runId) => this.queue.enqueueRun(runId)));
-    return toConversationMessage(result.message);
+    const mapped = toConversationMessage(result.message);
+    await this.broadcastConversation(conversationId, "conversation.message", mapped);
+    return mapped;
   }
 
   async markRead(userId: string, conversationId: string) {
@@ -257,7 +269,31 @@ export class ConversationsService {
       return { message, targetRunId };
     });
     if (result.targetRunId) await this.queue.enqueueRun(result.targetRunId);
-    return toConversationMessage(result.message);
+    const mapped = toConversationMessage(result.message);
+    await this.broadcastConversation(conversation.id, "conversation.message", mapped);
+    return mapped;
+  }
+
+  private async broadcastConversation(conversationId: string, type: string, payload: unknown): Promise<void> {
+    const participants = await this.prisma.conversationParticipant.findMany({
+      where: { conversationId },
+      select: { participantKind: true, participantId: true }
+    });
+    const userIds = new Set<string>();
+    for (const participant of participants) {
+      if (participant.participantKind === ParticipantKind.USER) userIds.add(participant.participantId);
+    }
+    const agentIds = participants
+      .filter((participant) => participant.participantKind === ParticipantKind.AGENT)
+      .map((participant) => participant.participantId);
+    if (agentIds.length) {
+      const agents = await this.prisma.agent.findMany({
+        where: { id: { in: agentIds } },
+        select: { ownerId: true }
+      });
+      for (const agent of agents) userIds.add(agent.ownerId);
+    }
+    this.realtime.emitToUsers(userIds, type, payload);
   }
 
   private async assertAccess(userId: string, conversationId: string) {
@@ -291,6 +327,27 @@ export class ConversationsService {
       include: { participants: true, messages: { orderBy: { createdAt: "desc" }, take: 1 } },
       orderBy: { updatedAt: "desc" }
     });
+  }
+
+  private async assertCanMessageAgents(userId: string, participants: Array<{ participantKind: ParticipantKind; participantId: string }>): Promise<void> {
+    const agentIds = participants
+      .filter((participant) => participant.participantKind === ParticipantKind.AGENT)
+      .map((participant) => participant.participantId);
+    if (!agentIds.length) return;
+    const agents = await this.prisma.agent.findMany({
+      where: { id: { in: agentIds } },
+      select: { id: true, ownerId: true, status: true, visibility: true }
+    });
+    const externalAgents = agents.filter((agent) => agent.ownerId !== userId);
+    if (externalAgents.some((agent) => agent.status !== AgentStatus.ACTIVE || agent.visibility === AgentVisibility.PRIVATE)) {
+      throw new ForbiddenException("An external agent is no longer available for messaging.");
+    }
+    const externalIds = externalAgents.map((agent) => agent.id);
+    if (!externalIds.length) return;
+    const contacts = await this.prisma.agentContact.count({ where: { userId, agentId: { in: externalIds } } });
+    if (contacts !== externalIds.length) {
+      throw new ForbiddenException("Add every external agent in this conversation as a contact before sending messages.");
+    }
   }
 
   private async resolveTarget(kind: ParticipantKind, id: string): Promise<{ label: string }> {

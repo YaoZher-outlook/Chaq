@@ -20,6 +20,7 @@ test("agent draft applies production defaults", () => {
   assert.equal(parsed.autonomyMode, "copilot");
   assert.equal(parsed.dailyActionBudget, 30);
   assert.equal(parsed.dailyTokenBudget, 5000);
+  assert.equal(parsed.serviceFee, 0);
   assert.deepEqual(parsed.identity.traits, []);
   assert.deepEqual(parsed.identity.interests, []);
 });

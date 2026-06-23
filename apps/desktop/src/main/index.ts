@@ -4,16 +4,12 @@ import { cpSync, existsSync, mkdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { ChatMessage, SkillAutoMessageSettings, SkillDraft, SkillSourceKind } from "@chaq/shared";
+import type { ChatMessage, SkillAutoMessageSettings, SkillDraft, SkillSourceKind, SkillSummary } from "@chaq/shared";
 import { LocalDatabase } from "./local-db";
 import { callUserModel, detectUserModelProvider, testUserModelConfig } from "./model-adapters";
 
 let mainWindow: BrowserWindow | null = null;
 let localDb: LocalDatabase;
-let dragTarget: BrowserWindow | null = null;
-let dragOffset = { x: 0, y: 0 };
-let dragSize = { width: 0, height: 0 };
-let dragTimer: ReturnType<typeof setInterval> | null = null;
 
 const chaqEnvironmentRoot = join(process.env.CHAQ_ENV_ROOT || "E:\\Environment", "Chaq");
 const chaqUserDataPath = join(chaqEnvironmentRoot, "user-data");
@@ -119,6 +115,7 @@ function createWindow(): void {
 function registerIpc(): void {
   ipcMain.handle("skills:list", () => localDb.listSkills());
   ipcMain.handle("skills:get", (_event, id: string) => localDb.getSkill(id));
+  ipcMain.handle("skills:cache", (_event, skills: SkillSummary[]) => localDb.cacheSkills(skills));
   ipcMain.handle("skills:create", (_event, payload: { skill: SkillDraft; sourceKind?: SkillSourceKind; id?: string }) =>
     localDb.createSkill(payload.skill, payload.sourceKind, payload.id)
   );
@@ -216,19 +213,16 @@ function registerIpc(): void {
   });
   ipcMain.handle("window:close", (event) => {
     const target = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
-    stopWindowDrag();
     if (target && target === mainWindow) {
       app.quit();
       return;
     }
     target?.close();
   });
-  ipcMain.handle("window:begin-drag", (event) => {
-    const target = BrowserWindow.fromWebContents(event.sender);
-    if (target) beginWindowDrag(target);
-  });
-  ipcMain.handle("window:end-drag", () => {
-    stopWindowDrag();
+  ipcMain.handle("auth:broadcast-logout", () => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send("auth:logged-out");
+    }
   });
   ipcMain.handle("window:set-mode", (_event, mode: "login" | "main") => {
     if (!mainWindow) return;
@@ -296,37 +290,6 @@ async function openImageFile(): Promise<{ fileName: string; dataUrl: string } | 
     fileName: filePath.split(/[\\/]/).pop() ?? "image",
     dataUrl: `data:${mimeType};base64,${bytes.toString("base64")}`
   };
-}
-
-function beginWindowDrag(target: BrowserWindow): void {
-  stopWindowDrag();
-  const cursor = screen.getCursorScreenPoint();
-  const bounds = target.getBounds();
-  dragTarget = target;
-  dragOffset = { x: cursor.x - bounds.x, y: cursor.y - bounds.y };
-  dragSize = { width: bounds.width, height: bounds.height };
-  dragTimer = setInterval(() => {
-    if (!dragTarget || dragTarget.isDestroyed()) {
-      stopWindowDrag();
-      return;
-    }
-    const point = screen.getCursorScreenPoint();
-    dragTarget.setBounds({
-      x: Math.round(point.x - dragOffset.x),
-      y: Math.round(point.y - dragOffset.y),
-      width: dragSize.width,
-      height: dragSize.height
-    }, false);
-  }, 16);
-}
-
-function stopWindowDrag(): void {
-  if (dragTimer) {
-    clearInterval(dragTimer);
-    dragTimer = null;
-  }
-  dragTarget = null;
-  dragSize = { width: 0, height: 0 };
 }
 
 function profilePopupPosition(parent: BrowserWindow, anchor: AnchorRect, width: number, height: number): { x: number; y: number } {

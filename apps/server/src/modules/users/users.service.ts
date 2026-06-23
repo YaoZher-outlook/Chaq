@@ -4,34 +4,27 @@ import { Prisma, TokenTransactionKind, User, UserRole } from "@prisma/client";
 import { isValidPassword, normalizeEmail, sendVerificationEmail } from "../../common/email";
 import { hashPassword, hashSessionToken, verifyPassword } from "../../common/password";
 import { PrismaService } from "../../common/prisma.service";
+import { RateLimitService } from "../../common/rate-limit.service";
 
 @Injectable()
 export class UsersService {
-  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+  constructor(
+    @Inject(PrismaService) private readonly prisma: PrismaService,
+    @Inject(RateLimitService) private readonly rateLimit: RateLimitService
+  ) {}
 
   async ensureUser(userId: string): Promise<User> {
-    const adminId = process.env.DEMO_ADMIN_USER_ID ?? "admin-local";
-    return this.prisma.user.upsert({
-      where: { id: userId },
-      create: {
-        id: userId,
-        username: userId,
-        email: userId.includes("@") ? normalizeEmail(userId) : undefined,
-        passwordHash: hashPassword("123456", `auto-${userId}`),
-        displayName: userId === adminId ? "Chaq Admin" : `Chaq 用户 ${userId.slice(0, 6)}`,
-        role: userId === adminId ? UserRole.ADMIN : UserRole.USER,
-        tokenBalance: userId === adminId ? 100000 : 10000,
-        settings: { create: {} }
-      } as any,
-      update: {}
-    });
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new NotFoundException("User not found.");
+    return user;
   }
 
   async me(userId: string) {
     const user = await (this.prisma.user as any).findUnique({
       where: { id: userId },
       include: { settings: true }
-    }) ?? await this.ensureUser(userId);
+    });
+    if (!user) throw new NotFoundException("User not found.");
     return {
       id: user.id,
       username: user.username,
@@ -79,7 +72,7 @@ export class UsersService {
         throw new BadRequestException("两次输入的新密码不一致。");
       }
       if (!isValidPassword(input.newPassword)) {
-        throw new BadRequestException("密码需为 8-64 位，并同时包含字母和数字。");
+        throw new BadRequestException("密码需要 8-64 位，并同时包含字母和数字。");
       }
       data.passwordHash = hashPassword(input.newPassword);
     }
@@ -95,6 +88,7 @@ export class UsersService {
     await this.findOrThrow(userId);
     const email = normalizeEmail(emailInput);
     await this.assertEmailAvailable(email, userId);
+    await this.assertEmailCodeRateLimit(email, "bind_email");
     const code = String(randomInt(100000, 1000000));
     await (this.prisma as any).emailVerificationCode.create({
       data: {
@@ -187,6 +181,26 @@ export class UsersService {
     return user.tokenBalance;
   }
 
+  async creditTokensInTransaction(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    amount: number,
+    note: string,
+    metadata?: Prisma.InputJsonValue,
+    kind: TokenTransactionKind = TokenTransactionKind.AGENT_SERVICE_EARNING
+  ): Promise<number> {
+    if (amount <= 0) return (await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { tokenBalance: true } })).tokenBalance;
+    const user = await tx.user.update({
+      where: { id: userId },
+      data: { tokenBalance: { increment: amount } },
+      select: { tokenBalance: true }
+    });
+    await tx.tokenTransaction.create({
+      data: { userId, kind, amount, balanceAfter: user.tokenBalance, note, metadata }
+    });
+    return user.tokenBalance;
+  }
+
   async tokenLedger(userId: string) {
     await this.ensureUser(userId);
     return this.prisma.tokenTransaction.findMany({
@@ -194,6 +208,59 @@ export class UsersService {
       orderBy: { createdAt: "desc" },
       take: 50
     });
+  }
+
+  async walletSummary(userId: string) {
+    const user = await this.ensureUser(userId);
+    const [transactions, spent, modelSpent, feesPaid, earnings, earningRows] = await Promise.all([
+      this.prisma.tokenTransaction.findMany({ where: { userId }, orderBy: { createdAt: "desc" }, take: 100 }),
+      this.prisma.tokenTransaction.aggregate({
+        where: { userId, amount: { lt: 0 } },
+        _sum: { amount: true }
+      }),
+      this.prisma.tokenTransaction.aggregate({
+        where: { userId, kind: { in: [TokenTransactionKind.CLOUD_MODEL_USAGE, TokenTransactionKind.AGENT_MODEL_USAGE] } },
+        _sum: { amount: true }
+      }),
+      this.prisma.tokenTransaction.aggregate({
+        where: { userId, kind: TokenTransactionKind.AGENT_SERVICE_FEE },
+        _sum: { amount: true }
+      }),
+      this.prisma.tokenTransaction.aggregate({
+        where: { userId, kind: TokenTransactionKind.AGENT_SERVICE_EARNING },
+        _sum: { amount: true }
+      }),
+      this.prisma.tokenTransaction.findMany({
+        where: { userId, kind: TokenTransactionKind.AGENT_SERVICE_EARNING },
+        select: { amount: true, metadata: true },
+        orderBy: { createdAt: "desc" },
+        take: 5000
+      })
+    ]);
+    const grouped = new Map<string, { amount: number; transactionCount: number }>();
+    for (const row of earningRows) {
+      const agentId = (row.metadata as Record<string, unknown> | null)?.agentId;
+      if (typeof agentId !== "string") continue;
+      const current = grouped.get(agentId) ?? { amount: 0, transactionCount: 0 };
+      current.amount += row.amount;
+      current.transactionCount += 1;
+      grouped.set(agentId, current);
+    }
+    const agents = grouped.size
+      ? await this.prisma.agent.findMany({ where: { id: { in: [...grouped.keys()] } }, select: { id: true, name: true } })
+      : [];
+    const names = new Map(agents.map((agent) => [agent.id, agent.name]));
+    return {
+      balance: user.tokenBalance,
+      totalSpent: Math.abs(spent._sum.amount ?? 0),
+      modelSpent: Math.abs(modelSpent._sum.amount ?? 0),
+      serviceFeesPaid: Math.abs(feesPaid._sum.amount ?? 0),
+      serviceEarnings: earnings._sum.amount ?? 0,
+      agentEarnings: [...grouped.entries()]
+        .map(([agentId, value]) => ({ agentId, agentName: names.get(agentId) ?? "Archived Agent", ...value }))
+        .sort((a, b) => b.amount - a.amount),
+      transactions
+    };
   }
 
   async settings(userId: string) {
@@ -276,6 +343,7 @@ export class UsersService {
   }
 
   private async consumeCode(email: string, purpose: string, code: string): Promise<void> {
+    await this.assertEmailCodeVerifyRateLimit(email, purpose);
     const record = await (this.prisma as any).emailVerificationCode.findFirst({
       where: {
         email,
@@ -292,5 +360,19 @@ export class UsersService {
       where: { id: record.id },
       data: { consumedAt: new Date() }
     });
+  }
+
+  private async assertEmailCodeRateLimit(email: string, purpose: string): Promise<void> {
+    const result = await this.rateLimit.consume(`email-code:${purpose}`, email, 3, 10 * 60);
+    if (!result.allowed) {
+      throw new BadRequestException(`验证码请求过于频繁，请 ${result.retryAfterSeconds} 秒后再试。`);
+    }
+  }
+
+  private async assertEmailCodeVerifyRateLimit(email: string, purpose: string): Promise<void> {
+    const result = await this.rateLimit.consume(`email-code-verify:${purpose}`, email, 8, 10 * 60);
+    if (!result.allowed) {
+      throw new BadRequestException(`验证码尝试过于频繁，请 ${result.retryAfterSeconds} 秒后再试。`);
+    }
   }
 }

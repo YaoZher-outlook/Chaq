@@ -6,7 +6,7 @@ export type DistillationStatus = "draft" | "confirmed" | "discarded";
 export type MessageRole = "user" | "assistant" | "system";
 export type ReactionTarget = "skill" | "comment";
 export type ReactionValue = "up" | "down";
-export type TokenTransactionKind = "recharge" | "cloud_model_usage" | "agent_model_usage" | "refund" | "admin_adjustment";
+export type TokenTransactionKind = "recharge" | "cloud_model_usage" | "agent_model_usage" | "agent_service_fee" | "agent_service_earning" | "refund" | "admin_adjustment";
 export type SkillAutoMessageMode = "fixed" | "random";
 export type SkillAutoMessagePeriod = "day" | "week" | "month";
 export type ProviderKind =
@@ -18,6 +18,7 @@ export type ProviderKind =
   | "zhipu"
   | "ollama"
   | "custom";
+export type ModelProviderScope = "platform" | "user_private";
 
 export interface SkillDraft {
   name: string;
@@ -112,7 +113,7 @@ export interface MarketplaceSkill {
 export interface MarketplaceComment {
   id: Id;
   marketplaceSkillId: Id;
-  displayName: "匿名用户";
+  displayName: string;
   content: string;
   upvotes: number;
   downvotes: number;
@@ -121,10 +122,13 @@ export interface MarketplaceComment {
 
 export interface ModelProviderPublic {
   id: Id;
+  scope: ModelProviderScope;
   kind: ProviderKind;
   name: string;
   baseUrl: string;
   models: ModelOption[];
+  embeddingModel?: string | null;
+  embeddingTokenPrice: number;
   enabled: boolean;
   promptTokenPrice: number;
   completionTokenPrice: number;
@@ -135,6 +139,8 @@ export interface ModelOption {
   id: string;
   label: string;
   contextWindow: number;
+  embeddingModel?: string;
+  embeddingTokenPrice?: number;
 }
 
 export interface UserModelConfigPublic {
@@ -143,6 +149,7 @@ export interface UserModelConfigPublic {
   name: string;
   baseUrl: string;
   defaultModel: string;
+  embeddingModel?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -155,6 +162,21 @@ export interface TokenTransaction {
   balanceAfter: number;
   note?: string | null;
   createdAt: string;
+}
+
+export interface WalletSummary {
+  balance: number;
+  totalSpent: number;
+  modelSpent: number;
+  serviceFeesPaid: number;
+  serviceEarnings: number;
+  agentEarnings: Array<{
+    agentId: Id;
+    agentName: string;
+    amount: number;
+    transactionCount: number;
+  }>;
+  transactions: TokenTransaction[];
 }
 
 export interface CloudChatRequest {
@@ -253,6 +275,7 @@ export interface AgentDraft {
   tags: string[];
   autonomyMode: AgentAutonomyMode;
   visibility: AgentVisibility;
+  serviceFee: number;
   modelProviderId?: string | null;
   model?: string | null;
   temperature: number;
@@ -293,6 +316,17 @@ export interface PublicAgentSummary {
   tags: string[];
   status: AgentStatus;
   autonomyMode: AgentAutonomyMode;
+  serviceFee: number;
+  isContact?: boolean;
+  updatedAt: string;
+}
+
+export interface AgentContact {
+  id: Id;
+  agent: PublicAgentSummary;
+  alias?: string | null;
+  muted: boolean;
+  createdAt: string;
   updatedAt: string;
 }
 
@@ -337,6 +371,7 @@ export interface AgentProfile {
     avatarUrl?: string | null;
   };
   isOwner: boolean;
+  isContact: boolean;
   stats: {
     posts: number;
     relationships: number;

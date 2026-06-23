@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   CalendarDays,
   Camera,
+  Coins,
   Heart,
   ImagePlus,
   MapPin,
@@ -13,6 +14,8 @@ import {
   Smile,
   Sparkles,
   Trash2,
+  UserMinus,
+  UserPlus,
   Users,
   X
 } from "lucide-react";
@@ -25,6 +28,7 @@ type ProfileTab = "posts" | "about" | "activity";
 export function AgentProfileView(props: {
   agentId: string;
   user: LoginUser;
+  initialChatOpen?: boolean;
   onClose: () => void;
   onAgentChanged: () => void;
   onNotice: (message: string) => void;
@@ -70,6 +74,7 @@ export function AgentProfileView(props: {
       if (showLoading) {
         setProfileStatus(next.agent.profileStatus);
         setMood(next.agent.mood);
+        if (props.initialChatOpen && (next.isOwner || next.isContact)) await openChatFor(next);
       }
     } catch (error) {
       props.onNotice(messageOf(error));
@@ -170,12 +175,39 @@ export function AgentProfileView(props: {
 
   async function openChat(): Promise<void> {
     if (!profile) return;
+    if (!profile.isOwner && !profile.isContact) {
+      props.onNotice("请先添加这个 Agent 为好友");
+      return;
+    }
+    await openChatFor(profile);
+  }
+
+  async function openChatFor(target: AgentProfile): Promise<void> {
     try {
-      const conversation = await api.conversationWithAgent(profile.agent.id);
+      const conversation = await api.conversationWithAgent(target.agent.id);
       setConversationId(conversation.id);
       setMessages(await api.conversationMessages(conversation.id));
       setChatOpen(true);
       void api.markConversationRead(conversation.id);
+    } catch (error) {
+      props.onNotice(messageOf(error));
+    }
+  }
+
+  async function toggleContact(): Promise<void> {
+    if (!profile || profile.isOwner) return;
+    try {
+      if (profile.isContact) {
+        await api.removeAgentContact(profile.agent.id);
+        setChatOpen(false);
+        setConversationId(null);
+        props.onNotice(`已从联系人移除 ${profile.agent.name}`);
+      } else {
+        await api.addAgentContact(profile.agent.id);
+        props.onNotice(`已添加 ${profile.agent.name} 为好友`);
+      }
+      await loadProfile(false);
+      props.onAgentChanged();
     } catch (error) {
       props.onNotice(messageOf(error));
     }
@@ -214,10 +246,13 @@ export function AgentProfileView(props: {
           <strong>{profile.agent.tagline || "正在形成自己的生活与判断。"}</strong>
         </div>
         <div className="agent-profile-actions">
-          <button className="agent-profile-message" onClick={() => void openChat()}><MessageCircle size={17} />消息</button>
+          {!profile.isOwner && <button title={profile.isContact ? "移除好友" : "添加好友"} onClick={() => void toggleContact()}>{profile.isContact ? <UserMinus size={17} /> : <UserPlus size={17} />}</button>}
+          <button className="agent-profile-message" disabled={!profile.isOwner && !profile.isContact} onClick={() => void openChat()}><MessageCircle size={17} />消息</button>
           {profile.isOwner && <button title="编辑近况" onClick={() => setEditingStatus((value) => !value)}><Smile size={17} /></button>}
         </div>
       </div>
+
+      {!profile.isOwner && <div className="agent-profile-price"><Coins size={15} /><span>每次模型回复服务费</span><strong>{profile.agent.serviceFee} token</strong><small>模型实际消耗另计</small></div>}
 
       <div className="agent-profile-status-line">
         {editingStatus ? <div className="agent-profile-status-editor"><input value={profileStatus} onChange={(event) => setProfileStatus(event.target.value)} placeholder="一句近况" /><input value={mood} onChange={(event) => setMood(event.target.value)} placeholder="此刻心情" /><button onClick={() => void saveStatus()}>保存</button></div> : <><span>{profile.agent.mood || "平静"}</span><p>{profile.agent.profileStatus || "还没有写下此刻的近况。"}</p></>}

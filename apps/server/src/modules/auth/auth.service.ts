@@ -3,13 +3,17 @@ import { BadRequestException, ConflictException, Inject, Injectable, Unauthorize
 import { AuthSessionStatus } from "@prisma/client";
 import { normalizeEmail, isValidPassword, sendVerificationEmail } from "../../common/email";
 import { PrismaService } from "../../common/prisma.service";
+import { RateLimitService } from "../../common/rate-limit.service";
 import { hashPassword, hashSessionToken, verifyPassword } from "../../common/password";
 
 const defaultSessionDays = 14;
 
 @Injectable()
 export class AuthService {
-  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+  constructor(
+    @Inject(PrismaService) private readonly prisma: PrismaService,
+    @Inject(RateLimitService) private readonly rateLimit: RateLimitService
+  ) {}
 
   async login(username: string, password: string) {
     const normalized = normalizeEmail(username);
@@ -48,6 +52,7 @@ export class AuthService {
   async requestRegisterCode(emailInput: string): Promise<{ ok: true }> {
     const email = normalizeEmail(emailInput);
     await this.assertEmailAvailable(email);
+    await this.assertEmailCodeRateLimit(email, "register");
     const code = this.createCode();
     await (this.prisma as any).emailVerificationCode.create({
       data: {
@@ -177,11 +182,12 @@ export class AuthService {
       throw new BadRequestException("两次输入的密码不一致。");
     }
     if (!isValidPassword(password)) {
-      throw new BadRequestException("密码需为 8-64 位，并同时包含字母和数字。");
+      throw new BadRequestException("密码需要 8-64 位，并同时包含字母和数字。");
     }
   }
 
   private async consumeCode(email: string, purpose: string, code: string): Promise<void> {
+    await this.assertEmailCodeVerifyRateLimit(email, purpose);
     const record = await (this.prisma as any).emailVerificationCode.findFirst({
       where: {
         email,
@@ -202,6 +208,20 @@ export class AuthService {
 
   private createCode(): string {
     return String(randomInt(100000, 1000000));
+  }
+
+  private async assertEmailCodeRateLimit(email: string, purpose: string): Promise<void> {
+    const result = await this.rateLimit.consume(`email-code:${purpose}`, email, 3, 10 * 60);
+    if (!result.allowed) {
+      throw new BadRequestException(`验证码请求过于频繁，请 ${result.retryAfterSeconds} 秒后再试。`);
+    }
+  }
+
+  private async assertEmailCodeVerifyRateLimit(email: string, purpose: string): Promise<void> {
+    const result = await this.rateLimit.consume(`email-code-verify:${purpose}`, email, 8, 10 * 60);
+    if (!result.allowed) {
+      throw new BadRequestException(`验证码尝试过于频繁，请 ${result.retryAfterSeconds} 秒后再试。`);
+    }
   }
 
   private async createUniqueUserId(): Promise<string> {

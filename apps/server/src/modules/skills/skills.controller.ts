@@ -1,4 +1,4 @@
-import { Body, Controller, Inject, Param, Post } from "@nestjs/common";
+import { Body, Controller, Get, Inject, Param, Post } from "@nestjs/common";
 import { z } from "zod";
 import { distillRequestSchema, skillDraftSchema, skillSourceKinds } from "@chaq/shared";
 import { CurrentUserId } from "../../common/current-user.decorator";
@@ -18,6 +18,10 @@ const createSkillSchema = z.object({
   sourceKind: z.enum(skillSourceKinds).default("manual")
 });
 
+const updateSkillSchema = createSkillSchema.partial().extend({
+  skill: skillDraftSchema
+});
+
 const reportSkillSchema = z.object({
   reason: z.string().min(1).max(500).default("user_report")
 });
@@ -26,10 +30,36 @@ const reportSkillSchema = z.object({
 export class SkillsController {
   constructor(@Inject(SkillsService) private readonly skills: SkillsService) {}
 
+  @Get()
+  list(@CurrentUserId() userId: string) {
+    return this.skills.listSkills(userId);
+  }
+
   @Post()
   create(@CurrentUserId() userId: string, @Body() body: unknown) {
     const input = parseBody(createSkillSchema, body);
     return this.skills.createSkill(userId, input.skill, input.sourceKind ?? "manual");
+  }
+
+  @Get(":id")
+  detail(@CurrentUserId() userId: string, @Param("id") id: string) {
+    return this.skills.getSkill(userId, id);
+  }
+
+  @Post(":id")
+  update(@CurrentUserId() userId: string, @Param("id") id: string, @Body() body: unknown) {
+    const input = parseBody(updateSkillSchema, body);
+    return this.skills.updateSkill(userId, id, input.skill, input.sourceKind ?? "manual");
+  }
+
+  @Get(":id/versions")
+  versions(@CurrentUserId() userId: string, @Param("id") id: string) {
+    return this.skills.listVersions(userId, id);
+  }
+
+  @Post(":id/delete")
+  delete(@CurrentUserId() userId: string, @Param("id") id: string) {
+    return this.skills.deleteSkill(userId, id);
   }
 
   @Post("sources")

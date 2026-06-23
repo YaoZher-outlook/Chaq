@@ -61,6 +61,11 @@ export class UsersController {
     return this.users.tokenLedger(userId);
   }
 
+  @Get("me/wallet")
+  wallet(@CurrentUserId() userId: string) {
+    return this.users.walletSummary(userId);
+  }
+
   @Get("me/settings")
   settings(@CurrentUserId() userId: string) {
     return this.users.settings(userId);

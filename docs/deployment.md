@@ -15,13 +15,17 @@ The production Compose file runs five services: PostgreSQL, Redis, one-shot migr
 docker compose --env-file .env.production -f docker-compose.production.yml up -d --build
 ```
 
-Do not run `prisma:seed` in production.
+Do not run `prisma:seed` in production. The development seed creates only `admin / 123456` with `9999` platform tokens and refuses to run when `NODE_ENV=production`.
 
 ## Network And TLS
 
-Expose only the API through a TLS reverse proxy. PostgreSQL and Redis have no public port mappings in the production Compose file. Chaq applies Redis-backed application limits; add a second layer of request limits at the proxy and forward only trusted headers.
+Expose only the API through a TLS reverse proxy. PostgreSQL and Redis have no public port mappings in the production Compose file. Chaq applies Redis-backed application limits; add a second layer of request limits at the proxy and forward only trusted headers. The proxy must pass WebSocket upgrades for `/api/realtime`.
 
 Readiness checks use `GET /api/health/ready`; liveness checks use `GET /api/health/live`.
+
+## Auth And Email
+
+Registration and email binding use six-digit email codes that expire after 10 minutes and are consumed once. Chaq applies Redis-backed limits to code sending, code verification attempts, and credential routes. In production, configure SMTP credentials and keep proxy-level rate limits enabled for `/api/auth/*` and `/api/users/me/email-code`.
 
 ## Desktop Build
 

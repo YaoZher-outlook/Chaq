@@ -4,6 +4,7 @@ import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./app.module";
 import { AuthService } from "./modules/auth/auth.service";
 import { RateLimitService } from "./common/rate-limit.service";
+import { RealtimeService } from "./common/realtime.service";
 
 type ExpressMiddleware = (request: unknown, response: unknown, next: () => void) => void;
 const expressBody = require("express") as {
@@ -36,6 +37,7 @@ async function bootstrap(): Promise<void> {
 
   const auth = app.get(AuthService);
   const rateLimit = app.get(RateLimitService);
+  app.get(RealtimeService).bind(app.getHttpServer(), auth);
   app.use(async (request: SessionRequest, response: SessionResponse, next: () => void) => {
     const path = request.path ?? "";
     const isHealth = path.includes("/health/");

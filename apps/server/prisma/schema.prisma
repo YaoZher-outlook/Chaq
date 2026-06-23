@@ -54,6 +54,8 @@ enum TokenTransactionKind {
   RECHARGE
   CLOUD_MODEL_USAGE
   AGENT_MODEL_USAGE
+  AGENT_SERVICE_FEE
+  AGENT_SERVICE_EARNING
   REFUND
   ADMIN_ADJUSTMENT
 }
@@ -67,6 +69,11 @@ enum ProviderKind {
   ZHIPU
   OLLAMA
   CUSTOM
+}
+
+enum ModelProviderScope {
+  PLATFORM
+  USER_PRIVATE
 }
 
 enum AgentStatus {
@@ -221,16 +228,16 @@ enum KnowledgeSourceStatus {
 }
 
 model User {
-  id                 String              @id
-  username           String              @unique
-  email              String?             @unique
-  passwordHash       String              @default("")
+  id                 String                @id
+  username           String                @unique
+  email              String?               @unique
+  passwordHash       String                @default("")
   displayName        String
   avatarUrl          String?
-  role               UserRole            @default(USER)
-  tokenBalance       Int                 @default(10000)
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
+  role               UserRole              @default(USER)
+  tokenBalance       Int                   @default(10000)
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
   skills             Skill[]
   sources            SkillSource[]
   marketplaceSkills  MarketplaceSkill[]
@@ -239,10 +246,12 @@ model User {
   favorites          Favorite[]
   tokenTransactions  TokenTransaction[]
   modelCallLogs      ModelCallLog[]
+  modelProviders     ModelProviderConfig[]
   sessions           AuthSession[]
   settings           UserSetting?
   skillReports       SkillReport[]
   agents             Agent[]
+  agentContacts      AgentContact[]
   agentPostReactions AgentPostReaction[]
   agentPostComments  AgentPostComment[]
 }
@@ -455,37 +464,44 @@ model TokenTransaction {
 }
 
 model ModelProviderConfig {
-  id                   String         @id @default(cuid())
+  id                   String             @id @default(cuid())
+  scope                ModelProviderScope @default(PLATFORM)
+  ownerId              String?
+  owner                User?              @relation(fields: [ownerId], references: [id], onDelete: Cascade)
   kind                 ProviderKind
   name                 String
   baseUrl              String
   apiKeyCiphertext     String
   models               Json
-  enabled              Boolean        @default(true)
-  promptTokenPrice     Float          @default(0)
-  completionTokenPrice Float          @default(0)
+  enabled              Boolean            @default(true)
+  promptTokenPrice     Float              @default(0)
+  completionTokenPrice Float              @default(0)
   contextWindow        Int
-  createdAt            DateTime       @default(now())
-  updatedAt            DateTime       @updatedAt
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
   callLogs             ModelCallLog[]
   agents               Agent[]
+
+  @@index([scope, ownerId, enabled])
 }
 
 model ModelCallLog {
-  id               String               @id @default(cuid())
-  agentRunId       String?              @unique
-  userId           String
-  user             User                 @relation(fields: [userId], references: [id])
-  providerId       String?
-  provider         ModelProviderConfig? @relation(fields: [providerId], references: [id], onDelete: SetNull)
-  model            String
-  promptTokens     Int
-  completionTokens Int
-  chargedTokens    Int
-  success          Boolean
-  error            String?
-  responseContent  String?
-  createdAt        DateTime             @default(now())
+  id                String               @id @default(cuid())
+  agentRunId        String?              @unique
+  userId            String
+  user              User                 @relation(fields: [userId], references: [id])
+  providerId        String?
+  provider          ModelProviderConfig? @relation(fields: [providerId], references: [id], onDelete: SetNull)
+  model             String
+  promptTokens      Int
+  completionTokens  Int
+  chargedTokens     Int
+  serviceFee        Int                  @default(0)
+  beneficiaryUserId String?
+  success           Boolean
+  error             String?
+  responseContent   String?
+  createdAt         DateTime             @default(now())
 
   @@index([userId, createdAt])
   @@index([providerId])
@@ -518,6 +534,7 @@ model Agent {
   status               AgentStatus            @default(DRAFT)
   autonomyMode         AgentAutonomyMode      @default(COPILOT)
   visibility           AgentVisibility        @default(PRIVATE)
+  serviceFee           Int                    @default(0)
   temperature          Float                  @default(0.7)
   initiative           Int                    @default(55)
   reflectionDepth      Int                    @default(2)
@@ -542,11 +559,28 @@ model Agent {
   runs                 AgentRun[]
   events               AgentEvent[]
   posts                AgentPost[]
+  contacts             AgentContact[]
 
   @@unique([ownerId, handle])
   @@index([ownerId, status])
   @@index([status, autonomyMode, nextRunAt])
   @@index([modelProviderId])
+}
+
+model AgentContact {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agentId   String
+  agent     Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  alias     String?
+  muted     Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, agentId])
+  @@index([agentId, createdAt])
+  @@index([userId, updatedAt])
 }
 
 model AgentPost {

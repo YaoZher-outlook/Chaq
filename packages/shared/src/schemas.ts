@@ -69,6 +69,17 @@ export const userModelConfigSchema = z.object({
   defaultModel: z.string().min(1).max(120)
 });
 
+export const privateProviderConfigSchema = z.object({
+  id: z.string().optional(),
+  kind: z.enum(providerKinds),
+  name: z.string().min(1).max(80),
+  baseUrl: z.string().min(1).max(300),
+  apiKey: z.string().max(5000).optional().default(""),
+  defaultModel: z.string().min(1).max(160),
+  embeddingModel: z.string().max(160).optional().default(""),
+  contextWindow: z.number().int().positive().default(128000)
+});
+
 export const providerConfigSchema = z.object({
   kind: z.enum(providerKinds),
   name: z.string().min(1).max(80),
@@ -83,6 +94,8 @@ export const providerConfigSchema = z.object({
       })
     )
     .min(1),
+  embeddingModel: z.string().max(160).optional().default(""),
+  embeddingTokenPrice: z.number().nonnegative().default(0),
   enabled: z.boolean(),
   promptTokenPrice: z.number().nonnegative(),
   completionTokenPrice: z.number().nonnegative(),
@@ -138,6 +151,7 @@ export const agentDraftSchema = z.object({
   tags: z.array(z.string().min(1).max(32)).max(12).default([]),
   autonomyMode: z.enum(agentAutonomyModes).default("copilot"),
   visibility: z.enum(agentVisibilities).default("private"),
+  serviceFee: z.number().int().min(0).max(100_000).default(0),
   modelProviderId: z.string().optional().nullable(),
   model: z.string().max(160).optional().nullable(),
   temperature: z.number().min(0).max(2).default(0.7),
@@ -211,6 +225,16 @@ export const agentToolUpdateSchema = z.object({
   riskLevel: z.enum(["safe", "confirm", "external"]).optional(),
   config: z.record(z.unknown()).optional().nullable(),
   permissions: z.record(z.unknown()).optional().nullable()
+});
+
+export const agentToolCreateSchema = z.object({
+  name: z.string().min(2).max(80).regex(/^[a-zA-Z0-9_-]+$/),
+  kind: z.enum(["builtin", "http"]).default("http"),
+  description: z.string().min(1).max(500),
+  enabled: z.boolean().default(true),
+  riskLevel: z.enum(["safe", "confirm", "external"]).default("safe"),
+  config: z.record(z.unknown()).default({}),
+  permissions: z.record(z.unknown()).default({})
 });
 
 export const agentKnowledgeInputSchema = z.object({

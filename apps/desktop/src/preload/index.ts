@@ -13,6 +13,7 @@ const api = {
   skills: {
     list: (): Promise<SkillSummary[]> => ipcRenderer.invoke("skills:list"),
     get: (id: string): Promise<SkillSummary | null> => ipcRenderer.invoke("skills:get", id),
+    cache: (skills: SkillSummary[]): Promise<void> => ipcRenderer.invoke("skills:cache", skills),
     create: (skill: SkillDraft, sourceKind?: SkillSourceKind, id?: string): Promise<SkillSummary> =>
       ipcRenderer.invoke("skills:create", { skill, sourceKind, id }),
     update: (id: string, skill: SkillDraft, sourceKind?: SkillSourceKind): Promise<SkillSummary> =>
@@ -59,6 +60,7 @@ const api = {
       baseUrl: string;
       apiKey: string;
       defaultModel: string;
+      embeddingModel?: string | null;
     }): Promise<UserModelConfigPublic> => ipcRenderer.invoke("models:save-user", payload),
     deleteUser: (id: string, userId?: string): Promise<void> => ipcRenderer.invoke("models:delete-user", { id, userId }),
     testUser: (payload: {
@@ -98,8 +100,6 @@ const api = {
     minimize: (): Promise<void> => ipcRenderer.invoke("window:minimize"),
     maximize: (): Promise<void> => ipcRenderer.invoke("window:maximize"),
     close: (): Promise<void> => ipcRenderer.invoke("window:close"),
-    beginDrag: (): Promise<void> => ipcRenderer.invoke("window:begin-drag"),
-    endDrag: (): Promise<void> => ipcRenderer.invoke("window:end-drag"),
     setMode: (mode: "login" | "main"): Promise<void> => ipcRenderer.invoke("window:set-mode", mode),
     setOpacity: (opacity: number): Promise<void> => ipcRenderer.invoke("window:set-opacity", opacity),
     openSettings: (token?: string | null): Promise<void> => ipcRenderer.invoke("window:open-settings", token),
@@ -108,6 +108,14 @@ const api = {
       anchor?: { x: number; y: number; width: number; height: number } | null
     ): Promise<void> => ipcRenderer.invoke("window:open-profile", { token, anchor }),
     openProfileEdit: (token?: string | null): Promise<void> => ipcRenderer.invoke("window:open-profile-edit", token)
+  },
+  auth: {
+    broadcastLogout: (): Promise<void> => ipcRenderer.invoke("auth:broadcast-logout"),
+    onLoggedOut: (callback: () => void): (() => void) => {
+      const listener = () => callback();
+      ipcRenderer.on("auth:logged-out", listener);
+      return () => ipcRenderer.removeListener("auth:logged-out", listener);
+    }
   }
 };
 
