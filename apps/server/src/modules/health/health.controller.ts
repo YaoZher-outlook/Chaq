@@ -11,7 +11,13 @@ export class HealthController {
 
   @Get("live")
   live() {
-    return { status: "ok", service: "chaq-api", time: new Date().toISOString() };
+    return {
+      status: "ok",
+      service: "chaq-api",
+      mode: process.env.NODE_ENV || "development",
+      host: process.env.SERVER_HOST || "127.0.0.1",
+      time: new Date().toISOString()
+    };
   }
 
   @Get("ready")
@@ -19,7 +25,15 @@ export class HealthController {
     try {
       await this.prisma.$queryRaw`SELECT 1`;
       const queue = await this.queue.counts();
-      return { status: "ok", database: "ready", redis: "ready", queue, time: new Date().toISOString() };
+      return {
+        status: "ok",
+        database: "ready",
+        redis: "ready",
+        queue,
+        mode: process.env.NODE_ENV || "development",
+        host: process.env.SERVER_HOST || "127.0.0.1",
+        time: new Date().toISOString()
+      };
     } catch (error) {
       throw new ServiceUnavailableException({
         status: "degraded",

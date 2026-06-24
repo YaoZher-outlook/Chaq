@@ -6,6 +6,7 @@ import {
   AgentMemoryKind,
   AgentPostVisibility,
   AgentRunStatus,
+  AgentRunTrigger,
   AgentStatus,
   AgentTaskStatus,
   AgentToolKind,
@@ -158,6 +159,7 @@ export class AgentRuntimeService {
           }
         })
       ]);
+      await this.notifyUserTriggeredRunFailure(run, runId, message);
       throw error;
     }
   }
@@ -797,6 +799,46 @@ export class AgentRuntimeService {
 
   private async cancelRun(runId: string, error: string, status: AgentRunStatus = AgentRunStatus.CANCELLED): Promise<void> {
     await this.prisma.agentRun.update({ where: { id: runId }, data: { status, error, completedAt: new Date() } });
+  }
+
+  private async notifyUserTriggeredRunFailure(
+    run: { agentId: string; conversationId: string | null; trigger: AgentRunTrigger },
+    runId: string,
+    error: string
+  ): Promise<void> {
+    if (run.trigger !== AgentRunTrigger.USER_MESSAGE || !run.conversationId) return;
+    const conversation = await this.prisma.conversation.findUnique({
+      where: { id: run.conversationId },
+      include: { participants: true }
+    });
+    const target = conversation?.participants.find((participant) =>
+      !(participant.participantKind === ParticipantKind.AGENT && participant.participantId === run.agentId)
+        && participant.participantKind !== ParticipantKind.SYSTEM
+    );
+    if (!target) return;
+    await this.conversations.sendAgentMessage({
+      sourceAgentId: run.agentId,
+      targetKind: target.participantKind,
+      targetId: target.participantId,
+      content: this.failureReply(error),
+      conversationId: run.conversationId,
+      runId,
+      idempotencyKey: `${runId}:runtime-error-reply`
+    }).catch(() => undefined);
+  }
+
+  private failureReply(error: string): string {
+    const lower = error.toLowerCase();
+    if (lower.includes("api key") || lower.includes("credential")) {
+      return "我已经收到消息，但当前模型 API Key 没有配置好。请在模型设置里保存可用密钥后再试。";
+    }
+    if (lower.includes("fetch failed") || lower.includes("timed out") || lower.includes("timeout")) {
+      return "我已经收到消息，但现在连不上模型服务。请检查平台模型的接口地址、API Key 和服务器网络出口后再试。";
+    }
+    if (lower.includes("token balance") || lower.includes("insufficient")) {
+      return "我已经收到消息，但这次运行前的 Token 余额检查没有通过。请充值或降低本次调用配置后再试。";
+    }
+    return "我已经收到消息，但这次思考运行失败了。错误已记录到活动日志，修复模型配置后可以重新发送。";
   }
 
   private json(value: unknown): Prisma.InputJsonValue {

@@ -35,3 +35,10 @@ test("HTTP tool URL guard rejects local and private network targets", () => {
   assert.throws(() => runtime.assertAllowedHttpUrl("http://127.0.0.1:24537/api", { allowHttp: true }), /local or private/);
   assert.throws(() => runtime.assertAllowedHttpUrl("http://192.168.1.8/api", { allowHttp: true }), /local or private/);
 });
+
+test("agent runtime converts model failures into safe chat feedback", () => {
+  const runtime = new AgentRuntimeService({} as never, {} as never, {} as never) as any;
+  assert.match(runtime.failureReply("fetch failed"), /连不上模型服务/);
+  assert.match(runtime.failureReply("Provider API key is not configured."), /API Key/);
+  assert.match(runtime.failureReply("Token balance is insufficient"), /Token/);
+});

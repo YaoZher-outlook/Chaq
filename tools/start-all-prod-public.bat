@@ -4,7 +4,7 @@ chcp 65001 >nul
 
 set "TOOLS=%~dp0"
 
-echo [Chaq] Starting public-bind production API server and desktop client...
+echo [Chaq] Starting public production API server, Agent worker, and desktop client...
 call "%TOOLS%start-server-prod-public.bat"
 if errorlevel 1 exit /b 1
 
