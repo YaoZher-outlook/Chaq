@@ -50,6 +50,7 @@ textarea {
 }
 
 button {
+  position: relative;
   border: 1px solid transparent;
   background: var(--input);
   color: var(--text);
@@ -61,15 +62,41 @@ button {
   justify-content: center;
   gap: 7px;
   cursor: pointer;
+  transform: translateY(0) scale(1);
+  transition:
+    transform 150ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    box-shadow 160ms ease,
+    opacity 160ms ease;
+  -webkit-tap-highlight-color: transparent;
 }
 
 button:hover {
   background: rgba(255, 255, 255, 0.13);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+  transform: translateY(-1px);
+}
+
+button:active {
+  transform: translateY(0) scale(0.985);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.14);
 }
 
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  border-color: rgba(92, 214, 175, 0.68);
+  box-shadow: 0 0 0 3px rgba(65, 201, 155, 0.16);
 }
 
 .rb-spotlight {
@@ -160,6 +187,42 @@ textarea {
   border-radius: 8px;
   outline: none;
   padding: 10px 11px;
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease;
+}
+
+input:hover,
+select:hover,
+textarea:hover {
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(142, 153, 168, 0.36) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(142, 153, 168, 0.34);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(142, 153, 168, 0.52);
+  background-clip: padding-box;
 }
 
 select {
@@ -1385,16 +1448,19 @@ p {
   height: 100%;
   min-height: 0;
   display: grid;
-  grid-template-rows: 1fr 86px;
+  grid-template-rows: minmax(0, 1fr) auto;
 }
 
 .agent-message-list {
+  position: relative;
   min-height: 0;
   overflow: auto;
   display: flex;
   flex-direction: column;
   gap: 9px;
   padding: 16px 18px;
+  scroll-behavior: smooth;
+  overscroll-behavior: contain;
 }
 
 .agent-message-row,
@@ -1403,6 +1469,7 @@ p {
   display: flex;
   align-items: flex-end;
   gap: 8px;
+  animation: chat-message-enter 220ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 
 .agent-message-row.mine {
@@ -1437,6 +1504,17 @@ p {
   border: 1px solid var(--agent-line);
   border-radius: 7px;
   background: #292c34;
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.agent-message-row:hover .agent-message {
+  border-color: rgba(124, 202, 236, 0.22);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.16);
+  transform: translateY(-1px);
 }
 
 .agent-message.mine {
@@ -1508,22 +1586,51 @@ p {
   color: var(--agent-muted);
 }
 
+.agent-message-list.bottom-pulse {
+  animation: scroll-bottom-confirm 520ms ease;
+}
+
+.agent-scroll-bottom {
+  position: sticky;
+  bottom: 8px;
+  z-index: 4;
+  align-self: center;
+  width: max-content;
+  min-height: 32px;
+  padding: 6px 11px;
+  border-color: rgba(105, 188, 255, 0.35);
+  background: rgba(42, 54, 66, 0.92);
+  color: #dcecff;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(10px);
+  animation: scroll-bottom-button-in 180ms ease both;
+}
+
 .agent-composer {
   display: grid;
-  grid-template-columns: 1fr 42px;
+  grid-template-columns: minmax(0, 1fr) 42px;
+  align-items: end;
   gap: 8px;
   padding: 10px 12px;
   border-top: 1px solid var(--agent-line);
 }
 
+.agent-composer-input {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
 .agent-composer textarea {
-  min-height: 62px;
-  max-height: 62px;
+  min-height: 50px;
+  max-height: 92px;
+  padding-right: 38px;
   resize: none;
 }
 
-.agent-composer button {
-  height: 42px;
+.agent-composer > button {
+  height: 50px;
   align-self: end;
   padding: 0;
 }
@@ -1721,6 +1828,44 @@ p {
 @keyframes agent-typing-dot {
   0%, 60%, 100% { transform: translateY(0); opacity: 0.45; }
   30% { transform: translateY(-3px); opacity: 1; }
+}
+
+@keyframes chat-message-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes scroll-bottom-button-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes scroll-bottom-confirm {
+  0% {
+    box-shadow: inset 0 -28px 32px rgba(102, 203, 243, 0);
+  }
+
+  38% {
+    box-shadow: inset 0 -28px 32px rgba(102, 203, 243, 0.12);
+  }
+
+  100% {
+    box-shadow: inset 0 -28px 32px rgba(102, 203, 243, 0);
+  }
 }
 
 /* Agent public profile */
@@ -2481,6 +2626,84 @@ p {
   grid-template-columns: 24px 0.5fr 1fr auto;
 }
 
+.agent-rag-panel {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid rgba(105, 188, 255, 0.22);
+  border-radius: 7px;
+  background: rgba(73, 139, 185, 0.08);
+}
+
+.agent-rag-query {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-rag-results {
+  display: grid;
+  gap: 7px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.agent-rag-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.agent-rag-meta span {
+  padding: 3px 7px;
+  border: 1px solid var(--agent-line);
+  border-radius: 999px;
+  color: var(--agent-muted);
+  font-size: 10px;
+}
+
+.agent-rag-results article {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--agent-line);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.agent-rag-results header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.agent-rag-results header strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-rag-results header span {
+  color: #8ed9ff;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-rag-results p {
+  display: -webkit-box;
+  margin: 7px 0;
+  overflow: hidden;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+}
+
+.agent-rag-results small,
+.agent-empty-line {
+  color: var(--agent-muted);
+}
+
 .agent-memory-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2494,12 +2717,18 @@ p {
 
 .agent-knowledge-list article {
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr);
+  grid-template-columns: 22px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
   border: 1px solid var(--agent-line);
   border-radius: 7px;
+}
+
+.agent-knowledge-list .icon-only-button {
+  width: 30px;
+  min-width: 30px;
+  min-height: 30px;
 }
 
 .agent-knowledge-list article > div {
@@ -3013,9 +3242,16 @@ p {
 }
 
 .message-pane {
+  position: relative;
   min-height: 0;
   overflow: auto;
   padding: 22px 28px;
+  scroll-behavior: smooth;
+  overscroll-behavior: contain;
+}
+
+.message-pane.bottom-pulse {
+  animation: scroll-bottom-confirm 520ms ease;
 }
 
 .empty-chat {
@@ -3068,6 +3304,23 @@ p {
   font-size: 12px;
 }
 
+.chat-scroll-bottom {
+  position: sticky;
+  bottom: 8px;
+  z-index: 4;
+  display: flex;
+  width: max-content;
+  margin: 0 auto;
+  min-height: 32px;
+  padding: 6px 11px;
+  border-color: rgba(117, 167, 255, 0.36);
+  background: rgba(38, 43, 53, 0.92);
+  color: #e2ebff;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.26);
+  backdrop-filter: blur(10px);
+  animation: scroll-bottom-button-in 180ms ease both;
+}
+
 .skill-inspector {
   min-height: 0;
   overflow: auto;
@@ -3088,20 +3341,63 @@ p {
 
 .message-input {
   display: grid;
-  grid-template-columns: 1fr 50px;
+  grid-template-columns: minmax(0, 1fr) 50px;
+  align-items: end;
   gap: 12px;
   padding: 14px 22px;
   border-top: 1px solid var(--line);
   background: rgba(29, 31, 37, 0.82);
 }
 
-.message-input textarea {
-  min-height: 70px;
-  max-height: 70px;
+.composer-input-wrap {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  gap: 6px;
 }
 
-.message-input button {
-  height: 70px;
+.message-input textarea {
+  min-height: 56px;
+  max-height: 118px;
+  padding-right: 40px;
+  resize: vertical;
+}
+
+.message-input > button {
+  height: 58px;
+}
+
+.composer-clear {
+  position: absolute;
+  top: 7px;
+  right: 8px;
+  width: 26px;
+  min-width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 7px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.composer-clear:hover:not(:disabled) {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.composer-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 2px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.2;
+  user-select: none;
+}
+
+.composer-meta .warn {
+  color: #f1bd70;
 }
 
 .chat-more-drawer {
@@ -3412,7 +3708,7 @@ p {
   min-height: 0;
   overflow: auto;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   gap: 14px;
 }
 
@@ -3453,6 +3749,55 @@ p {
 .wallet-balance-band strong {
   font-size: 28px;
   line-height: 1;
+}
+
+.wallet-recharge-card {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px 14px;
+  padding: 14px;
+  border: 1px solid rgba(124, 168, 255, 0.2);
+  border-radius: 7px;
+  background: rgba(124, 168, 255, 0.055);
+}
+
+.wallet-recharge-card.disabled {
+  opacity: 0.72;
+}
+
+.wallet-recharge-card strong,
+.wallet-recharge-card p {
+  margin: 0;
+}
+
+.wallet-recharge-card p,
+.wallet-recharge-card small {
+  color: var(--muted);
+}
+
+.wallet-recharge-card > small,
+.wallet-recharge-card .field-error {
+  grid-column: 1 / -1;
+}
+
+.wallet-recharge-form {
+  display: grid;
+  grid-template-columns: 110px 110px auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.wallet-recharge-form input,
+.wallet-recharge-form select {
+  min-width: 0;
+  height: 36px;
+}
+
+.wallet-recharge-form button {
+  min-height: 36px;
+  white-space: nowrap;
 }
 
 .wallet-metrics {
@@ -3582,6 +3927,64 @@ p {
   display: grid;
   grid-template-columns: minmax(320px, 420px) 1fr;
   gap: 16px;
+}
+
+.admin-console-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(320px, 420px) minmax(260px, 0.75fr) minmax(360px, 1fr);
+  gap: 16px;
+}
+
+.admin-list-panel,
+.admin-review-panel {
+  min-height: 0;
+  align-content: start;
+  overflow: auto;
+}
+
+.admin-review-card {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.admin-review-card strong {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.admin-review-card small,
+.admin-review-card span {
+  color: var(--muted);
+}
+
+.admin-review-card p,
+.admin-review-card em {
+  overflow-wrap: anywhere;
+}
+
+.admin-review-card p {
+  margin-top: 6px;
+  color: #c6cdd7;
+  line-height: 1.5;
+}
+
+.admin-review-card em {
+  display: block;
+  margin-top: 8px;
+  color: #e4be77;
+  font-style: normal;
+}
+
+.admin-review-card footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .panel,
@@ -4101,6 +4504,7 @@ textarea[aria-invalid="true"] {
 
   .chat-main,
   .split-tools,
+  .admin-console-grid,
   .market-tools,
   .settings-layout,
   .settings-grid {
@@ -4109,6 +4513,14 @@ textarea[aria-invalid="true"] {
 
   .wallet-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .wallet-recharge-card {
+    grid-template-columns: 1fr;
+  }
+
+  .wallet-recharge-form {
+    grid-template-columns: minmax(0, 1fr) 104px auto;
   }
 
   .wallet-columns,
@@ -4160,4 +4572,166 @@ textarea[aria-invalid="true"] {
 
 .settings-window-shell .background-setting {
   grid-template-columns: 260px 1fr;
+}
+
+/* Interaction polish */
+.message-pane,
+.skill-list-qq,
+.market-list,
+.panel,
+.setting-card,
+.settings-content,
+.agent-message-list,
+.agent-form-scroll,
+.agent-panel-stack,
+.agent-activity-list,
+.agent-profile-page,
+.agent-profile-chat-messages,
+.agent-explore-grid,
+.agent-rag-results {
+  scroll-behavior: smooth;
+  overscroll-behavior: contain;
+}
+
+.panel,
+.setting-card,
+.market-card,
+.wallet-card,
+.settings-row,
+.saved-model-row,
+.agent-explore article,
+.agent-post,
+.agent-rag-results article {
+  transition:
+    transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    border-color 170ms ease,
+    background 170ms ease,
+    box-shadow 170ms ease;
+}
+
+.panel:hover,
+.setting-card:hover,
+.wallet-card:hover,
+.agent-explore article:hover,
+.agent-post:hover {
+  border-color: rgba(124, 202, 236, 0.16);
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.16);
+  transform: translateY(-1px);
+}
+
+.market-card:hover,
+.settings-row:hover,
+.saved-model-row:hover,
+.agent-directory-row:hover,
+.agent-inbox-row:hover,
+.agent-contact-empty:hover,
+.agent-empty-create:hover {
+  transform: translateY(-1px);
+}
+
+.market-card,
+.settings-row,
+.wallet-card,
+.agent-post,
+.agent-rag-results article,
+.msg,
+.comment,
+.saved-model-row {
+  animation: ui-soft-enter 220ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.msg {
+  animation-name: chat-message-enter;
+}
+
+.row-button:hover small,
+.agent-inbox-row:hover small,
+.agent-directory-row:hover small,
+.skill-card:hover small {
+  color: rgba(235, 241, 248, 0.82);
+}
+
+.icon-only-button:hover svg,
+.rail-button:hover svg,
+.agent-tabs button:hover svg,
+.settings-nav button:hover svg,
+.market-actions button:hover svg,
+.agent-post-actions button:hover svg {
+  transform: scale(1.08);
+}
+
+.icon-only-button svg,
+.rail-button svg,
+.agent-tabs button svg,
+.settings-nav button svg,
+.market-actions button svg,
+.agent-post-actions button svg {
+  transition: transform 150ms ease;
+}
+
+.message-pane {
+  scroll-behavior: smooth;
+}
+
+.msg-bubble {
+  transition:
+    transform 160ms ease,
+    box-shadow 160ms ease,
+    background 160ms ease;
+}
+
+.msg:hover .msg-bubble {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
+}
+
+.primary-button,
+.agent-run-button,
+.agent-profile-message,
+.message-input > button,
+.agent-composer > button {
+  box-shadow: 0 10px 24px rgba(46, 146, 105, 0.16);
+}
+
+.primary-button:hover,
+.agent-run-button:hover,
+.agent-profile-message:hover,
+.message-input > button:hover,
+.agent-composer > button:hover {
+  box-shadow: 0 14px 32px rgba(52, 188, 132, 0.22);
+}
+
+@keyframes ui-soft-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+
+  button,
+  .panel,
+  .setting-card,
+  .market-card,
+  .wallet-card,
+  .settings-row,
+  .saved-model-row,
+  .agent-message,
+  .msg-bubble {
+    transform: none !important;
+  }
 }

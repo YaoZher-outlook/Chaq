@@ -6,6 +6,9 @@ import { hashPassword, hashSessionToken, verifyPassword } from "../../common/pas
 import { PrismaService } from "../../common/prisma.service";
 import { RateLimitService } from "../../common/rate-limit.service";
 
+const rechargePilotUser = "chen_zy";
+const maxTokenBalance = 2_000_000_000;
+
 @Injectable()
 export class UsersService {
   constructor(
@@ -261,6 +264,49 @@ export class UsersService {
         .sort((a, b) => b.amount - a.amount),
       transactions
     };
+  }
+
+  async rechargeTokens(userId: string, input: { amount: number; unit: "token" | "k" | "m"; note?: string }) {
+    const user = await this.ensureUser(userId);
+    if (user.username !== rechargePilotUser) {
+      throw new ForbiddenException("Recharge is currently only available for chen_zy.");
+    }
+    const unitFactor = input.unit === "m" ? 1_000_000 : input.unit === "k" ? 1_000 : 1;
+    const amount = input.amount * unitFactor;
+    if (!Number.isInteger(amount) || amount <= 0) {
+      throw new BadRequestException("Recharge amount must be a positive integer token value.");
+    }
+    if (amount > 500_000_000) {
+      throw new BadRequestException("Single recharge cannot exceed 500M token.");
+    }
+    return this.prisma.$transaction(async (tx) => {
+      const changed = await tx.user.updateMany({
+        where: { id: userId, tokenBalance: { lte: maxTokenBalance - amount } },
+        data: { tokenBalance: { increment: amount } }
+      });
+      if (!changed.count) {
+        throw new BadRequestException("Token balance would exceed the current platform limit.");
+      }
+      const updated = await tx.user.findUniqueOrThrow({ where: { id: userId } });
+      const transaction = await tx.tokenTransaction.create({
+        data: {
+          userId,
+          kind: TokenTransactionKind.RECHARGE,
+          amount,
+          balanceAfter: updated.tokenBalance,
+          note: input.note?.trim() || "Pilot recharge credited before payment collection account is configured.",
+          metadata: {
+            status: "pilot_direct_credit",
+            allowedAccount: rechargePilotUser,
+            paymentProvider: "manual_pending",
+            collectionAccountConfigured: false,
+            requestedAmount: input.amount,
+            requestedUnit: input.unit
+          } as Prisma.InputJsonValue
+        }
+      });
+      return { user: this.publicUser(updated), transaction };
+    });
   }
 
   async settings(userId: string) {

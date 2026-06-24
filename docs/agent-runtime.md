@@ -49,6 +49,16 @@ Persists outcomes, updates daily usage, schedules the next autonomous wake, and 
 
 Knowledge is split into overlapping chunks. Chaq writes vectors for memories and knowledge chunks, then ranks retrieval with vector similarity plus Chinese/Latin keyword overlap. If the Agent's provider metadata includes an embedding model, the server calls the provider's embedding API; otherwise it falls back to the deterministic local `chaq-hash-v1` vectorizer so development never blocks on external model access.
 
+The owner can preview the exact retrieval behavior from the Agent memory tab or through `POST /api/agents/:id/knowledge/search`. The preview uses the same embedding path and ranking formula as the worker, and returns the query embedding model, whether fallback was used, token estimates, chunk scores, vector scores, keyword overlap, source title, and source kind. This is the main way to verify that an Agent's knowledge base will be recalled before relying on it in autonomous runs.
+
+Relevant implementation paths:
+
+- Knowledge ingestion: `apps/server/src/modules/agents/agents.service.ts`
+- Embedding provider/fallback: `apps/server/src/modules/models/models.service.ts`
+- Runtime retrieval: `apps/server/src/modules/agent-runtime/agent-runtime.service.ts`
+- Local vectorizer and keyword extraction: `apps/server/src/common/vector-search.ts`
+- Provider preset defaults: `apps/desktop/src/renderer/lib/provider-presets.ts`
+
 ## Cost And Loop Controls
 
 - Each Agent has daily token and action budgets.

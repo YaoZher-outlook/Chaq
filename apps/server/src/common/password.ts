@@ -19,7 +19,8 @@ export function verifyPassword(password: string, storedHash: string): boolean {
 }
 
 export function hashSessionToken(token: string): string {
-  return createHash("sha256").update(token).digest("hex");
+  const secret = process.env.SESSION_HASH_SECRET || process.env.MODEL_SECRET_KEY || "";
+  return createHash("sha256").update(`${secret}\0${token}`).digest("hex");
 }
 
 function safeEqual(left: string, right: string): boolean {

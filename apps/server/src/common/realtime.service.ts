@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Server } from "node:http";
 import type { Socket } from "node:net";
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common";
 import { AuthService } from "../modules/auth/auth.service";
 
 type Client = {
@@ -10,9 +10,11 @@ type Client = {
 };
 
 @Injectable()
-export class RealtimeService {
+export class RealtimeService implements OnModuleDestroy {
   private readonly logger = new Logger(RealtimeService.name);
   private readonly clients = new Map<string, Set<Client>>();
+  private heartbeat?: NodeJS.Timeout;
+  private sequence = 0;
   private bound = false;
 
   bind(server: Server, auth: AuthService): void {
@@ -21,13 +23,23 @@ export class RealtimeService {
     server.on("upgrade", (request, socket) => {
       void this.handleUpgrade(request.url ?? "", request.headers, socket as Socket, auth);
     });
+    this.heartbeat = setInterval(() => this.emitHeartbeat(), 25_000);
+    this.heartbeat.unref?.();
     this.logger.log("Realtime WebSocket endpoint is listening on /api/realtime");
+  }
+
+  onModuleDestroy(): void {
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    for (const set of this.clients.values()) {
+      for (const client of set) client.socket.destroy();
+    }
+    this.clients.clear();
   }
 
   emitToUser(userId: string, type: string, payload: unknown): void {
     const clients = this.clients.get(userId);
     if (!clients?.size) return;
-    const data = JSON.stringify({ type, payload, at: new Date().toISOString() });
+    const data = this.eventFrame(type, payload);
     for (const client of [...clients]) {
       this.send(client, data);
     }
@@ -78,7 +90,7 @@ export class RealtimeService {
       socket.on("close", () => this.remove(client));
       socket.on("error", () => this.remove(client));
       socket.on("data", () => undefined);
-      this.send(client, JSON.stringify({ type: "realtime.ready", payload: { userId: user.id }, at: new Date().toISOString() }));
+      this.send(client, this.eventFrame("realtime.ready", { userId: user.id }));
     } catch (error) {
       this.logger.warn(`Realtime upgrade failed: ${error instanceof Error ? error.message : String(error)}`);
       socket.destroy();
@@ -91,6 +103,18 @@ export class RealtimeService {
     } catch {
       this.remove(client);
     }
+  }
+
+  private emitHeartbeat(): void {
+    const data = this.eventFrame("realtime.heartbeat", { clients: [...this.clients.values()].reduce((sum, set) => sum + set.size, 0) });
+    for (const set of [...this.clients.values()]) {
+      for (const client of [...set]) this.send(client, data);
+    }
+  }
+
+  private eventFrame(type: string, payload: unknown): string {
+    this.sequence = (this.sequence + 1) % Number.MAX_SAFE_INTEGER;
+    return JSON.stringify({ type, payload, at: new Date().toISOString(), seq: this.sequence });
   }
 
   private frame(data: string): Buffer {

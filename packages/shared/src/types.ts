@@ -120,6 +120,22 @@ export interface MarketplaceComment {
   createdAt: string;
 }
 
+export type SkillReportStatus = "pending" | "dismissed" | "actioned";
+
+export interface SkillReviewItem {
+  skill: MarketplaceSkill & {
+    ownerId: Id;
+    ownerDisplayName: string;
+    visibility: SkillVisibility;
+  };
+  reportCount: number;
+  latestReason: string;
+  latestReporter: string;
+  oldestReportAt: string;
+  latestReportAt: string;
+  status: SkillReportStatus;
+}
+
 export interface ModelProviderPublic {
   id: Id;
   scope: ModelProviderScope;
@@ -215,7 +231,9 @@ export type AgentAutonomyMode = "manual" | "copilot" | "autonomous";
 export type AgentVisibility = "private" | "unlisted" | "public";
 export type AgentPostVisibility = "public" | "relationships" | "private";
 export type AgentPresence = "thinking" | "online" | "away" | "offline";
+export type AgentReportStatus = "pending" | "dismissed" | "actioned";
 export type AgentMemoryKind = "episodic" | "semantic" | "procedural" | "social" | "reflection";
+export type AgentKnowledgeSourceKind = "note" | "file" | "chat_import" | "url" | "skill_migration";
 export type AgentGoalStatus = "pending" | "active" | "blocked" | "completed" | "cancelled";
 export type AgentTaskStatus = "pending" | "running" | "waiting" | "completed" | "failed" | "cancelled";
 export type AgentRunTrigger = "user_message" | "agent_message" | "scheduled" | "goal" | "event" | "manual";
@@ -321,6 +339,19 @@ export interface PublicAgentSummary {
   updatedAt: string;
 }
 
+export interface AgentReviewItem {
+  agent: PublicAgentSummary & {
+    ownerId: Id;
+    ownerDisplayName: string;
+  };
+  reportCount: number;
+  latestReason: string;
+  latestReporter: string;
+  oldestReportAt: string;
+  latestReportAt: string;
+  status: AgentReportStatus;
+}
+
 export interface AgentContact {
   id: Id;
   agent: PublicAgentSummary;
@@ -408,7 +439,7 @@ export interface AgentMemory {
 export interface AgentKnowledgeSource {
   id: Id;
   agentId: Id;
-  kind: "note" | "file" | "chat_import" | "url" | "skill_migration";
+  kind: AgentKnowledgeSourceKind;
   status: "processing" | "ready" | "failed";
   title: string;
   originUri?: string | null;
@@ -481,6 +512,30 @@ export interface AgentTool {
   config?: unknown;
   usageCount: number;
   lastUsedAt?: string | null;
+}
+
+export interface AgentKnowledgeSearchResult {
+  id: Id;
+  sourceId: Id;
+  sourceTitle: string;
+  sourceKind: AgentKnowledgeSourceKind;
+  position: number;
+  content: string;
+  score: number;
+  vectorScore: number;
+  keywordScore: number;
+  keywords: string[];
+  embeddingModel?: string | null;
+}
+
+export interface AgentKnowledgeSearchResponse {
+  query: string;
+  queryEmbeddingModel: string;
+  queryUsedFallback: boolean;
+  promptTokens: number;
+  chargedTokens: number;
+  resultCount: number;
+  results: AgentKnowledgeSearchResult[];
 }
 
 export interface AgentRun {

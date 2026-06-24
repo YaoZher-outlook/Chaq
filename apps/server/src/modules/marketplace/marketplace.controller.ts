@@ -1,6 +1,6 @@
 import { Body, Controller, Get, Inject, Param, Post, Query } from "@nestjs/common";
 import { z } from "zod";
-import { skillDraftSchema, skillSourceKinds } from "@chaq/shared";
+import { skillDraftSchema, skillReportInputSchema, skillSourceKinds } from "@chaq/shared";
 import { CurrentUserId } from "../../common/current-user.decorator";
 import { parseBody } from "../../common/http-errors";
 import { MarketplaceService } from "./marketplace.service";
@@ -41,6 +41,11 @@ export class MarketplaceController {
   @Post(":id/import")
   importSkill(@CurrentUserId() userId: string, @Param("id") id: string) {
     return this.marketplace.importSkill(userId, id);
+  }
+
+  @Post(":id/report")
+  reportSkill(@CurrentUserId() userId: string, @Param("id") id: string, @Body() body: unknown) {
+    return this.marketplace.reportSkill(userId, id, parseBody(skillReportInputSchema, body).reason ?? "user_report");
   }
 
   @Post(":id/reaction")

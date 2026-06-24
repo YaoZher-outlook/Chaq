@@ -78,6 +78,8 @@ For a useful Agent:
 6. Add goals, knowledge, memories, and relationships.
 7. Add optional HTTP tools from the Agent identity tab. Only enabled safe tools can be called automatically, and the runtime allows only `GET`, `POST`, and `HEAD`.
 
+Use the Agent memory tab's RAG preview box to test a query against the Agent knowledge base. It calls the same `/api/agents/:id/knowledge/search` path used for diagnostics and reports the embedding model, fallback state, token estimate, and ranked chunks.
+
 ## Local Storage
 
 The default local environment root is `E:\Environment\Chaq`, unless `CHAQ_ENV_ROOT` is set.

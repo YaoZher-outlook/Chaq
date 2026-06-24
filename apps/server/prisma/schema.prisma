@@ -23,6 +23,12 @@ enum SkillVisibility {
   PUBLIC
 }
 
+enum SkillReportStatus {
+  PENDING
+  DISMISSED
+  ACTIONED
+}
+
 enum SkillSourceKind {
   MANUAL
   WECHAT
@@ -213,6 +219,12 @@ enum ToolRiskLevel {
   EXTERNAL
 }
 
+enum AgentReportStatus {
+  PENDING
+  DISMISSED
+  ACTIONED
+}
+
 enum KnowledgeSourceKind {
   NOTE
   FILE
@@ -250,6 +262,9 @@ model User {
   sessions           AuthSession[]
   settings           UserSetting?
   skillReports       SkillReport[]
+  reviewedSkillReports SkillReport[]      @relation("SkillReportReviewer")
+  agentReports       AgentReport[]        @relation("AgentReportReporter")
+  reviewedAgentReports AgentReport[]      @relation("AgentReportReviewer")
   agents             Agent[]
   agentContacts      AgentContact[]
   agentPostReactions AgentPostReaction[]
@@ -327,14 +342,21 @@ model Skill {
 }
 
 model SkillReport {
-  id         String   @id @default(cuid())
-  reporterId String
-  skillId    String
-  reason     String
-  createdAt  DateTime @default(now())
-  reporter   User     @relation(fields: [reporterId], references: [id], onDelete: Cascade)
-  skill      Skill    @relation(fields: [skillId], references: [id], onDelete: Cascade)
+  id           String            @id @default(cuid())
+  reporterId   String
+  skillId      String
+  reason       String
+  status       SkillReportStatus @default(PENDING)
+  adminNote    String            @default("")
+  reviewedById String?
+  reviewedBy   User?             @relation("SkillReportReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewedAt   DateTime?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+  reporter     User              @relation(fields: [reporterId], references: [id], onDelete: Cascade)
+  skill        Skill             @relation(fields: [skillId], references: [id], onDelete: Cascade)
 
+  @@index([status, createdAt])
   @@index([reporterId])
   @@index([skillId])
 }
@@ -560,6 +582,7 @@ model Agent {
   events               AgentEvent[]
   posts                AgentPost[]
   contacts             AgentContact[]
+  reports              AgentReport[]
 
   @@unique([ownerId, handle])
   @@index([ownerId, status])
@@ -581,6 +604,26 @@ model AgentContact {
   @@unique([userId, agentId])
   @@index([agentId, createdAt])
   @@index([userId, updatedAt])
+}
+
+model AgentReport {
+  id           String            @id @default(cuid())
+  reporterId   String
+  reporter     User              @relation("AgentReportReporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  agentId      String
+  agent        Agent             @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  reason       String
+  status       AgentReportStatus @default(PENDING)
+  adminNote    String            @default("")
+  reviewedById String?
+  reviewedBy   User?             @relation("AgentReportReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewedAt   DateTime?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  @@index([status, createdAt])
+  @@index([agentId])
+  @@index([reporterId])
 }
 
 model AgentPost {

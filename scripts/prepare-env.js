@@ -5,9 +5,11 @@ const {
   electronCache,
   npmCache,
   postgresData,
+  projectLogs,
   runtimeCache,
   serverEnv,
-  userData
+  userData,
+  workspaceServerEnv
 } = require("./env-paths");
 
 const requiredEnv = {
@@ -20,6 +22,7 @@ const requiredEnv = {
   DEMO_ADMIN_USER_ID: "admin-local",
   AGENT_WORKER_CONCURRENCY: "4",
   MODEL_REQUEST_TIMEOUT_MS: "60000",
+  CHAQ_LOG_DIR: projectLogs,
   CHAQ_PG_BIN: "E:\\Environment\\pgsql\\bin",
   CHAQ_PG_DATA_DIR: postgresData,
   CHAQ_PG_USER: "chaq",
@@ -30,7 +33,12 @@ const requiredEnv = {
   CHAQ_REDIS_PORT: "46379"
 };
 
-for (const dir of [chaqEnvironmentRoot, electronCache, runtimeCache, npmCache, postgresData, userData]) {
+const secretEnv = {
+  MODEL_SECRET_KEY: () => randomBytes(48).toString("base64url"),
+  SESSION_HASH_SECRET: () => randomBytes(48).toString("base64url")
+};
+
+for (const dir of [chaqEnvironmentRoot, electronCache, runtimeCache, npmCache, postgresData, userData, projectLogs]) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
@@ -41,8 +49,9 @@ function formatEnvValue(value) {
 function writeServerEnv() {
   const existingLines = fs.existsSync(serverEnv) ? fs.readFileSync(serverEnv, "utf8").split(/\r?\n/) : [];
   const seen = new Set();
+  const existingSecrets = new Map();
   const nextLines = [];
-  let hasModelSecretKey = false;
+  const generatedSecrets = new Map();
 
   for (const line of existingLines) {
     const trimmed = line.trim();
@@ -53,10 +62,12 @@ function writeServerEnv() {
     }
 
     const key = trimmed.slice(0, index).trim();
-    if (key === "MODEL_SECRET_KEY") {
-      if (trimmed.slice(index + 1).trim()) {
+    if (key in secretEnv) {
+      const value = trimmed.slice(index + 1).trim().replace(/^"|"$/g, "");
+      if (value) {
+        existingSecrets.set(key, value);
         nextLines.push(line);
-        hasModelSecretKey = true;
+        seen.add(key);
       }
       continue;
     }
@@ -78,11 +89,60 @@ function writeServerEnv() {
     }
   }
 
-  if (!hasModelSecretKey) {
-    nextLines.push(`MODEL_SECRET_KEY=${randomBytes(48).toString("base64url")}`);
+  for (const [key, createSecret] of Object.entries(secretEnv)) {
+    if (seen.has(key)) continue;
+    const value = createSecret();
+    generatedSecrets.set(key, value);
+    existingSecrets.set(key, value);
+    nextLines.push(`${key}=${value}`);
   }
 
   fs.writeFileSync(serverEnv, `${nextLines.filter((line, index, lines) => line.trim() || index < lines.length - 1).join("\r\n")}\r\n`, "utf8");
+  writeWorkspaceServerEnv(existingSecrets);
+  writeSecretBackup(existingSecrets, generatedSecrets);
+}
+
+function writeWorkspaceServerEnv(secrets) {
+  const existingLines = fs.existsSync(workspaceServerEnv) ? fs.readFileSync(workspaceServerEnv, "utf8").split(/\r?\n/) : [];
+  const seen = new Set();
+  const nextLines = [];
+  const values = { ...requiredEnv, ...Object.fromEntries(secrets.entries()) };
+  for (const line of existingLines) {
+    const trimmed = line.trim();
+    const index = trimmed.indexOf("=");
+    if (!trimmed || trimmed.startsWith("#") || index < 1) {
+      nextLines.push(line);
+      continue;
+    }
+    const key = trimmed.slice(0, index).trim();
+    if (key in values) {
+      nextLines.push(`${key}=${formatEnvValue(String(values[key]))}`);
+      seen.add(key);
+    } else {
+      nextLines.push(line);
+    }
+  }
+  for (const [key, value] of Object.entries(values)) {
+    if (!seen.has(key)) nextLines.push(`${key}=${formatEnvValue(String(value))}`);
+  }
+  fs.writeFileSync(workspaceServerEnv, `${nextLines.filter((line, index, lines) => line.trim() || index < lines.length - 1).join("\r\n")}\r\n`, "utf8");
+}
+
+function writeSecretBackup(allSecrets, generatedSecrets) {
+  const desktop = process.env.USERPROFILE
+    ? require("node:path").join(process.env.USERPROFILE, "Desktop")
+    : null;
+  if (!desktop || !fs.existsSync(desktop)) return;
+  const lines = [
+    "Chaq server secrets",
+    `Generated at: ${new Date().toISOString()}`,
+    `Server env: ${serverEnv}`,
+    "",
+    ...[...allSecrets.entries()].map(([key, value]) => `${key}=${value}`),
+    "",
+    `Newly generated this run: ${[...generatedSecrets.keys()].join(", ")}`
+  ];
+  fs.writeFileSync(require("node:path").join(desktop, "Chaq-server-secrets.txt"), `${lines.join("\r\n")}\r\n`, "utf8");
 }
 
 writeServerEnv();
@@ -93,3 +153,5 @@ console.log(`Electron runtime cache: ${runtimeCache}`);
 console.log(`npm cache: ${npmCache}`);
 console.log(`Electron user data: ${userData}`);
 console.log(`Server env: ${serverEnv}`);
+console.log(`Workspace server env: ${workspaceServerEnv}`);
+console.log(`Server logs: ${projectLogs}`);

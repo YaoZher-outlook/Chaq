@@ -25,6 +25,12 @@ const adjustTokensSchema = z.object({
   note: z.string().max(300).optional()
 });
 
+const rechargeSchema = z.object({
+  amount: z.number().positive().max(500_000_000),
+  unit: z.enum(["token", "k", "m"]).default("m"),
+  note: z.string().max(300).optional()
+});
+
 const settingsSchema = z.object({
   language: z.enum(["zh", "en"]).optional(),
   theme: z.enum(["light", "dark", "system"]).optional(),
@@ -64,6 +70,12 @@ export class UsersController {
   @Get("me/wallet")
   wallet(@CurrentUserId() userId: string) {
     return this.users.walletSummary(userId);
+  }
+
+  @Post("me/recharge")
+  recharge(@CurrentUserId() userId: string, @Body() body: unknown) {
+    const input = parseBody(rechargeSchema, body);
+    return this.users.rechargeTokens(userId, { ...input, unit: input.unit ?? "m" });
   }
 
   @Get("me/settings")

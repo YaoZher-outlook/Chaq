@@ -10,6 +10,8 @@ import type {
   AgentRelationship,
   AgentRun,
   AgentSummary,
+  AgentKnowledgeSearchResponse,
+  AgentReviewItem,
   PublicAgentSummary,
   CloudChatRequest,
   CloudChatResponse,
@@ -18,6 +20,7 @@ import type {
   MarketplaceComment,
   MarketplaceSkill,
   ModelProviderPublic,
+  SkillReviewItem,
   SkillDraft,
   SkillSummary,
   SkillVersionSnapshot,
@@ -75,25 +78,36 @@ export function connectRealtime(onEvent: (event: { type: string; payload: unknow
   if (!sessionToken) return () => undefined;
   let closed = false;
   let socket: WebSocket | null = null;
+  let retryTimer: number | null = null;
+  let retryAttempt = 0;
   const open = () => {
+    if (closed) return;
     socket = new WebSocket(getRealtimeUrl(sessionToken));
+    socket.onopen = () => {
+      retryAttempt = 0;
+    };
     socket.onmessage = (message) => {
       try {
-        onEvent(JSON.parse(String(message.data)));
+        const event = JSON.parse(String(message.data));
+        if (event?.type !== "realtime.heartbeat") onEvent(event);
       } catch {
         // Ignore malformed realtime frames.
       }
     };
+    socket.onerror = () => {
+      socket?.close();
+    };
     socket.onclose = () => {
       if (closed) return;
-      window.setTimeout(() => {
-        if (!closed) open();
-      }, 2500);
+      const delay = Math.min(30_000, 1000 * 2 ** Math.min(5, retryAttempt));
+      retryAttempt += 1;
+      retryTimer = window.setTimeout(() => open(), delay + Math.round(Math.random() * 500));
     };
   };
   open();
   return () => {
     closed = true;
+    if (retryTimer) window.clearTimeout(retryTimer);
     socket?.close();
     socket = null;
   };
@@ -209,6 +223,13 @@ export const api = {
   }),
   tokenLedger: () => request<TokenTransaction[]>("/users/me/tokens"),
   wallet: () => request<WalletSummary>("/users/me/wallet"),
+  recharge: (payload: { amount: number; unit: "token" | "k" | "m"; note?: string }) => request<{
+    user: LoginUser;
+    transaction: TokenTransaction;
+  }>("/users/me/recharge", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  }),
   providers: () => request<ModelProviderPublic[]>("/models/providers"),
   availableProviders: () => request<ModelProviderPublic[]>("/models/available"),
   privateProviders: () => request<ModelProviderPublic[]>("/models/private/providers"),
@@ -264,6 +285,11 @@ export const api = {
     method: "POST",
     body: JSON.stringify({ reason })
   }),
+  adminSkillReports: () => request<SkillReviewItem[]>("/skills/admin/reports"),
+  moderateSkill: (skillId: string, action: "dismiss" | "unpublish" | "archive", note?: string) => request<{ ok: true }>(`/skills/admin/reports/${skillId}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ action, note: note ?? "" })
+  }),
   marketplace: (query?: string) => request<MarketplaceSkill[]>(`/marketplace${query ? `?query=${encodeURIComponent(query)}` : ""}`),
   publish: (skill: SkillDraft, sourceKind = "manual") => request<MarketplaceSkill>("/marketplace/publish", {
     method: "POST",
@@ -272,6 +298,10 @@ export const api = {
   importMarketplaceSkill: (id: string) => request<{ sourceMarketplaceSkillId: string; skill: SkillDraft }>(`/marketplace/${id}/import`, {
     method: "POST",
     body: JSON.stringify({})
+  }),
+  reportMarketplaceSkill: (id: string, reason: string) => request<{ ok: true }>(`/marketplace/${id}/report`, {
+    method: "POST",
+    body: JSON.stringify({ reason })
   }),
   reactSkill: (id: string, value: "up" | "down") => request<MarketplaceSkill>(`/marketplace/${id}/reaction`, {
     method: "POST",
@@ -366,6 +396,23 @@ export const api = {
   addAgentKnowledge: (agentId: string, payload: unknown) => request<{ id: string; chunkCount: number }>(`/agents/${agentId}/knowledge`, {
     method: "POST",
     body: JSON.stringify(payload)
+  }),
+  searchAgentKnowledge: (agentId: string, payload: { query: string; limit?: number }) => request<AgentKnowledgeSearchResponse>(`/agents/${agentId}/knowledge/search`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  }),
+  reindexAgentKnowledge: (agentId: string, sourceId: string) => request<{ id: string; chunkCount: number }>(`/agents/${agentId}/knowledge/${sourceId}/reindex`, {
+    method: "POST",
+    body: JSON.stringify({})
+  }),
+  reportAgent: (agentId: string, reason: string) => request<{ ok: true }>(`/agents/${agentId}/report`, {
+    method: "POST",
+    body: JSON.stringify({ reason })
+  }),
+  adminAgentReports: () => request<AgentReviewItem[]>("/agents/admin/reports"),
+  moderateAgent: (agentId: string, action: "dismiss" | "unpublish" | "archive", note?: string) => request<{ ok: true }>(`/agents/admin/reports/${agentId}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ action, note: note ?? "" })
   }),
   runAgent: (agentId: string, conversationId?: string) => request<AgentRun>(`/agents/${agentId}/run`, {
     method: "POST",

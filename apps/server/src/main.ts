@@ -2,6 +2,7 @@ import "reflect-metadata";
 import { createHash } from "node:crypto";
 import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./app.module";
+import { FileLogger } from "./common/file-logger";
 import { AuthService } from "./modules/auth/auth.service";
 import { RateLimitService } from "./common/rate-limit.service";
 import { RealtimeService } from "./common/realtime.service";
@@ -26,7 +27,8 @@ type SessionResponse = {
 };
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule, { bodyParser: false });
+  const logger = new FileLogger();
+  const app = await NestFactory.create(AppModule, { bodyParser: false, logger });
   app.use(expressBody.json({ limit: "12mb" }));
   app.use(expressBody.urlencoded({ extended: true, limit: "12mb" }));
   app.enableCors({
@@ -83,10 +85,10 @@ async function bootstrap(): Promise<void> {
   const port = Number(process.env.SERVER_PORT ?? 24537);
   const host = process.env.SERVER_HOST || "127.0.0.1";
   await app.listen(port, host);
-  console.log(`Chaq server listening on http://${host}:${port}/api`);
+  logger.log(`Chaq server listening on http://${host}:${port}/api`, "Bootstrap");
 }
 
 bootstrap().catch((error) => {
-  console.error(error);
+  new FileLogger().error(error);
   process.exit(1);
 });

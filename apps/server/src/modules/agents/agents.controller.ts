@@ -13,7 +13,10 @@ import {
   agentTaskInputSchema,
   agentTaskUpdateSchema,
   agentToolCreateSchema,
-  agentToolUpdateSchema
+  agentToolUpdateSchema,
+  agentKnowledgeSearchSchema,
+  agentReportInputSchema,
+  agentModerationSchema
 } from "@chaq/shared";
 import type { AgentDraft } from "@chaq/shared";
 import { CurrentUserId } from "../../common/current-user.decorator";
@@ -41,6 +44,17 @@ export class AgentsController {
     return this.agents.discover(userId, query);
   }
 
+  @Get("admin/reports")
+  adminReports(@CurrentUserId() userId: string) {
+    return this.agents.adminReviewQueue(userId);
+  }
+
+  @Post("admin/reports/:agentId/resolve")
+  resolveReport(@CurrentUserId() userId: string, @Param("agentId") agentId: string, @Body() body: unknown) {
+    const input = parseBody(agentModerationSchema, body);
+    return this.agents.moderateAgent(userId, agentId, input.action, input.note);
+  }
+
   @Get("contacts")
   contacts(@CurrentUserId() userId: string) {
     return this.agents.contacts(userId);
@@ -54,6 +68,11 @@ export class AgentsController {
   @Post(":id/contact/remove")
   removeContact(@CurrentUserId() userId: string, @Param("id") id: string) {
     return this.agents.removeContact(userId, id);
+  }
+
+  @Post(":id/report")
+  report(@CurrentUserId() userId: string, @Param("id") id: string, @Body() body: unknown) {
+    return this.agents.reportAgent(userId, id, parseBody(agentReportInputSchema, body).reason ?? "user_report");
   }
 
   @Post()
@@ -146,6 +165,16 @@ export class AgentsController {
   @Post(":id/knowledge")
   addKnowledge(@CurrentUserId() userId: string, @Param("id") id: string, @Body() body: unknown) {
     return this.agents.addKnowledge(userId, id, parseBody(agentKnowledgeInputSchema, body));
+  }
+
+  @Post(":id/knowledge/:sourceId/reindex")
+  reindexKnowledge(@CurrentUserId() userId: string, @Param("id") id: string, @Param("sourceId") sourceId: string) {
+    return this.agents.reindexKnowledge(userId, id, sourceId);
+  }
+
+  @Post(":id/knowledge/search")
+  searchKnowledge(@CurrentUserId() userId: string, @Param("id") id: string, @Body() body: unknown) {
+    return this.agents.searchKnowledge(userId, id, parseBody(agentKnowledgeSearchSchema, body));
   }
 
   @Post(":id/run")

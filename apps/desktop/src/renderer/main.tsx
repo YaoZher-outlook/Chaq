@@ -2,6 +2,7 @@ import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   AlertCircle,
+  ArrowDown,
   Bot,
   Bell,
   BellOff,
@@ -49,6 +50,7 @@ import {
 } from "lucide-react";
 import type {
   ChatMessage,
+  AgentReviewItem,
   ImportPreview,
   MarketplaceComment,
   MarketplaceSkill,
@@ -56,6 +58,7 @@ import type {
   ProviderKind,
   SkillAutoMessageSettings,
   SkillDraft,
+  SkillReviewItem,
   SkillSourceKind,
   SkillSummary,
   TokenTransaction,
@@ -77,6 +80,7 @@ type SkillEditorTab = "profile" | "edit" | "share" | "more";
 type SettingsCategory = "general" | "appearance" | "messages" | "storage" | "display";
 type SkillKind = "friend" | "expert" | "partner" | "custom";
 type LoginMode = "login" | "register";
+type RechargeUnit = "token" | "k" | "m";
 type WindowAnchorRect = { x: number; y: number; width: number; height: number };
 type UserModelFormState = {
   id: string;
@@ -125,6 +129,8 @@ const urlParams = new URLSearchParams(window.location.search);
 const isSettingsWindowMode = urlParams.get("settingsWindow") === "1";
 const isProfileWindowMode = urlParams.get("profileWindow") === "1";
 const isProfileEditWindowMode = urlParams.get("profileEditWindow") === "1";
+const CHAT_COMPOSER_MAX_LENGTH = 4000;
+const CHAT_COMPOSER_WARN_LENGTH = 3600;
 
 function defaultAutoSettings(skillId = ""): SkillAutoMessageSettings {
   return {
@@ -180,6 +186,11 @@ function App(): JSX.Element {
   const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
   const [draft, setDraft] = useState<SkillDraft>(blankSkill);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const skillMessagePaneRef = useRef<HTMLDivElement>(null);
+  const skillMessageEndRef = useRef<HTMLDivElement>(null);
+  const [skillChatAtBottom, setSkillChatAtBottom] = useState(true);
+  const [skillChatBottomPulse, setSkillChatBottomPulse] = useState(false);
+  const skillChatBottomPulseTimer = useRef<number | null>(null);
   const [composer, setComposer] = useState("");
   const [modelMode, setModelMode] = useState<ModelMode>("cloud");
   const [cloudProviders, setCloudProviders] = useState<ModelProviderPublic[]>([]);
@@ -191,6 +202,9 @@ function App(): JSX.Element {
   const [autoSettings, setAutoSettings] = useState<SkillAutoMessageSettings>(defaultAutoSettings());
   const [tokenTransactions, setTokenTransactions] = useState<TokenTransaction[]>([]);
   const [walletSummary, setWalletSummary] = useState<WalletSummary | null>(null);
+  const [rechargeForm, setRechargeForm] = useState<{ amount: string; unit: RechargeUnit }>({ amount: "1", unit: "m" });
+  const [rechargeError, setRechargeError] = useState("");
+  const [rechargeBusy, setRechargeBusy] = useState(false);
   const [skillSearch, setSkillSearch] = useState("");
 
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
@@ -231,6 +245,9 @@ function App(): JSX.Element {
   });
   const [adminProviders, setAdminProviders] = useState<ModelProviderPublic[]>([]);
   const [adminProviderErrors, setAdminProviderErrors] = useState<FieldErrors>({});
+  const [adminAgentReports, setAdminAgentReports] = useState<AgentReviewItem[]>([]);
+  const [adminSkillReports, setAdminSkillReports] = useState<SkillReviewItem[]>([]);
+  const [adminReviewBusyId, setAdminReviewBusyId] = useState<string | null>(null);
 
   const selectedSkill = skills.find((skill) => skill.id === selectedSkillId) ?? null;
   const selectedProvider = cloudProviders.find((provider) => provider.id === cloudProviderId);
@@ -244,9 +261,59 @@ function App(): JSX.Element {
   }, [skillSearch, skills, pinnedSkillIds]);
   const isAdmin = auth?.user.role === "ADMIN";
 
+  function scrollSkillChatToBottom(behavior: ScrollBehavior = "smooth"): void {
+    skillMessageEndRef.current?.scrollIntoView({ block: "end", behavior });
+  }
+
+  function updateSkillChatScrollState(): void {
+    const node = skillMessagePaneRef.current;
+    if (!node) return;
+    const nextAtBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 28;
+    setSkillChatAtBottom((previous) => {
+      if (!previous && nextAtBottom) {
+        setSkillChatBottomPulse(true);
+        if (skillChatBottomPulseTimer.current) window.clearTimeout(skillChatBottomPulseTimer.current);
+        skillChatBottomPulseTimer.current = window.setTimeout(() => setSkillChatBottomPulse(false), 520);
+      }
+      return nextAtBottom;
+    });
+  }
+
+  function updateSkillComposer(value: string): void {
+    setComposer(value.slice(0, CHAT_COMPOSER_MAX_LENGTH));
+  }
+
+  function canSendSkillMessage(): boolean {
+    return Boolean(selectedSkill && composer.trim() && !busy && composer.length <= CHAT_COMPOSER_MAX_LENGTH);
+  }
+
+  function handleSkillComposerKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>): void {
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+    event.preventDefault();
+    if (canSendSkillMessage()) void sendMessage();
+  }
+
   useEffect(() => {
     void restoreSession();
   }, []);
+
+  useEffect(() => () => {
+    if (skillChatBottomPulseTimer.current) window.clearTimeout(skillChatBottomPulseTimer.current);
+  }, []);
+
+  useEffect(() => {
+    if (!skillChatAtBottom) return;
+    window.requestAnimationFrame(() => scrollSkillChatToBottom(messages.length > 1 ? "smooth" : "auto"));
+  }, [messages.length, selectedSkillId, skillChatAtBottom]);
+
+  useEffect(() => {
+    if (!chatDrawerOpen) return undefined;
+    const listener = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setChatDrawerOpen(false);
+    };
+    window.addEventListener("keydown", listener);
+    return () => window.removeEventListener("keydown", listener);
+  }, [chatDrawerOpen]);
 
   useEffect(() => window.chaq.auth.onLoggedOut(() => {
     void applyLoggedOutState();
@@ -523,7 +590,14 @@ function App(): JSX.Element {
       setCloudProviders(providers);
       setAgentProviders(availableProviders);
       if (user.role === "ADMIN") {
-        setAdminProviders(await api.adminProviders().catch(() => []));
+        const [adminNextProviders, agentReports, skillReports] = await Promise.all([
+          api.adminProviders().catch(() => []),
+          api.adminAgentReports().catch(() => []),
+          api.adminSkillReports().catch(() => [])
+        ]);
+        setAdminProviders(adminNextProviders);
+        setAdminAgentReports(agentReports);
+        setAdminSkillReports(skillReports);
       }
     } catch (error) {
       setNotice(`后端未连接：${messageOf(error)}`);
@@ -561,6 +635,7 @@ function App(): JSX.Element {
   }
 
   async function loadMessages(skillId: string): Promise<void> {
+    setSkillChatAtBottom(true);
     setMessages(await window.chaq.messages.list(skillId));
   }
 
@@ -655,6 +730,36 @@ function App(): JSX.Element {
       setAuth((current) => current ? { ...current, user: { ...current.user, tokenBalance: summary.balance } } : current);
     } catch (error) {
       setNotice(`钱包加载失败：${messageOf(error)}`);
+    }
+  }
+
+  async function rechargeWallet(): Promise<void> {
+    if (auth?.user.username !== "chen_zy") {
+      setRechargeError("当前测试阶段只允许 chen_zy 账号充值。");
+      return;
+    }
+    const amount = Number(rechargeForm.amount);
+    const factor = rechargeForm.unit === "m" ? 1_000_000 : rechargeForm.unit === "k" ? 1_000 : 1;
+    const tokenAmount = amount * factor;
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setRechargeError("请输入大于 0 的充值数量。");
+      return;
+    }
+    if (!Number.isInteger(tokenAmount)) {
+      setRechargeError("换算后的 token 必须是整数。");
+      return;
+    }
+    setRechargeError("");
+    setRechargeBusy(true);
+    try {
+      const result = await api.recharge({ amount, unit: rechargeForm.unit });
+      setAuth((current) => current ? { ...current, user: { ...current.user, tokenBalance: result.user.tokenBalance } } : current);
+      await refreshWallet();
+      setNotice(`已充值 ${formatTokenCount(tokenAmount)} Token`);
+    } catch (error) {
+      setRechargeError(messageOf(error));
+    } finally {
+      setRechargeBusy(false);
     }
   }
 
@@ -754,6 +859,10 @@ function App(): JSX.Element {
   async function sendMessage(event?: FormEvent): Promise<void> {
     event?.preventDefault();
     if (!selectedSkill || !composer.trim() || busy) return;
+    if (composer.length > CHAT_COMPOSER_MAX_LENGTH) {
+      setNotice(`Message is too long. Keep it under ${CHAT_COMPOSER_MAX_LENGTH} characters.`);
+      return;
+    }
     setBusy(true);
     const content = composer.trim();
     setComposer("");
@@ -869,6 +978,17 @@ function App(): JSX.Element {
     setDraft(response.skill);
     setSkillEditorTab("profile");
     setView("skill-editor");
+  }
+
+  async function reportMarketSkill(id: string): Promise<void> {
+    try {
+      const reason = window.prompt("请简要说明举报原因", "疑似违规或不适合公开展示")?.trim();
+      if (!reason) return;
+      await api.reportMarketplaceSkill(id, reason);
+      setNotice("举报已提交，管理员会在后台审核");
+    } catch (error) {
+      setNotice(`举报失败：${messageOf(error)}`);
+    }
   }
 
   async function addComment(): Promise<void> {
@@ -1031,6 +1151,60 @@ function App(): JSX.Element {
       setNotice("已保存平台云模型");
     } catch (error) {
       setNotice(`保存云模型失败：${messageOf(error)}`);
+    }
+  }
+
+  async function refreshAdminAgentReports(): Promise<void> {
+    try {
+      setAdminAgentReports(await api.adminAgentReports());
+    } catch (error) {
+      setNotice(`刷新待审核 Agent 失败：${messageOf(error)}`);
+    }
+  }
+
+  async function refreshAdminSkillReports(): Promise<void> {
+    try {
+      setAdminSkillReports(await api.adminSkillReports());
+    } catch (error) {
+      setNotice(`刷新待审核 Skill 失败：${messageOf(error)}`);
+    }
+  }
+
+  async function moderateAgent(agentId: string, action: "dismiss" | "unpublish" | "archive"): Promise<void> {
+    const note = action === "dismiss"
+      ? "管理员审核后保留"
+      : action === "unpublish"
+        ? "管理员审核后下架"
+        : "管理员审核后归档";
+    setAdminReviewBusyId(agentId);
+    try {
+      await api.moderateAgent(agentId, action, note);
+      await refreshAdminAgentReports();
+      await refreshRemote();
+      setNotice(action === "dismiss" ? "已通过该 Agent 的举报审核" : action === "unpublish" ? "已下架该 Agent" : "已归档该 Agent");
+    } catch (error) {
+      setNotice(`处理待审核 Agent 失败：${messageOf(error)}`);
+    } finally {
+      setAdminReviewBusyId(null);
+    }
+  }
+
+  async function moderateSkill(skillId: string, action: "dismiss" | "unpublish" | "archive"): Promise<void> {
+    const note = action === "dismiss"
+      ? "管理员审核后保留"
+      : action === "unpublish"
+        ? "管理员审核后下架"
+        : "管理员审核后归档";
+    setAdminReviewBusyId(`skill:${skillId}`);
+    try {
+      await api.moderateSkill(skillId, action, note);
+      await refreshAdminSkillReports();
+      await refreshMarketplace();
+      setNotice(action === "dismiss" ? "已通过该 Skill 的举报审核" : action === "unpublish" ? "已下架该 Skill" : "已归档该 Skill");
+    } catch (error) {
+      setNotice(`处理待审核 Skill 失败：${messageOf(error)}`);
+    } finally {
+      setAdminReviewBusyId(null);
     }
   }
 
@@ -1269,6 +1443,10 @@ function App(): JSX.Element {
     );
   }
 
+  const skillComposerLength = composer.length;
+  const skillComposerNearLimit = skillComposerLength >= CHAT_COMPOSER_WARN_LENGTH;
+  const skillCanSend = canSendSkillMessage();
+
   return (
     <div
       className="qq-shell"
@@ -1324,7 +1502,7 @@ function App(): JSX.Element {
                   <button className="icon-only-button" title="更多" disabled={!selectedSkill} onClick={() => setChatDrawerOpen((open) => !open)}><MoreHorizontal size={19} /></button>
                 </div>
               </header>
-              <div className="message-pane">
+              <div ref={skillMessagePaneRef} className={skillChatBottomPulse ? "message-pane bottom-pulse" : "message-pane"} onScroll={updateSkillChatScrollState}>
                 {!selectedSkill && <div className="empty-chat"><img src={loginBgUrl} alt="" /><strong>还没有选择 Skill</strong><span>左侧列表会像 QQ 联系人一样展示你的 Skill。</span></div>}
                 {selectedSkill && messages.length === 0 && <div className="empty-chat"><img src={selectedSkill.avatarUrl || coverUrl} alt="" onError={fallbackImage} /><strong>还没有聊天</strong><span>向这个 Skill 发送第一句话。</span></div>}
                 {messages.map((message) => (
@@ -1332,10 +1510,27 @@ function App(): JSX.Element {
                     <div className="msg-bubble"><p>{message.content}</p>{message.modelLabel && <small>{message.modelLabel}</small>}</div>
                   </div>
                 ))}
+                <div ref={skillMessageEndRef} />
+                {selectedSkill && !skillChatAtBottom && <button className="chat-scroll-bottom" type="button" onClick={() => { scrollSkillChatToBottom(); setSkillChatAtBottom(true); }}><ArrowDown size={15} />到底部</button>}
               </div>
               <form className="message-input" onSubmit={(event) => void sendMessage(event)}>
-                <textarea value={composer} onChange={(event) => setComposer(event.target.value)} placeholder="输入消息..." />
-                <button disabled={busy || !composer.trim() || !selectedSkill}><Send size={18} /></button>
+                <div className="composer-input-wrap">
+                  <textarea
+                    value={composer}
+                    maxLength={CHAT_COMPOSER_MAX_LENGTH}
+                    onChange={(event) => updateSkillComposer(event.target.value)}
+                    onKeyDown={handleSkillComposerKeyDown}
+                    placeholder="输入消息..."
+                    aria-label="输入 Skill 消息"
+                    disabled={!selectedSkill}
+                  />
+                  {composer && <button className="composer-clear" type="button" title="清空输入" aria-label="清空输入" disabled={busy} onClick={() => updateSkillComposer("")}><X size={14} /></button>}
+                  <div className="composer-meta" aria-live="polite">
+                    <span>{busy ? "正在发送..." : "Enter 发送 · Shift+Enter 换行"}</span>
+                    <span className={skillComposerNearLimit ? "warn" : ""}>{skillComposerLength}/{CHAT_COMPOSER_MAX_LENGTH}</span>
+                  </div>
+                </div>
+                <button title="发送" aria-label="发送消息" disabled={!skillCanSend}>{busy ? <RefreshCw className="spin" size={18} /> : <Send size={18} />}</button>
               </form>
               {selectedSkill && (
                 <aside className={chatDrawerOpen ? "chat-more-drawer open" : "chat-more-drawer"}>
@@ -1438,7 +1633,10 @@ function App(): JSX.Element {
                 <div className="panel">
                   {selectedMarket ? (
                     <>
-                      <h3>{selectedMarket.name}</h3>
+                      <div className="panel-title-row">
+                        <h3>{selectedMarket.name}</h3>
+                        <button onClick={() => void reportMarketSkill(selectedMarket.id)}><Flag size={15} />举报 Skill</button>
+                      </div>
                       <textarea aria-invalid={Boolean(commentError)} value={commentText} onChange={(event) => { setCommentText(event.target.value); setCommentError(""); }} placeholder="匿名评论..." />
                       <FieldError message={commentError} />
                       <button onClick={() => void addComment()}>发表评论</button>
@@ -1492,16 +1690,73 @@ function App(): JSX.Element {
           )}
 
           {view === "wallet" && (
-            <WalletPage summary={walletSummary} onRefresh={() => void refreshWallet()} />
+            <WalletPage
+              summary={walletSummary}
+              currentUser={auth?.user ?? null}
+              rechargeForm={rechargeForm}
+              setRechargeForm={setRechargeForm}
+              rechargeBusy={rechargeBusy}
+              rechargeError={rechargeError}
+              onRefresh={() => void refreshWallet()}
+              onRecharge={() => void rechargeWallet()}
+            />
           )}
 
           {view === "admin" && isAdmin && (
-            <ToolPage title="管理员后台" subtitle="管理平台云模型供应商、价格和启停状态。">
-              <div className="split-tools">
+            <ToolPage title="管理员后台" subtitle="管理平台云模型供应商、Agent 举报审核和公开内容风险。">
+              <div className="admin-console-grid">
                 <CleanAdminProviderForm form={providerForm} setForm={setProviderForm} onKindChange={applyAdminProviderPreset} onSave={() => void saveAdminProvider()} errors={adminProviderErrors} clearError={(key) => setAdminProviderErrors((current) => clearFieldError(current, key))} />
-                <div className="panel">
-                  <button onClick={() => void api.adminProviders().then(setAdminProviders)}><RefreshCw size={16} />刷新供应商</button>
+                <div className="panel admin-list-panel">
+                  <div className="panel-title-row">
+                    <h3>平台云模型</h3>
+                    <button onClick={() => void api.adminProviders().then(setAdminProviders)}><RefreshCw size={16} />刷新供应商</button>
+                  </div>
                   {adminProviders.map((provider) => <button key={provider.id} className="row-button" onClick={() => setProviderForm({ ...providerForm, id: provider.id, kind: provider.kind, name: provider.name, baseUrl: provider.baseUrl, modelId: provider.models[0]?.id ?? "", modelLabel: provider.models[0]?.label ?? "", embeddingModel: provider.embeddingModel ?? "", embeddingTokenPrice: provider.embeddingTokenPrice, contextWindow: provider.contextWindow, promptTokenPrice: provider.promptTokenPrice, completionTokenPrice: provider.completionTokenPrice, enabled: provider.enabled, apiKey: "" })}><ShieldCheck size={16} />{provider.name}<small>{provider.enabled ? "启用" : "停用"}</small></button>)}
+                  {!adminProviders.length && <div className="quiet-empty">暂无平台云模型。</div>}
+                </div>
+                <div className="panel admin-review-panel">
+                  <div className="panel-title-row">
+                    <h3>待审核 Agent</h3>
+                    <button onClick={() => void refreshAdminAgentReports()}><RefreshCw size={16} />刷新审核</button>
+                  </div>
+                  {adminAgentReports.length === 0 && <div className="quiet-empty">暂无待审核举报。</div>}
+                  {adminAgentReports.map((item) => (
+                    <article key={item.agent.id} className="admin-review-card">
+                      <div>
+                        <strong>{item.agent.name}<small>@{item.agent.handle}</small></strong>
+                        <p>{item.agent.tagline || item.agent.biography || "这个 Agent 没有简介。"}</p>
+                        <span>举报 {item.reportCount} 次 · 发布者 {item.agent.ownerDisplayName} · 最新举报人 {item.latestReporter}</span>
+                        <em>{item.latestReason}</em>
+                      </div>
+                      <footer>
+                        <button disabled={adminReviewBusyId === item.agent.id} onClick={() => void moderateAgent(item.agent.id, "dismiss")}><Check size={15} />通过</button>
+                        <button disabled={adminReviewBusyId === item.agent.id} onClick={() => void moderateAgent(item.agent.id, "unpublish")}><ShieldCheck size={15} />下架</button>
+                        <button disabled={adminReviewBusyId === item.agent.id} onClick={() => void moderateAgent(item.agent.id, "archive")}><Trash2 size={15} />归档</button>
+                      </footer>
+                    </article>
+                  ))}
+                </div>
+                <div className="panel admin-review-panel">
+                  <div className="panel-title-row">
+                    <h3>待审核 Skill</h3>
+                    <button onClick={() => void refreshAdminSkillReports()}><RefreshCw size={16} />刷新审核</button>
+                  </div>
+                  {adminSkillReports.length === 0 && <div className="quiet-empty">暂无待审核 Skill 举报。</div>}
+                  {adminSkillReports.map((item) => (
+                    <article key={item.skill.skillId} className="admin-review-card">
+                      <div>
+                        <strong>{item.skill.name}<small>{item.skill.visibility}</small></strong>
+                        <p>{item.skill.description || "这个 Skill 没有简介。"}</p>
+                        <span>举报 {item.reportCount} 次 · 发布者 {item.skill.ownerDisplayName} · 最新举报人 {item.latestReporter}</span>
+                        <em>{item.latestReason}</em>
+                      </div>
+                      <footer>
+                        <button disabled={adminReviewBusyId === `skill:${item.skill.skillId}`} onClick={() => void moderateSkill(item.skill.skillId, "dismiss")}><Check size={15} />通过</button>
+                        <button disabled={adminReviewBusyId === `skill:${item.skill.skillId}`} onClick={() => void moderateSkill(item.skill.skillId, "unpublish")}><ShieldCheck size={15} />下架</button>
+                        <button disabled={adminReviewBusyId === `skill:${item.skill.skillId}`} onClick={() => void moderateSkill(item.skill.skillId, "archive")}><Trash2 size={15} />归档</button>
+                      </footer>
+                    </article>
+                  ))}
                 </div>
               </div>
             </ToolPage>
@@ -1768,9 +2023,9 @@ function LoginBackgroundCanvas(): JSX.Element {
 function WindowButtons({ compact = false }: { compact?: boolean }): JSX.Element {
   return (
     <div className={compact ? "window-buttons compact" : "window-buttons"}>
-      <MagneticButton onClick={() => void window.chaq.window.minimize()}><Minimize2 size={14} /></MagneticButton>
-      {!compact && <MagneticButton onClick={() => void window.chaq.window.maximize()}><Square size={13} /></MagneticButton>}
-      <MagneticButton onClick={() => void window.chaq.window.close()}><X size={15} /></MagneticButton>
+      <MagneticButton aria-label="最小化窗口" title="最小化" onClick={() => void window.chaq.window.minimize()}><Minimize2 size={14} /></MagneticButton>
+      {!compact && <MagneticButton aria-label="最大化窗口" title="最大化" onClick={() => void window.chaq.window.maximize()}><Square size={13} /></MagneticButton>}
+      <MagneticButton aria-label="关闭窗口" title="关闭" onClick={() => void window.chaq.window.close()}><X size={15} /></MagneticButton>
     </div>
   );
 }
@@ -1785,26 +2040,68 @@ function TitleBar({ user }: { user: LoginUser }): JSX.Element {
 }
 
 function RailButton(props: { active: boolean; title: string; icon: JSX.Element; onClick: () => void }): JSX.Element {
-  return <MagneticButton className={props.active ? "rail-button active" : "rail-button"} title={props.title} onClick={props.onClick}>{React.cloneElement(props.icon, { size: 22 })}</MagneticButton>;
+  return <MagneticButton className={props.active ? "rail-button active" : "rail-button"} title={props.title} aria-label={props.title} aria-current={props.active ? "page" : undefined} onClick={props.onClick}>{React.cloneElement(props.icon, { size: 22 })}</MagneticButton>;
 }
 
 function ToolPage(props: { title: string; subtitle: string; children: React.ReactNode }): JSX.Element {
   return <section className="tool-page"><header><h2>{props.title}</h2><p>{props.subtitle}</p></header>{props.children}</section>;
 }
 
-function WalletPage(props: { summary: WalletSummary | null; onRefresh: () => void }): JSX.Element {
+function WalletPage(props: {
+  summary: WalletSummary | null;
+  currentUser: LoginUser | null;
+  rechargeForm: { amount: string; unit: RechargeUnit };
+  setRechargeForm: (next: { amount: string; unit: RechargeUnit }) => void;
+  rechargeBusy: boolean;
+  rechargeError: string;
+  onRefresh: () => void;
+  onRecharge: () => void;
+}): JSX.Element {
   const summary = props.summary;
-  return <ToolPage title="Token 钱包" subtitle="查看模型消耗、Agent 服务费和创作者收益。所有记录均来自服务器账本。">
+  const canRecharge = props.currentUser?.username === "chen_zy";
+  const factor = props.rechargeForm.unit === "m" ? 1_000_000 : props.rechargeForm.unit === "k" ? 1_000 : 1;
+  const preview = Number(props.rechargeForm.amount) * factor;
+  return <ToolPage title="Token 钱包" subtitle="查看模型消耗、Agent 服务费、创作者收益和试点充值记录。所有记录均来自服务器账本。">
     <div className="wallet-page">
       <section className="wallet-balance-band">
-        <div><WalletCards size={22} /><span><small>可用余额</small><strong>{summary?.balance ?? "--"}</strong></span></div>
+        <div><WalletCards size={22} /><span><small>可用余额</small><strong>{formatTokenCount(summary?.balance)}</strong></span></div>
         <button className="icon-only-button" title="刷新钱包" onClick={props.onRefresh}><RefreshCw size={17} /></button>
       </section>
+      <section className={canRecharge ? "wallet-recharge-card" : "wallet-recharge-card disabled"}>
+        <div>
+          <strong>试点充值</strong>
+          <p>{canRecharge ? "当前仅 chen_zy 账号可用。收款账户配置前，充值会直接写入平台 Token 账本。" : "当前测试阶段只开放 chen_zy 账号充值。"}</p>
+        </div>
+        <div className="wallet-recharge-form">
+          <input
+            aria-label="充值数量"
+            type="number"
+            min="0"
+            step="0.001"
+            value={props.rechargeForm.amount}
+            disabled={!canRecharge || props.rechargeBusy}
+            onChange={(event) => props.setRechargeForm({ ...props.rechargeForm, amount: event.target.value })}
+          />
+          <select
+            aria-label="充值单位"
+            value={props.rechargeForm.unit}
+            disabled={!canRecharge || props.rechargeBusy}
+            onChange={(event) => props.setRechargeForm({ ...props.rechargeForm, unit: event.target.value as RechargeUnit })}
+          >
+            <option value="m">M Token</option>
+            <option value="k">k Token</option>
+            <option value="token">Token</option>
+          </select>
+          <button className="primary-button" disabled={!canRecharge || props.rechargeBusy} onClick={props.onRecharge}><WalletCards size={16} />{props.rechargeBusy ? "处理中" : "充值"}</button>
+        </div>
+        <small>{Number.isFinite(preview) && preview > 0 ? `预计到账 ${formatTokenCount(preview)} Token` : "请输入充值数量"}</small>
+        <FieldError message={props.rechargeError} />
+      </section>
       <div className="wallet-metrics">
-        <article><span>累计支出</span><strong>{summary?.totalSpent ?? 0}</strong><small>token</small></article>
-        <article><span>模型消耗</span><strong>{summary?.modelSpent ?? 0}</strong><small>token</small></article>
-        <article><span>支付服务费</span><strong>{summary?.serviceFeesPaid ?? 0}</strong><small>token</small></article>
-        <article className="earning"><span>创作者收益</span><strong>{summary?.serviceEarnings ?? 0}</strong><small>token</small></article>
+        <article><span>累计支出</span><strong>{formatTokenCount(summary?.totalSpent ?? 0)}</strong><small>token</small></article>
+        <article><span>模型消耗</span><strong>{formatTokenCount(summary?.modelSpent ?? 0)}</strong><small>token</small></article>
+        <article><span>支付服务费</span><strong>{formatTokenCount(summary?.serviceFeesPaid ?? 0)}</strong><small>token</small></article>
+        <article className="earning"><span>创作者收益</span><strong>{formatTokenCount(summary?.serviceEarnings ?? 0)}</strong><small>token</small></article>
       </div>
       <div className="wallet-columns">
         <section className="wallet-ledger">
@@ -1812,13 +2109,13 @@ function WalletPage(props: { summary: WalletSummary | null; onRefresh: () => voi
           <div>{summary?.transactions.map((transaction) => <article key={transaction.id}>
             <span className={transaction.amount >= 0 ? "wallet-flow-icon income" : "wallet-flow-icon expense"}>{transaction.amount >= 0 ? <TrendingUp size={15} /> : <Clock size={15} />}</span>
             <div><strong>{tokenTransactionLabel(transaction.kind)}</strong><small>{transaction.note || formatDateTime(transaction.createdAt)}</small></div>
-            <span className={transaction.amount >= 0 ? "wallet-amount income" : "wallet-amount"}>{transaction.amount > 0 ? "+" : ""}{transaction.amount}</span>
+            <span className={transaction.amount >= 0 ? "wallet-amount income" : "wallet-amount"}>{transaction.amount > 0 ? "+" : ""}{formatTokenCount(transaction.amount)}</span>
           </article>)}</div>
-          {!summary?.transactions.length && <div className="quiet-empty">还没有 token 流水。</div>}
+          {!summary?.transactions.length && <div className="quiet-empty">还没有 Token 流水。</div>}
         </section>
         <section className="wallet-earnings">
           <header><TrendingUp size={17} /><strong>Agent 收益</strong></header>
-          {summary?.agentEarnings.map((earning) => <article key={earning.agentId}><div><strong>{earning.agentName}</strong><small>{earning.transactionCount} 次付费响应</small></div><span>+{earning.amount}</span></article>)}
+          {summary?.agentEarnings.map((earning) => <article key={earning.agentId}><div><strong>{earning.agentName}</strong><small>{earning.transactionCount} 次付费响应</small></div><span>+{formatTokenCount(earning.amount)}</span></article>)}
           {!summary?.agentEarnings.length && <div className="quiet-empty">公开 Agent 收到服务费后会显示在这里。</div>}
         </section>
       </div>
@@ -2779,6 +3076,25 @@ function formatDateTime(value: string): string {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false
+  });
+}
+
+function formatTokenCount(value?: number | null): string {
+  if (value === undefined || value === null || !Number.isFinite(value)) return "--";
+  const absolute = Math.abs(value);
+  const sign = value < 0 ? "-" : "";
+  if (absolute >= 1_000_000) {
+    return `${sign}${trimNumber(absolute / 1_000_000)}M`;
+  }
+  if (absolute >= 1_000) {
+    return `${sign}${trimNumber(absolute / 1_000)}k`;
+  }
+  return `${sign}${absolute.toLocaleString("zh-CN")}`;
+}
+
+function trimNumber(value: number): string {
+  return value.toLocaleString("zh-CN", {
+    maximumFractionDigits: value >= 100 ? 0 : value >= 10 ? 1 : 2
   });
 }
 

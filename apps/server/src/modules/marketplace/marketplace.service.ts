@@ -1,4 +1,4 @@
-import { Inject, Injectable, NotFoundException } from "@nestjs/common";
+import { ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import { DistillationStatus, Prisma, ReactionTarget, ReactionValue, SkillSourceKind, SkillVisibility } from "@prisma/client";
 import type { MarketplaceComment, MarketplaceSkill, SkillDraft } from "@chaq/shared";
 import { PrismaService } from "../../common/prisma.service";
@@ -128,6 +128,24 @@ export class MarketplaceService {
         tags: row.tags
       } satisfies SkillDraft
     };
+  }
+
+  async reportSkill(userId: string, marketplaceSkillId: string, reason: string) {
+    await this.users.ensureUser(userId);
+    const row = await this.prisma.marketplaceSkill.findUnique({
+      where: { id: marketplaceSkillId },
+      include: { skill: { select: { ownerId: true } } }
+    });
+    if (!row) throw new NotFoundException("Marketplace skill not found.");
+    if (row.skill.ownerId === userId) throw new ForbiddenException("Cannot report your own skill.");
+    await this.prisma.skillReport.create({
+      data: {
+        reporterId: userId,
+        skillId: row.skillId,
+        reason: reason.trim() || "user_report"
+      }
+    });
+    return { ok: true };
   }
 
   async reactToSkill(userId: string, marketplaceSkillId: string, value: "up" | "down") {

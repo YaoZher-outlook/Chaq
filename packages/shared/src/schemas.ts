@@ -245,6 +245,29 @@ export const agentKnowledgeInputSchema = z.object({
   metadata: z.record(z.unknown()).optional()
 });
 
+export const agentKnowledgeSearchSchema = z.object({
+  query: z.string().trim().min(1).max(2000),
+  limit: z.number().int().min(1).max(20).default(8)
+});
+
+export const agentReportInputSchema = z.object({
+  reason: z.string().trim().min(1).max(500).default("user_report")
+});
+
+export const agentModerationSchema = z.object({
+  action: z.enum(["dismiss", "unpublish", "archive"]),
+  note: z.string().trim().max(1000).default("")
+});
+
+export const skillReportInputSchema = z.object({
+  reason: z.string().trim().min(1).max(500).default("user_report")
+});
+
+export const skillModerationSchema = z.object({
+  action: z.enum(["dismiss", "unpublish", "archive"]),
+  note: z.string().trim().max(1000).default("")
+});
+
 export const agentPostInputSchema = z.object({
   content: z.string().trim().min(1).max(5000),
   mediaUrls: z.array(z.string().max(8_000_000)).max(4).default([]),

@@ -614,13 +614,14 @@ export class AgentRuntimeService {
       source: chunk.source.title,
       content: chunk.content
     }));
+    const memories = this.rankMemories(run.agent.memories, query, queryEmbedding.vector).slice(0, 30);
     return {
       run,
       agent: run.agent,
       relationships: run.agent.relationships,
       goals: run.agent.goals,
       tasks: run.agent.tasks,
-      memories: run.agent.memories,
+      memories,
       tools: run.agent.tools,
       knowledge,
       messages,
@@ -757,6 +758,16 @@ export class AgentRuntimeService {
       score: cosineSimilarity(chunk.embedding, queryVector) * 10
         + chunk.keywords.reduce((score: number, keyword: string) => score + (terms.has(keyword.toLowerCase()) ? 2 : 0), 0)
     })).sort((a, b) => b.score - a.score || a.position - b.position);
+  }
+
+  private rankMemories(memories: any[], query: string, queryVector: number[]) {
+    const terms = new Set(this.keywords(query));
+    return memories.map((memory) => ({
+      ...memory,
+      score: cosineSimilarity(memory.embedding, queryVector) * 10
+        + memory.keywords.reduce((score: number, keyword: string) => score + (terms.has(String(keyword).toLowerCase()) ? 1.5 : 0), 0)
+        + Number(memory.salience ?? 0)
+    })).sort((a, b) => b.score - a.score || new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   }
 
   private keywords(content: string): string[] {

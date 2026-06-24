@@ -1,7 +1,6 @@
-import { randomUUID } from "node:crypto";
 import { ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
-import { DistillationStatus, Prisma, SkillSourceKind, SkillVisibility } from "@prisma/client";
-import type { DistillRequest, SkillDraft, SkillSummary, SkillVersionSnapshot } from "@chaq/shared";
+import { DistillationStatus, Prisma, ReactionTarget, SkillReportStatus, SkillSourceKind, SkillVisibility } from "@prisma/client";
+import type { DistillRequest, SkillDraft, SkillReviewItem, SkillSummary, SkillVersionSnapshot } from "@chaq/shared";
 import { PrismaService } from "../../common/prisma.service";
 import { ModelsService } from "../models/models.service";
 import { UsersService } from "../users/users.service";
@@ -180,7 +179,7 @@ export class SkillsService {
     await this.users.ensureUser(userId);
     const skill = await this.prisma.skill.findUnique({
       where: { id: skillId },
-      select: { id: true, ownerId: true }
+      select: { id: true, ownerId: true, visibility: true }
     });
     if (!skill) {
       throw new NotFoundException("Skill not found.");
@@ -188,11 +187,116 @@ export class SkillsService {
     if (skill.ownerId === userId) {
       throw new ForbiddenException("Cannot report your own skill.");
     }
-    const id = randomUUID();
-    await this.prisma.$executeRaw`
-      insert into "SkillReport" ("id", "reporterId", "skillId", "reason")
-      values (${id}, ${userId}, ${skillId}, ${reason})
-    `;
+    if (skill.visibility !== SkillVisibility.PUBLIC) {
+      throw new NotFoundException("Skill not found.");
+    }
+    await this.prisma.skillReport.create({
+      data: {
+        reporterId: userId,
+        skillId,
+        reason: reason.trim() || "user_report"
+      }
+    });
+    return { ok: true };
+  }
+
+  async adminReviewQueue(adminUserId: string): Promise<SkillReviewItem[]> {
+    await this.users.assertAdmin(adminUserId);
+    const rows = await this.prisma.skillReport.findMany({
+      where: { status: SkillReportStatus.PENDING },
+      include: {
+        reporter: { select: { displayName: true, username: true } },
+        skill: {
+          include: {
+            owner: { select: { displayName: true } },
+            marketplace: true
+          }
+        }
+      },
+      orderBy: { createdAt: "asc" },
+      take: 500
+    });
+    const grouped = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const list = grouped.get(row.skillId) ?? [];
+      list.push(row);
+      grouped.set(row.skillId, list);
+    }
+    return [...grouped.values()].map((reports) => {
+      const sorted = [...reports].sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime());
+      const latest = sorted[sorted.length - 1];
+      const skill = latest.skill;
+      const marketplace = skill.marketplace;
+      return {
+        skill: {
+          id: marketplace?.id ?? skill.id,
+          skillId: skill.id,
+          versionId: marketplace?.versionId ?? skill.activeVersionId ?? "",
+          publisherId: marketplace?.publisherId ?? skill.ownerId,
+          ownerId: skill.ownerId,
+          ownerDisplayName: skill.owner?.displayName ?? skill.ownerId,
+          visibility: skill.visibility.toLowerCase() as SkillReviewItem["skill"]["visibility"],
+          name: marketplace?.name ?? skill.name,
+          description: marketplace?.description ?? skill.description,
+          avatarUrl: marketplace?.avatarUrl ?? skill.avatarUrl,
+          tags: marketplace?.tags ?? skill.tags,
+          upvotes: marketplace?.upvotes ?? 0,
+          downvotes: marketplace?.downvotes ?? 0,
+          favorites: marketplace?.favorites ?? 0,
+          importCount: marketplace?.importCount ?? 0,
+          commentCount: marketplace?.commentCount ?? 0,
+          createdAt: (marketplace?.createdAt ?? skill.createdAt).toISOString(),
+          updatedAt: (marketplace?.updatedAt ?? skill.updatedAt).toISOString()
+        },
+        reportCount: sorted.length,
+        latestReason: latest.reason,
+        latestReporter: latest.reporter?.displayName ?? latest.reporter?.username ?? latest.reporterId,
+        oldestReportAt: sorted[0].createdAt.toISOString(),
+        latestReportAt: latest.createdAt.toISOString(),
+        status: "pending"
+      } satisfies SkillReviewItem;
+    }).sort((left, right) => right.reportCount - left.reportCount || left.oldestReportAt.localeCompare(right.oldestReportAt));
+  }
+
+  async moderateSkill(adminUserId: string, skillId: string, action: "dismiss" | "unpublish" | "archive", note = "") {
+    await this.users.assertAdmin(adminUserId);
+    const skill = await this.prisma.skill.findUnique({
+      where: { id: skillId },
+      include: { marketplace: { select: { id: true } } }
+    });
+    if (!skill) throw new NotFoundException("Skill not found.");
+    await this.prisma.$transaction(async (tx) => {
+      if (action === "unpublish" || action === "archive") {
+        await tx.skill.update({
+          where: { id: skillId },
+          data: { visibility: SkillVisibility.PRIVATE }
+        });
+        if (skill.marketplace) {
+          const commentIds = await tx.comment.findMany({
+            where: { marketplaceSkillId: skill.marketplace.id },
+            select: { id: true }
+          });
+          await tx.reaction.deleteMany({
+            where: {
+              OR: [
+                { target: ReactionTarget.SKILL, targetId: skill.marketplace.id },
+                { target: ReactionTarget.COMMENT, targetId: { in: commentIds.map((comment) => comment.id) } }
+              ]
+            }
+          });
+          await tx.marketplaceSkill.delete({ where: { id: skill.marketplace.id } });
+        }
+      }
+      await tx.skillReport.updateMany({
+        where: { skillId, status: SkillReportStatus.PENDING },
+        data: {
+          status: action === "dismiss" ? SkillReportStatus.DISMISSED : SkillReportStatus.ACTIONED,
+          adminNote: note,
+          reviewedById: adminUserId,
+          reviewedAt: new Date()
+        }
+      });
+    });
     return { ok: true };
   }
 

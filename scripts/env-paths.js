@@ -12,7 +12,9 @@ module.exports = {
   runtimeCache: path.join(chaqEnvironmentRoot, "runtime-cache-v2"),
   npmCache: path.join(chaqEnvironmentRoot, "npm-cache"),
   userData: path.join(chaqEnvironmentRoot, "user-data"),
+  projectLogs: path.join(projectRoot, ".logs"),
   serverEnv: path.join(chaqEnvironmentRoot, "server.env"),
+  workspaceServerEnv: path.join(projectRoot, "apps", "server", ".env"),
   postgresData: path.join(chaqEnvironmentRoot, "postgres-data"),
   postgresLog: path.join(chaqEnvironmentRoot, "logs", "postgres.log")
 };

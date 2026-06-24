@@ -5,6 +5,7 @@ import {
   CalendarDays,
   Camera,
   Coins,
+  Flag,
   Heart,
   ImagePlus,
   MapPin,
@@ -213,6 +214,18 @@ export function AgentProfileView(props: {
     }
   }
 
+  async function reportAgent(): Promise<void> {
+    if (!profile || profile.isOwner) return;
+    const reason = window.prompt("请简要说明举报原因", "疑似违规或不适合公开展示");
+    if (!reason?.trim()) return;
+    try {
+      await api.reportAgent(profile.agent.id, reason.trim());
+      props.onNotice("举报已提交，等待管理员审核。");
+    } catch (error) {
+      props.onNotice(messageOf(error));
+    }
+  }
+
   async function sendChat(event: FormEvent): Promise<void> {
     event.preventDefault();
     if (!conversationId || !chatComposer.trim()) return;
@@ -248,6 +261,7 @@ export function AgentProfileView(props: {
         <div className="agent-profile-actions">
           {!profile.isOwner && <button title={profile.isContact ? "移除好友" : "添加好友"} onClick={() => void toggleContact()}>{profile.isContact ? <UserMinus size={17} /> : <UserPlus size={17} />}</button>}
           <button className="agent-profile-message" disabled={!profile.isOwner && !profile.isContact} onClick={() => void openChat()}><MessageCircle size={17} />消息</button>
+          {!profile.isOwner && <button title="举报 Agent" onClick={() => void reportAgent()}><Flag size={17} /></button>}
           {profile.isOwner && <button title="编辑近况" onClick={() => setEditingStatus((value) => !value)}><Smile size={17} /></button>}
         </div>
       </div>

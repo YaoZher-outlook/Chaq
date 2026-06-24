@@ -2,6 +2,7 @@ import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertCircle,
+  ArrowDown,
   Bot,
   Brain,
   BookOpen,
@@ -33,6 +34,7 @@ import type {
   AgentContact,
   AgentDraft,
   AgentEvent,
+  AgentKnowledgeSearchResponse,
   AgentSummary,
   ConversationMessage,
   ConversationSummary,
@@ -53,6 +55,9 @@ type HttpToolForm = {
   riskLevel: "safe" | "confirm" | "external";
   allowHttp: boolean;
 };
+
+const CHAT_COMPOSER_MAX_LENGTH = 4000;
+const CHAT_COMPOSER_WARN_LENGTH = 3600;
 
 export function AgentWorkspace(props: {
   user: LoginUser;
@@ -192,6 +197,10 @@ export function AgentWorkspace(props: {
   async function sendMessage(event: FormEvent): Promise<void> {
     event.preventDefault();
     if (!conversationId || !composer.trim() || busy) return;
+    if (composer.length > CHAT_COMPOSER_MAX_LENGTH) {
+      props.onNotice(`Message is too long. Keep it under ${CHAT_COMPOSER_MAX_LENGTH} characters.`);
+      return;
+    }
     const content = composer.trim();
     setComposer("");
     setBusy(true);
@@ -289,7 +298,7 @@ export function AgentWorkspace(props: {
                 <button className="agent-run-button" disabled={busy || agent.status !== "active"} onClick={() => void runNow()}><Zap size={16} />运行</button>
               </div>
             </header>
-            <nav className="agent-tabs">
+            <nav className="agent-tabs" role="tablist" aria-label="Agent sections">
               <AgentTabButton active={tab === "chat"} icon={<Inbox />} label="会话" onClick={() => setTab("chat")} />
               <AgentTabButton active={tab === "identity"} icon={<Settings2 />} label="身份" onClick={() => setTab("identity")} />
               <AgentTabButton active={tab === "goals"} icon={<Target />} label="目标" onClick={() => setTab("goals")} />
@@ -326,6 +335,13 @@ function AgentExplore(props: { onClose: () => void; onOpenProfile: (agentId: str
   const [addingId, setAddingId] = useState<string | null>(null);
 
   useEffect(() => { void search(); }, []);
+  useEffect(() => {
+    const listener = (event: KeyboardEvent) => {
+      if (event.key === "Escape") props.onClose();
+    };
+    window.addEventListener("keydown", listener);
+    return () => window.removeEventListener("keydown", listener);
+  }, [props.onClose]);
 
   async function search(): Promise<void> {
     setLoading(true);
@@ -381,10 +397,54 @@ function AgentChat(props: {
   thinking: boolean;
   onSubmit: (event: FormEvent) => void;
 }): JSX.Element {
+  const listRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
-  useEffect(() => endRef.current?.scrollIntoView({ block: "end" }), [props.messages.length, props.thinking]);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const [bottomPulse, setBottomPulse] = useState(false);
+  const bottomPulseTimer = useRef<number | null>(null);
+  const composerLength = props.composer.length;
+  const composerNearLimit = composerLength >= CHAT_COMPOSER_WARN_LENGTH;
+  const canSend = Boolean(props.composer.trim() && !props.busy && composerLength <= CHAT_COMPOSER_MAX_LENGTH);
+
+  function updateComposer(value: string): void {
+    props.setComposer(value.slice(0, CHAT_COMPOSER_MAX_LENGTH));
+  }
+
+  function handleComposerKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>): void {
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+    event.preventDefault();
+    if (canSend) event.currentTarget.form?.requestSubmit();
+  }
+
+  function scrollToBottom(behavior: ScrollBehavior = "smooth"): void {
+    endRef.current?.scrollIntoView({ block: "end", behavior });
+  }
+
+  function updateScrollState(): void {
+    const node = listRef.current;
+    if (!node) return;
+    const nextAtBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 28;
+    setIsAtBottom((previous) => {
+      if (!previous && nextAtBottom) {
+        setBottomPulse(true);
+        if (bottomPulseTimer.current) window.clearTimeout(bottomPulseTimer.current);
+        bottomPulseTimer.current = window.setTimeout(() => setBottomPulse(false), 520);
+      }
+      return nextAtBottom;
+    });
+  }
+
+  useEffect(() => () => {
+    if (bottomPulseTimer.current) window.clearTimeout(bottomPulseTimer.current);
+  }, []);
+
+  useEffect(() => {
+    if (!isAtBottom) return;
+    window.requestAnimationFrame(() => scrollToBottom(props.messages.length > 1 ? "smooth" : "auto"));
+  }, [props.messages.length, props.thinking, isAtBottom]);
+
   return <div className="agent-chat">
-    <div className="agent-message-list">
+    <div ref={listRef} className={bottomPulse ? "agent-message-list bottom-pulse" : "agent-message-list"} onScroll={updateScrollState}>
       {props.messages.map((message) => {
         const mine = message.authorKind === "user" && message.authorId === props.user.id;
         return <div key={message.id} className={mine ? "agent-message-row mine" : `agent-message-row ${message.authorKind}`}>
@@ -396,10 +456,25 @@ function AgentChat(props: {
       {props.thinking && <div className="agent-chat-thinking"><AgentAvatar agent={props.agent} /><div className="agent-typing"><i /><i /><i /><span>{props.agent.name} 正在思考</span></div></div>}
       {!props.messages.length && <div className="agent-chat-empty"><Bot size={32} /><strong>{props.agent.name}</strong></div>}
       <div ref={endRef} />
+      {!isAtBottom && <button className="agent-scroll-bottom" type="button" onClick={() => { scrollToBottom(); setIsAtBottom(true); }}><ArrowDown size={15} />到底部</button>}
     </div>
     <form className="agent-composer" onSubmit={props.onSubmit}>
-      <textarea value={props.composer} onChange={(event) => props.setComposer(event.target.value)} placeholder={`发消息给 ${props.agent.name}`} />
-      <button title="发送" disabled={props.busy || !props.composer.trim()}><Send size={18} /></button>
+      <div className="agent-composer-input">
+        <textarea
+          value={props.composer}
+          maxLength={CHAT_COMPOSER_MAX_LENGTH}
+          onChange={(event) => updateComposer(event.target.value)}
+          onKeyDown={handleComposerKeyDown}
+          placeholder={`发消息给 ${props.agent.name}`}
+          aria-label={`发消息给 ${props.agent.name}`}
+        />
+        {props.composer && <button className="composer-clear" type="button" title="清空输入" aria-label="清空输入" disabled={props.busy} onClick={() => updateComposer("")}><X size={14} /></button>}
+        <div className="composer-meta" aria-live="polite">
+          <span>{props.busy ? "正在发送..." : "Enter 发送 · Shift+Enter 换行"}</span>
+          <span className={composerNearLimit ? "warn" : ""}>{composerLength}/{CHAT_COMPOSER_MAX_LENGTH}</span>
+        </div>
+      </div>
+      <button title="发送" aria-label="发送消息" disabled={!canSend}>{props.busy ? <RefreshCw className="spin" size={18} /> : <Send size={18} />}</button>
     </form>
   </div>;
 }
@@ -581,6 +656,10 @@ function AgentMemoryPanel(props: { agent: AgentDetail; onChanged: () => void; on
   const [knowledge, setKnowledge] = useState("");
   const [memoryError, setMemoryError] = useState("");
   const [knowledgeErrors, setKnowledgeErrors] = useState<FieldErrors>({});
+  const [ragQuery, setRagQuery] = useState("");
+  const [ragError, setRagError] = useState("");
+  const [ragBusy, setRagBusy] = useState(false);
+  const [ragResult, setRagResult] = useState<AgentKnowledgeSearchResponse | null>(null);
   async function addMemory(): Promise<void> {
     if (!memory.trim()) { setMemoryError("请填写要保存的长期记忆。"); return; }
     try { await api.addAgentMemory(props.agent.id, { kind: "semantic", content: memory, summary: memory.slice(0, 160), salience: 0.7, confidence: 0.9, emotionalValence: 0, keywords: splitList(memory) }); setMemory(""); setMemoryError(""); props.onChanged(); } catch (error) { props.onNotice(messageOf(error)); }
@@ -591,13 +670,53 @@ function AgentMemoryPanel(props: { agent: AgentDetail; onChanged: () => void; on
     if (Object.values(nextErrors).some(Boolean)) return;
     try { const result = await api.addAgentKnowledge(props.agent.id, { kind: "note", title: knowledgeTitle, content: knowledge }); setKnowledge(""); setKnowledgeTitle(""); setKnowledgeErrors({}); props.onNotice(`已索引 ${result.chunkCount} 个知识分块`); } catch (error) { props.onNotice(messageOf(error)); }
   }
+  async function searchKnowledge(): Promise<void> {
+    if (!ragQuery.trim()) {
+      setRagError("请输入检索问题。");
+      return;
+    }
+    setRagBusy(true);
+    try {
+      const result = await api.searchAgentKnowledge(props.agent.id, { query: ragQuery.trim(), limit: 8 });
+      setRagResult(result);
+      setRagError("");
+    } catch (error) {
+      props.onNotice(messageOf(error));
+    } finally {
+      setRagBusy(false);
+    }
+  }
+  async function reindexSource(sourceId: string): Promise<void> {
+    setRagBusy(true);
+    try {
+      const result = await api.reindexAgentKnowledge(props.agent.id, sourceId);
+      props.onNotice(`已重建 ${result.chunkCount} 个知识分块`);
+      props.onChanged();
+    } catch (error) {
+      props.onNotice(messageOf(error));
+    } finally {
+      setRagBusy(false);
+    }
+  }
   return <div className="agent-panel-stack">
     <div className="agent-memory-compose"><Brain size={18} /><textarea aria-invalid={Boolean(memoryError)} value={memory} onChange={(event) => { setMemory(event.target.value); setMemoryError(""); }} placeholder="长期记忆" /><button onClick={() => void addMemory()}>记住</button></div>
     {memoryError && <small className="field-error"><AlertCircle size={13} />{memoryError}</small>}
     <div className="agent-memory-compose knowledge"><BookOpen size={18} /><input aria-invalid={Boolean(knowledgeErrors.title)} value={knowledgeTitle} onChange={(event) => { setKnowledgeTitle(event.target.value); setKnowledgeErrors(clearAgentError(knowledgeErrors, "title")); }} placeholder="知识标题" /><textarea aria-invalid={Boolean(knowledgeErrors.content)} value={knowledge} onChange={(event) => { setKnowledge(event.target.value); setKnowledgeErrors(clearAgentError(knowledgeErrors, "content")); }} placeholder="知识内容" /><button onClick={() => void addKnowledge()}>索引</button></div>
     {knowledgeErrors.title && <small className="field-error"><AlertCircle size={13} />{knowledgeErrors.title}</small>}
     {knowledgeErrors.content && <small className="field-error"><AlertCircle size={13} />{knowledgeErrors.content}</small>}
-    <div className="agent-knowledge-list">{props.agent.knowledgeSources.map((source) => <article key={source.id}><BookOpen size={16} /><div><strong>{source.title}</strong><small>{source.kind} · {source.chunkCount} chunks · {source.status}</small></div></article>)}</div>
+    <div className="agent-rag-panel">
+      <div className="agent-rag-query"><Search size={16} /><input aria-invalid={Boolean(ragError)} value={ragQuery} onChange={(event) => { setRagQuery(event.target.value); setRagError(""); }} placeholder="测试知识库检索" /><button disabled={ragBusy} onClick={() => void searchKnowledge()}>检索</button></div>
+      {ragError && <small className="field-error"><AlertCircle size={13} />{ragError}</small>}
+      {ragResult && <div className="agent-rag-results">
+        <div className="agent-rag-meta"><span>{ragResult.queryEmbeddingModel}</span><span>{ragResult.queryUsedFallback ? "fallback" : "provider"}</span><span>{ragResult.promptTokens} tokens</span><span>{ragResult.chargedTokens} 计费</span></div>
+        {ragResult.results.length === 0 ? <p className="agent-empty-line">没有命中知识分块</p> : ragResult.results.map((item) => <article key={item.id}>
+          <header><strong>{item.sourceTitle}</strong><span>{item.score.toFixed(2)}</span></header>
+          <p>{item.content}</p>
+          <small>{item.sourceKind} · chunk {item.position + 1} · vector {item.vectorScore.toFixed(2)} · keyword {item.keywordScore}</small>
+        </article>)}
+      </div>}
+    </div>
+    <div className="agent-knowledge-list">{props.agent.knowledgeSources.map((source) => <article key={source.id}><BookOpen size={16} /><div><strong>{source.title}</strong><small>{source.kind} · {source.chunkCount} chunks · {source.status}</small></div><button className="icon-only-button" title="重建索引" disabled={ragBusy} onClick={() => void reindexSource(source.id)}><RefreshCw size={14} /></button></article>)}</div>
     <div className="agent-memory-grid">{props.agent.memories.map((item) => <article key={item.id}><span>{item.kind}</span><p>{item.summary || item.content}</p><small>显著度 {Math.round(item.salience * 100)}%</small></article>)}</div>
   </div>;
 }
@@ -647,6 +766,13 @@ function CreateAgentDialog(props: { providers: ModelProviderPublic[]; skills: Sk
   const [errors, setErrors] = useState<FieldErrors>({});
   const eligibleProviders = form.visibility === "private" ? props.providers : props.providers.filter((item) => item.scope === "platform");
   const provider = eligibleProviders.find((item) => item.id === form.modelProviderId);
+  useEffect(() => {
+    const listener = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) props.onClose();
+    };
+    window.addEventListener("keydown", listener);
+    return () => window.removeEventListener("keydown", listener);
+  }, [busy, props.onClose]);
   const update = <K extends keyof typeof form>(key: K, value: (typeof form)[K]) => {
     setForm({ ...form, [key]: value });
     setErrors(clearAgentError(errors, key));
@@ -770,7 +896,7 @@ function AgentAvatar(props: { agent: Pick<AgentSummary, "name" | "avatarUrl" | "
 }
 
 function AgentTabButton(props: { active: boolean; icon: JSX.Element; label: string; onClick: () => void }): JSX.Element {
-  return <button className={props.active ? "active" : ""} onClick={props.onClick}>{React.cloneElement(props.icon, { size: 15 })}{props.label}</button>;
+  return <button className={props.active ? "active" : ""} role="tab" aria-selected={props.active} onClick={props.onClick}>{React.cloneElement(props.icon, { size: 15 })}{props.label}</button>;
 }
 
 function eventIcon(kind: string): JSX.Element {

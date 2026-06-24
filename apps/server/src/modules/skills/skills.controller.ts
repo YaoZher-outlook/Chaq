@@ -1,6 +1,6 @@
 import { Body, Controller, Get, Inject, Param, Post } from "@nestjs/common";
 import { z } from "zod";
-import { distillRequestSchema, skillDraftSchema, skillSourceKinds } from "@chaq/shared";
+import { distillRequestSchema, skillDraftSchema, skillModerationSchema, skillReportInputSchema, skillSourceKinds } from "@chaq/shared";
 import { CurrentUserId } from "../../common/current-user.decorator";
 import { parseBody } from "../../common/http-errors";
 import { SkillsService } from "./skills.service";
@@ -22,10 +22,6 @@ const updateSkillSchema = createSkillSchema.partial().extend({
   skill: skillDraftSchema
 });
 
-const reportSkillSchema = z.object({
-  reason: z.string().min(1).max(500).default("user_report")
-});
-
 @Controller("skills")
 export class SkillsController {
   constructor(@Inject(SkillsService) private readonly skills: SkillsService) {}
@@ -39,6 +35,17 @@ export class SkillsController {
   create(@CurrentUserId() userId: string, @Body() body: unknown) {
     const input = parseBody(createSkillSchema, body);
     return this.skills.createSkill(userId, input.skill, input.sourceKind ?? "manual");
+  }
+
+  @Get("admin/reports")
+  adminReports(@CurrentUserId() userId: string) {
+    return this.skills.adminReviewQueue(userId);
+  }
+
+  @Post("admin/reports/:skillId/resolve")
+  moderate(@CurrentUserId() userId: string, @Param("skillId") skillId: string, @Body() body: unknown) {
+    const input = parseBody(skillModerationSchema, body);
+    return this.skills.moderateSkill(userId, skillId, input.action, input.note ?? "");
   }
 
   @Get(":id")
@@ -74,6 +81,6 @@ export class SkillsController {
 
   @Post(":id/report")
   report(@CurrentUserId() userId: string, @Body() body: unknown, @Param("id") id: string) {
-    return this.skills.reportSkill(userId, id, parseBody(reportSkillSchema, body).reason ?? "user_report");
+    return this.skills.reportSkill(userId, id, parseBody(skillReportInputSchema, body).reason ?? "user_report");
   }
 }

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { BadRequestException, Inject, Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import {
   AgentAutonomyMode,
   AgentEventKind,
@@ -20,9 +20,9 @@ import {
   RelationshipKind,
   ToolRiskLevel
 } from "@prisma/client";
-import type { AgentDraft } from "@chaq/shared";
+import type { AgentDraft, AgentKnowledgeSearchResponse, AgentReviewItem } from "@chaq/shared";
 import { PrismaService } from "../../common/prisma.service";
-import { extractKeywords } from "../../common/vector-search";
+import { cosineSimilarity, extractKeywords } from "../../common/vector-search";
 import { UsersService } from "../users/users.service";
 import { ModelsService } from "../models/models.service";
 import { AgentQueueService } from "./agent-queue.service";
@@ -140,6 +140,110 @@ export class AgentsService {
       }
     });
     return toAgentContact(row);
+  }
+
+  async reportAgent(userId: string, agentId: string, reason: string): Promise<{ ok: true }> {
+    await this.users.ensureUser(userId);
+    const agent = await this.prisma.agent.findFirst({
+      where: {
+        id: agentId,
+        status: { not: AgentStatus.ARCHIVED },
+        visibility: { in: [AgentVisibility.PUBLIC, AgentVisibility.UNLISTED] }
+      },
+      select: { id: true, ownerId: true }
+    });
+    if (!agent) throw new NotFoundException("Agent not found.");
+    if (agent.ownerId === userId) throw new ForbiddenException("Cannot report your own agent.");
+    await (this.prisma as any).agentReport.create({
+      data: {
+        reporterId: userId,
+        agentId,
+        reason: reason.trim() || "user_report"
+      }
+    });
+    return { ok: true };
+  }
+
+  async adminReviewQueue(adminUserId: string): Promise<AgentReviewItem[]> {
+    await this.users.assertAdmin(adminUserId);
+    const rows = await (this.prisma as any).agentReport.findMany({
+      where: { status: "PENDING" },
+      include: {
+        reporter: { select: { displayName: true, username: true } },
+        agent: {
+          include: {
+            owner: { select: { displayName: true } },
+            contacts: { where: { userId: adminUserId }, select: { id: true } },
+            runs: { where: { status: { in: [AgentRunStatus.QUEUED, AgentRunStatus.RUNNING] } }, select: { status: true }, take: 1 }
+          }
+        }
+      },
+      orderBy: { createdAt: "asc" },
+      take: 500
+    });
+    const grouped = new Map<string, any[]>();
+    for (const row of rows) {
+      const list = grouped.get(row.agentId) ?? [];
+      list.push(row);
+      grouped.set(row.agentId, list);
+    }
+    return [...grouped.values()].map((reports) => {
+      const sorted = [...reports].sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime());
+      const latest = sorted[sorted.length - 1];
+      const agent = latest.agent;
+      return {
+        agent: {
+          ...toPublicAgentSummary(agent),
+          ownerId: agent.ownerId,
+          ownerDisplayName: agent.owner?.displayName ?? agent.ownerId
+        },
+        reportCount: sorted.length,
+        latestReason: latest.reason,
+        latestReporter: latest.reporter?.displayName ?? latest.reporter?.username ?? latest.reporterId,
+        oldestReportAt: sorted[0].createdAt.toISOString(),
+        latestReportAt: latest.createdAt.toISOString(),
+        status: "pending"
+      } satisfies AgentReviewItem;
+    }).sort((left, right) => right.reportCount - left.reportCount || left.oldestReportAt.localeCompare(right.oldestReportAt));
+  }
+
+  async moderateAgent(adminUserId: string, agentId: string, action: "dismiss" | "unpublish" | "archive", note = ""): Promise<{ ok: true }> {
+    await this.users.assertAdmin(adminUserId);
+    const agent = await this.prisma.agent.findUnique({ where: { id: agentId }, select: { id: true, name: true } });
+    if (!agent) throw new NotFoundException("Agent not found.");
+    await this.prisma.$transaction(async (tx) => {
+      if (action === "unpublish") {
+        await tx.agent.update({
+          where: { id: agentId },
+          data: { visibility: AgentVisibility.PRIVATE, status: AgentStatus.PAUSED }
+        });
+        await tx.agentContact.deleteMany({ where: { agentId } });
+      } else if (action === "archive") {
+        await tx.agent.update({
+          where: { id: agentId },
+          data: { visibility: AgentVisibility.PRIVATE, status: AgentStatus.ARCHIVED, nextRunAt: null }
+        });
+        await tx.agentContact.deleteMany({ where: { agentId } });
+      }
+      await (tx as any).agentReport.updateMany({
+        where: { agentId, status: "PENDING" },
+        data: {
+          status: action === "dismiss" ? "DISMISSED" : "ACTIONED",
+          adminNote: note,
+          reviewedById: adminUserId,
+          reviewedAt: new Date()
+        }
+      });
+      await tx.agentEvent.create({
+        data: {
+          agentId,
+          kind: AgentEventKind.SYSTEM,
+          title: action === "dismiss" ? "Moderation report dismissed" : "Agent moderated by admin",
+          content: note || `Admin action: ${action}`
+        }
+      });
+    });
+    return { ok: true };
   }
 
   async removeContact(userId: string, agentId: string): Promise<{ ok: true }> {
@@ -602,44 +706,127 @@ export class AgentsService {
   async addKnowledge(userId: string, agentId: string, input: any) {
     await this.ownedAgent(userId, agentId);
     const chunks = this.chunkText(input.content);
-    const embeddedChunks: Array<{ vector: number[]; model: string }> = [];
-    for (const content of chunks) {
-      embeddedChunks.push(await this.models.agentEmbedding(agentId, content, userId));
-    }
+    if (!chunks.length) throw new BadRequestException("Knowledge content is empty.");
     const hash = createHash("sha256").update(input.content).digest("hex");
-    const row = await this.prisma.agentKnowledgeSource.create({
+    const existing = await this.prisma.agentKnowledgeSource.findFirst({
+      where: { agentId, contentHash: hash, status: KnowledgeSourceStatus.READY },
+      include: { _count: { select: { chunks: true } } }
+    });
+    if (existing) return this.toKnowledgeSourceResponse(existing);
+    const source = await this.prisma.agentKnowledgeSource.create({
       data: {
         agentId,
         kind: KnowledgeSourceKind[input.kind.toUpperCase() as keyof typeof KnowledgeSourceKind],
-        status: KnowledgeSourceStatus.READY,
+        status: KnowledgeSourceStatus.PROCESSING,
         title: input.title,
         originUri: input.originUri,
         contentHash: hash,
         summary: input.content.slice(0, 500),
-        metadata: input.metadata as Prisma.InputJsonValue | undefined,
-        chunks: {
-          create: chunks.map((content, position) => ({
-            position,
-            content,
-            tokenCount: Math.ceil(content.length / 4),
-            keywords: this.keywords(content),
-            embedding: embeddedChunks[position].vector as unknown as Prisma.InputJsonValue,
-            embeddingModel: embeddedChunks[position].model
-          }))
-        }
-      },
-      include: { _count: { select: { chunks: true } } }
+        metadata: input.metadata as Prisma.InputJsonValue | undefined
+      }
     });
-    await this.event(agentId, AgentEventKind.MEMORY, "Knowledge indexed", `${row.title}: ${row._count.chunks} chunks`);
+    try {
+      await this.indexKnowledgeChunks(userId, agentId, source.id, chunks);
+      const row = await this.prisma.agentKnowledgeSource.findUniqueOrThrow({
+        where: { id: source.id },
+        include: { _count: { select: { chunks: true } } }
+      });
+      await this.event(agentId, AgentEventKind.MEMORY, "Knowledge indexed", `${row.title}: ${row._count.chunks} chunks`);
+      return this.toKnowledgeSourceResponse(row);
+    } catch (error) {
+      await this.prisma.agentKnowledgeSource.update({
+        where: { id: source.id },
+        data: {
+          status: KnowledgeSourceStatus.FAILED,
+          error: error instanceof Error ? error.message.slice(0, 1000) : String(error).slice(0, 1000)
+        }
+      }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async reindexKnowledge(userId: string, agentId: string, sourceId: string) {
+    await this.ownedAgent(userId, agentId);
+    const source = await this.prisma.agentKnowledgeSource.findFirst({
+      where: { id: sourceId, agentId },
+      include: { chunks: { orderBy: { position: "asc" } } }
+    });
+    if (!source) throw new NotFoundException("Knowledge source not found.");
+    const chunks = source.chunks.map((chunk) => chunk.content).filter(Boolean);
+    if (!chunks.length) throw new BadRequestException("Knowledge source has no chunks to rebuild.");
+    await this.prisma.agentKnowledgeSource.update({
+      where: { id: sourceId },
+      data: { status: KnowledgeSourceStatus.PROCESSING, error: null }
+    });
+    try {
+      await this.indexKnowledgeChunks(userId, agentId, sourceId, chunks);
+      const row = await this.prisma.agentKnowledgeSource.findUniqueOrThrow({
+        where: { id: sourceId },
+        include: { _count: { select: { chunks: true } } }
+      });
+      await this.event(agentId, AgentEventKind.MEMORY, "Knowledge reindexed", `${row.title}: ${row._count.chunks} chunks`);
+      return this.toKnowledgeSourceResponse(row);
+    } catch (error) {
+      await this.prisma.agentKnowledgeSource.update({
+        where: { id: sourceId },
+        data: {
+          status: KnowledgeSourceStatus.FAILED,
+          error: error instanceof Error ? error.message.slice(0, 1000) : String(error).slice(0, 1000)
+        }
+      }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async searchKnowledge(userId: string, agentId: string, input: { query: string; limit?: number }): Promise<AgentKnowledgeSearchResponse> {
+    await this.ownedAgent(userId, agentId);
+    const query = input.query.trim();
+    const limit = Math.min(20, Math.max(1, input.limit ?? 8));
+    const queryEmbedding = await this.models.agentEmbedding(agentId, query, userId);
+    const queryKeywords = new Set(extractKeywords(query, 24));
+    const chunks = await this.prisma.agentKnowledgeChunk.findMany({
+      where: { source: { agentId, status: KnowledgeSourceStatus.READY } },
+      include: { source: { select: { id: true, title: true, kind: true } } },
+      orderBy: [{ source: { updatedAt: "desc" } }, { position: "asc" }],
+      take: 2000
+    });
+    const results = chunks
+      .map((chunk) => {
+        const vectorScore = cosineSimilarity(chunk.embedding, queryEmbedding.vector);
+        const keywords = Array.isArray(chunk.keywords) ? chunk.keywords.map(String).filter(Boolean).slice(0, 16) : [];
+        const keywordScore = keywords.filter((keyword) => queryKeywords.has(keyword)).length;
+        const score = Number((vectorScore * 10 + keywordScore).toFixed(4));
+        return {
+          id: chunk.id,
+          sourceId: chunk.source.id,
+          sourceTitle: chunk.source.title,
+          sourceKind: chunk.source.kind.toLowerCase() as AgentKnowledgeSearchResponse["results"][number]["sourceKind"],
+          position: chunk.position,
+          content: chunk.content,
+          score,
+          vectorScore: Number(vectorScore.toFixed(4)),
+          keywordScore,
+          keywords,
+          embeddingModel: chunk.embeddingModel
+        };
+      })
+      .sort((left, right) => right.score - left.score)
+      .slice(0, limit);
+    const matchedChunkIds = results.map((item) => item.id);
+    if (matchedChunkIds.length && typeof (this.prisma.agentKnowledgeChunk as any).updateMany === "function") {
+      await (this.prisma.agentKnowledgeChunk as any).updateMany({
+        where: { id: { in: matchedChunkIds } },
+        data: { metadata: { lastMatchedAt: new Date().toISOString(), query } as Prisma.InputJsonValue }
+      }).catch(() => undefined);
+    }
     return {
-      id: row.id,
-      agentId: row.agentId,
-      kind: row.kind.toLowerCase(),
-      status: row.status.toLowerCase(),
-      title: row.title,
-      summary: row.summary,
-      chunkCount: row._count.chunks,
-      createdAt: row.createdAt.toISOString()
+      query,
+      queryEmbeddingModel: queryEmbedding.model,
+      queryUsedFallback: queryEmbedding.fallback,
+      promptTokens: queryEmbedding.promptTokens,
+      chargedTokens: queryEmbedding.chargedTokens,
+      resultCount: results.length,
+      results
     };
   }
 
@@ -772,6 +959,58 @@ export class AgentsService {
       { agentId, name: "publish_profile_post", description: "Share a short update on the agent profile." },
       { agentId, name: "wait", description: "Schedule the next autonomous wake-up." }
     ];
+  }
+
+  private async indexKnowledgeChunks(userId: string, agentId: string, sourceId: string, chunks: string[]): Promise<void> {
+    const embeddedChunks: Array<{ vector: number[]; model: string }> = [];
+    for (const content of chunks) {
+      embeddedChunks.push(await this.models.agentEmbedding(agentId, content, userId));
+    }
+    await this.prisma.$transaction(async (tx) => {
+      await tx.agentKnowledgeChunk.deleteMany({ where: { sourceId } });
+      await tx.agentKnowledgeChunk.createMany({
+        data: chunks.map((content, position) => ({
+          sourceId,
+          position,
+          content,
+          tokenCount: Math.ceil(content.length / 4),
+          keywords: this.keywords(content),
+          embedding: embeddedChunks[position].vector as unknown as Prisma.InputJsonValue,
+          embeddingModel: embeddedChunks[position].model,
+          metadata: {
+            indexedAt: new Date().toISOString()
+          } as Prisma.InputJsonValue
+        }))
+      });
+      await tx.agentKnowledgeSource.update({
+        where: { id: sourceId },
+        data: { status: KnowledgeSourceStatus.READY, error: null }
+      });
+    });
+  }
+
+  private toKnowledgeSourceResponse(row: {
+    id: string;
+    agentId: string;
+    kind: KnowledgeSourceKind;
+    status: KnowledgeSourceStatus;
+    title: string;
+    summary: string;
+    error?: string | null;
+    createdAt: Date;
+    _count?: { chunks?: number };
+  }) {
+    return {
+      id: row.id,
+      agentId: row.agentId,
+      kind: row.kind.toLowerCase(),
+      status: row.status.toLowerCase(),
+      title: row.title,
+      summary: row.summary,
+      error: row.error ?? null,
+      chunkCount: row._count?.chunks ?? 0,
+      createdAt: row.createdAt.toISOString()
+    };
   }
 
   private chunkText(content: string): string[] {
