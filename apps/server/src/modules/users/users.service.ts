@@ -1,12 +1,12 @@
-import { randomInt } from "node:crypto";
+import { randomBytes, randomInt } from "node:crypto";
 import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
-import { Prisma, TokenTransactionKind, User, UserRole } from "@prisma/client";
+import { Prisma, RechargeOrderStatus, TokenTransactionKind, User, UserRole } from "@prisma/client";
 import { isValidPassword, normalizeEmail, sendVerificationEmail } from "../../common/email";
 import { hashPassword, hashSessionToken, verifyPassword } from "../../common/password";
 import { PrismaService } from "../../common/prisma.service";
 import { RateLimitService } from "../../common/rate-limit.service";
 
-const rechargePilotUser = "chen_zy";
+const defaultRechargePilotUser = "chen_zy";
 const maxTokenBalance = 2_000_000_000;
 
 @Injectable()
@@ -215,7 +215,15 @@ export class UsersService {
 
   async walletSummary(userId: string) {
     const user = await this.ensureUser(userId);
-    const [transactions, spent, modelSpent, feesPaid, earnings, earningRows] = await Promise.all([
+    await this.expireRechargeOrders();
+    const rechargeOrdersQuery = typeof (this.prisma as any).rechargeOrder?.findMany === "function"
+      ? this.prisma.rechargeOrder.findMany({
+        where: { userId },
+        orderBy: { createdAt: "desc" },
+        take: 20
+      })
+      : Promise.resolve([]);
+    const [transactions, spent, modelSpent, feesPaid, earnings, earningRows, rechargeOrders] = await Promise.all([
       this.prisma.tokenTransaction.findMany({ where: { userId }, orderBy: { createdAt: "desc" }, take: 100 }),
       this.prisma.tokenTransaction.aggregate({
         where: { userId, amount: { lt: 0 } },
@@ -238,7 +246,8 @@ export class UsersService {
         select: { amount: true, metadata: true },
         orderBy: { createdAt: "desc" },
         take: 5000
-      })
+      }),
+      rechargeOrdersQuery
     ]);
     const grouped = new Map<string, { amount: number; transactionCount: number }>();
     for (const row of earningRows) {
@@ -262,51 +271,280 @@ export class UsersService {
       agentEarnings: [...grouped.entries()]
         .map(([agentId, value]) => ({ agentId, agentName: names.get(agentId) ?? "Archived Agent", ...value }))
         .sort((a, b) => b.amount - a.amount),
-      transactions
+      transactions,
+      rechargeOrders: rechargeOrders.map((order) => this.toRechargeOrder(order, true, this.paymentSettings()))
     };
   }
 
-  async rechargeTokens(userId: string, input: { amount: number; unit: "token" | "k" | "m"; note?: string }) {
+  async rechargeConfig(userId: string) {
     const user = await this.ensureUser(userId);
-    if (user.username !== rechargePilotUser) {
-      throw new ForbiddenException("Recharge is currently only available for chen_zy.");
+    const settings = this.paymentSettings();
+    const allowed = user.username === settings.allowedUsername;
+    return {
+      enabled: settings.enabled,
+      allowed,
+      allowedUsername: settings.allowedUsername,
+      cnyPerMToken: settings.cnyPerMToken,
+      minMToken: settings.minMToken,
+      maxMToken: settings.maxMToken,
+      orderExpiresMinutes: settings.orderExpiresMinutes,
+      paymentAccount: allowed && settings.enabled ? this.paymentAccount(settings, true) : undefined
+    };
+  }
+
+  async createRechargeOrder(userId: string, input: { amount: number; unit: "token" | "k" | "m"; note?: string }) {
+    const user = await this.ensureUser(userId);
+    const settings = this.paymentSettings();
+    this.assertRechargeAllowed(user, settings);
+    if (!settings.enabled) {
+      throw new BadRequestException("Recharge collection account is not configured.");
     }
-    const unitFactor = input.unit === "m" ? 1_000_000 : input.unit === "k" ? 1_000 : 1;
-    const amount = input.amount * unitFactor;
-    if (!Number.isInteger(amount) || amount <= 0) {
-      throw new BadRequestException("Recharge amount must be a positive integer token value.");
+    const rate = await this.rateLimit.consume("recharge-order-create", userId, 6, 60 * 60);
+    if (!rate.allowed) {
+      throw new BadRequestException(`Recharge order requests are too frequent. Retry after ${rate.retryAfterSeconds} seconds.`);
     }
-    if (amount > 500_000_000) {
-      throw new BadRequestException("Single recharge cannot exceed 500M token.");
-    }
-    return this.prisma.$transaction(async (tx) => {
-      const changed = await tx.user.updateMany({
-        where: { id: userId, tokenBalance: { lte: maxTokenBalance - amount } },
-        data: { tokenBalance: { increment: amount } }
+    await this.expireRechargeOrders();
+    const amountTokens = this.normalizeRechargeAmount(input, settings);
+    const order = await this.prisma.rechargeOrder.create({
+      data: {
+        orderNo: this.createRechargeOrderNo(),
+        userId,
+        amountTokens,
+        requestedAmount: input.amount,
+        requestedUnit: input.unit,
+        payableCny: this.payableCny(amountTokens, settings),
+        paymentReference: this.createPaymentReference(),
+        payerNote: input.note?.trim() ?? "",
+        expiresAt: new Date(Date.now() + settings.orderExpiresMinutes * 60_000)
+      }
+    });
+    return this.toRechargeOrder(order, true, settings);
+  }
+
+  async submitRechargeOrder(userId: string, orderId: string, payerNote = "") {
+    const user = await this.ensureUser(userId);
+    const settings = this.paymentSettings();
+    this.assertRechargeAllowed(user, settings);
+    await this.expireRechargeOrders();
+    const changed = await this.prisma.rechargeOrder.updateMany({
+      where: {
+        id: orderId,
+        userId,
+        status: RechargeOrderStatus.PENDING,
+        expiresAt: { gt: new Date() }
+      },
+      data: {
+        status: RechargeOrderStatus.SUBMITTED,
+        payerNote: payerNote.trim(),
+        submittedAt: new Date()
+      }
+    });
+    if (!changed.count) throw new BadRequestException("Recharge order cannot be submitted.");
+    const order = await this.prisma.rechargeOrder.findUniqueOrThrow({ where: { id: orderId } });
+    return this.toRechargeOrder(order, true, settings);
+  }
+
+  async cancelRechargeOrder(userId: string, orderId: string) {
+    const changed = await this.prisma.rechargeOrder.updateMany({
+      where: { id: orderId, userId, status: RechargeOrderStatus.PENDING },
+      data: { status: RechargeOrderStatus.CANCELLED }
+    });
+    if (!changed.count) throw new BadRequestException("Recharge order cannot be cancelled.");
+    const order = await this.prisma.rechargeOrder.findUniqueOrThrow({ where: { id: orderId } });
+    return this.toRechargeOrder(order, true, this.paymentSettings());
+  }
+
+  async adminRechargeOrders(adminUserId: string) {
+    await this.assertAdmin(adminUserId);
+    await this.expireRechargeOrders();
+    const settings = this.paymentSettings();
+    const rows = await this.prisma.rechargeOrder.findMany({
+      where: { status: { in: [RechargeOrderStatus.PENDING, RechargeOrderStatus.SUBMITTED] } },
+      include: { user: { select: { id: true, username: true, email: true, displayName: true } } },
+      orderBy: [{ status: "desc" }, { createdAt: "asc" }],
+      take: 200
+    });
+    return rows.map((row) => ({ ...this.toRechargeOrder(row, false, settings), user: row.user }));
+  }
+
+  async moderateRechargeOrder(adminUserId: string, orderId: string, action: "confirm" | "reject", note = "") {
+    await this.assertAdmin(adminUserId);
+    await this.expireRechargeOrders();
+    if (action === "reject") {
+      const changed = await this.prisma.rechargeOrder.updateMany({
+        where: { id: orderId, status: { in: [RechargeOrderStatus.PENDING, RechargeOrderStatus.SUBMITTED] } },
+        data: {
+          status: RechargeOrderStatus.REJECTED,
+          adminNote: note.trim(),
+          reviewedById: adminUserId,
+          reviewedAt: new Date()
+        }
       });
-      if (!changed.count) {
+      if (!changed.count) throw new BadRequestException("Recharge order cannot be rejected.");
+      const order = await this.prisma.rechargeOrder.findUniqueOrThrow({ where: { id: orderId } });
+      return this.toRechargeOrder(order, false, this.paymentSettings());
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const order = await tx.rechargeOrder.findUnique({ where: { id: orderId } });
+      if (!order) throw new NotFoundException("Recharge order not found.");
+      if (order.status !== RechargeOrderStatus.PENDING && order.status !== RechargeOrderStatus.SUBMITTED) {
+        throw new BadRequestException("Recharge order has already been processed.");
+      }
+      if (order.expiresAt.getTime() <= Date.now()) {
+        await tx.rechargeOrder.update({ where: { id: orderId }, data: { status: RechargeOrderStatus.EXPIRED } });
+        throw new BadRequestException("Recharge order has expired.");
+      }
+      const changed = await tx.rechargeOrder.updateMany({
+        where: {
+          id: orderId,
+          status: { in: [RechargeOrderStatus.PENDING, RechargeOrderStatus.SUBMITTED] },
+          expiresAt: { gt: new Date() }
+        },
+        data: {
+          status: RechargeOrderStatus.PAID,
+          adminNote: note.trim(),
+          reviewedById: adminUserId,
+          reviewedAt: new Date()
+        }
+      });
+      if (!changed.count) throw new BadRequestException("Recharge order has already been processed.");
+      const user = await tx.user.update({
+        where: { id: order.userId },
+        data: { tokenBalance: { increment: order.amountTokens } },
+        select: { tokenBalance: true }
+      });
+      if (user.tokenBalance > maxTokenBalance) {
         throw new BadRequestException("Token balance would exceed the current platform limit.");
       }
-      const updated = await tx.user.findUniqueOrThrow({ where: { id: userId } });
       const transaction = await tx.tokenTransaction.create({
         data: {
-          userId,
+          userId: order.userId,
           kind: TokenTransactionKind.RECHARGE,
-          amount,
-          balanceAfter: updated.tokenBalance,
-          note: input.note?.trim() || "Pilot recharge credited before payment collection account is configured.",
+          amount: order.amountTokens,
+          balanceAfter: user.tokenBalance,
+          note: note.trim() || `Manual bank transfer confirmed: ${order.orderNo}`,
           metadata: {
-            status: "pilot_direct_credit",
-            allowedAccount: rechargePilotUser,
-            paymentProvider: "manual_pending",
-            collectionAccountConfigured: false,
-            requestedAmount: input.amount,
-            requestedUnit: input.unit
+            rechargeOrderId: order.id,
+            orderNo: order.orderNo,
+            paymentReference: order.paymentReference,
+            payableCny: order.payableCny,
+            paymentMethod: order.paymentMethod
           } as Prisma.InputJsonValue
         }
       });
-      return { user: this.publicUser(updated), transaction };
+      const updated = await tx.rechargeOrder.update({
+        where: { id: orderId },
+        data: { paidTransactionId: transaction.id }
+      });
+      return this.toRechargeOrder(updated, false, this.paymentSettings());
     });
+  }
+
+  private async expireRechargeOrders(): Promise<void> {
+    if (typeof (this.prisma.rechargeOrder as any)?.updateMany !== "function") return;
+    await this.prisma.rechargeOrder.updateMany({
+      where: {
+        status: { in: [RechargeOrderStatus.PENDING, RechargeOrderStatus.SUBMITTED] },
+        expiresAt: { lte: new Date() }
+      },
+      data: { status: RechargeOrderStatus.EXPIRED }
+    }).catch(() => undefined);
+  }
+
+  private assertRechargeAllowed(user: User, settings = this.paymentSettings()): void {
+    if (user.username !== settings.allowedUsername) {
+      throw new ForbiddenException(`Recharge is currently only available for ${settings.allowedUsername}.`);
+    }
+  }
+
+  private normalizeRechargeAmount(input: { amount: number; unit: "token" | "k" | "m" }, settings = this.paymentSettings()): number {
+    const unitFactor = input.unit === "m" ? 1_000_000 : input.unit === "k" ? 1_000 : 1;
+    const raw = input.amount * unitFactor;
+    const amountTokens = Math.round(raw);
+    if (!Number.isFinite(raw) || Math.abs(raw - amountTokens) > 0.000001 || amountTokens <= 0) {
+      throw new BadRequestException("Recharge amount must convert to a positive integer token value.");
+    }
+    if (amountTokens < settings.minMToken * 1_000_000) {
+      throw new BadRequestException(`Recharge amount cannot be lower than ${settings.minMToken}M token.`);
+    }
+    if (amountTokens > settings.maxMToken * 1_000_000) {
+      throw new BadRequestException(`Single recharge cannot exceed ${settings.maxMToken}M token.`);
+    }
+    return amountTokens;
+  }
+
+  private payableCny(amountTokens: number, settings = this.paymentSettings()): number {
+    return Number(((amountTokens / 1_000_000) * settings.cnyPerMToken).toFixed(2));
+  }
+
+  private createRechargeOrderNo(): string {
+    const date = new Date();
+    const ymd = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, "0")}${String(date.getDate()).padStart(2, "0")}`;
+    return `CHQ${ymd}${randomBytes(4).toString("hex").toUpperCase()}`;
+  }
+
+  private createPaymentReference(): string {
+    return `CHQ-${randomBytes(4).toString("hex").toUpperCase()}`;
+  }
+
+  private paymentSettings() {
+    const accountNumber = String(process.env.PAYMENT_ACCOUNT_NUMBER ?? "").trim();
+    const cnyPerMToken = this.positiveNumberEnv("PAYMENT_CNY_PER_M_TOKEN", 1);
+    return {
+      enabled: Boolean(accountNumber),
+      allowedUsername: String(process.env.PAYMENT_PILOT_USERNAME || defaultRechargePilotUser),
+      bankName: String(process.env.PAYMENT_BANK_NAME || "Manual bank transfer"),
+      accountName: String(process.env.PAYMENT_ACCOUNT_NAME || ""),
+      accountNumber,
+      cnyPerMToken,
+      minMToken: this.positiveNumberEnv("PAYMENT_MIN_M_TOKEN", 1),
+      maxMToken: this.positiveNumberEnv("PAYMENT_MAX_M_TOKEN", 500),
+      orderExpiresMinutes: Math.round(this.positiveNumberEnv("PAYMENT_ORDER_EXPIRES_MINUTES", 24 * 60))
+    };
+  }
+
+  private positiveNumberEnv(key: string, fallback: number): number {
+    const value = Number(process.env[key]);
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+  }
+
+  private paymentAccount(settings = this.paymentSettings(), includeFullAccount = false) {
+    return {
+      bankName: settings.bankName,
+      accountName: settings.accountName,
+      accountNumberMasked: this.maskAccountNumber(settings.accountNumber),
+      ...(includeFullAccount ? { accountNumber: settings.accountNumber } : {})
+    };
+  }
+
+  private maskAccountNumber(value: string): string {
+    if (value.length <= 8) return value ? "****" : "";
+    return `${value.slice(0, 4)} **** **** ${value.slice(-4)}`;
+  }
+
+  private toRechargeOrder(row: any, includeAccount: boolean, settings = this.paymentSettings()) {
+    return {
+      id: row.id,
+      orderNo: row.orderNo,
+      userId: row.userId,
+      status: String(row.status).toLowerCase(),
+      amountTokens: row.amountTokens,
+      requestedAmount: row.requestedAmount,
+      requestedUnit: row.requestedUnit,
+      payableCny: row.payableCny,
+      paymentMethod: "bank_transfer",
+      paymentReference: row.paymentReference,
+      paymentAccount: includeAccount ? this.paymentAccount(settings, true) : this.paymentAccount(settings, false),
+      payerNote: row.payerNote,
+      adminNote: row.adminNote,
+      paidTransactionId: row.paidTransactionId,
+      submittedAt: row.submittedAt?.toISOString?.() ?? null,
+      reviewedAt: row.reviewedAt?.toISOString?.() ?? null,
+      expiresAt: row.expiresAt.toISOString(),
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString()
+    };
   }
 
   async settings(userId: string) {

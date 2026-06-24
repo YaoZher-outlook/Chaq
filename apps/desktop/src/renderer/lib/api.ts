@@ -20,6 +20,9 @@ import type {
   MarketplaceComment,
   MarketplaceSkill,
   ModelProviderPublic,
+  AdminRechargeOrder,
+  RechargeConfig,
+  RechargeOrder,
   SkillReviewItem,
   SkillDraft,
   SkillSummary,
@@ -223,12 +226,23 @@ export const api = {
   }),
   tokenLedger: () => request<TokenTransaction[]>("/users/me/tokens"),
   wallet: () => request<WalletSummary>("/users/me/wallet"),
-  recharge: (payload: { amount: number; unit: "token" | "k" | "m"; note?: string }) => request<{
-    user: LoginUser;
-    transaction: TokenTransaction;
-  }>("/users/me/recharge", {
+  rechargeConfig: () => request<RechargeConfig>("/users/me/recharge/config"),
+  recharge: (payload: { amount: number; unit: "token" | "k" | "m"; note?: string }) => request<RechargeOrder>("/users/me/recharge", {
     method: "POST",
     body: JSON.stringify(payload)
+  }),
+  submitRecharge: (id: string, payerNote?: string) => request<RechargeOrder>(`/users/me/recharge/${id}/submit`, {
+    method: "POST",
+    body: JSON.stringify({ payerNote: payerNote ?? "" })
+  }),
+  cancelRecharge: (id: string) => request<RechargeOrder>(`/users/me/recharge/${id}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({})
+  }),
+  adminRechargeOrders: () => request<AdminRechargeOrder[]>("/users/admin/recharge/orders"),
+  resolveRechargeOrder: (id: string, action: "confirm" | "reject", note?: string) => request<RechargeOrder>(`/users/admin/recharge/orders/${id}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ action, note: note ?? "" })
   }),
   providers: () => request<ModelProviderPublic[]>("/models/providers"),
   availableProviders: () => request<ModelProviderPublic[]>("/models/available"),

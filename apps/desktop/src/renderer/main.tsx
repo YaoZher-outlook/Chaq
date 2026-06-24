@@ -51,10 +51,12 @@ import {
 import type {
   ChatMessage,
   AgentReviewItem,
+  AdminRechargeOrder,
   ImportPreview,
   MarketplaceComment,
   MarketplaceSkill,
   ModelProviderPublic,
+  RechargeConfig,
   ProviderKind,
   SkillAutoMessageSettings,
   SkillDraft,
@@ -205,6 +207,7 @@ function App(): JSX.Element {
   const [rechargeForm, setRechargeForm] = useState<{ amount: string; unit: RechargeUnit }>({ amount: "1", unit: "m" });
   const [rechargeError, setRechargeError] = useState("");
   const [rechargeBusy, setRechargeBusy] = useState(false);
+  const [rechargeConfig, setRechargeConfig] = useState<RechargeConfig | null>(null);
   const [skillSearch, setSkillSearch] = useState("");
 
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
@@ -247,6 +250,7 @@ function App(): JSX.Element {
   const [adminProviderErrors, setAdminProviderErrors] = useState<FieldErrors>({});
   const [adminAgentReports, setAdminAgentReports] = useState<AgentReviewItem[]>([]);
   const [adminSkillReports, setAdminSkillReports] = useState<SkillReviewItem[]>([]);
+  const [adminRechargeOrders, setAdminRechargeOrders] = useState<AdminRechargeOrder[]>([]);
   const [adminReviewBusyId, setAdminReviewBusyId] = useState<string | null>(null);
 
   const selectedSkill = skills.find((skill) => skill.id === selectedSkillId) ?? null;
@@ -590,14 +594,16 @@ function App(): JSX.Element {
       setCloudProviders(providers);
       setAgentProviders(availableProviders);
       if (user.role === "ADMIN") {
-        const [adminNextProviders, agentReports, skillReports] = await Promise.all([
+        const [adminNextProviders, agentReports, skillReports, rechargeOrders] = await Promise.all([
           api.adminProviders().catch(() => []),
           api.adminAgentReports().catch(() => []),
-          api.adminSkillReports().catch(() => [])
+          api.adminSkillReports().catch(() => []),
+          api.adminRechargeOrders().catch(() => [])
         ]);
         setAdminProviders(adminNextProviders);
         setAdminAgentReports(agentReports);
         setAdminSkillReports(skillReports);
+        setAdminRechargeOrders(rechargeOrders);
       }
     } catch (error) {
       setNotice(`后端未连接：${messageOf(error)}`);
@@ -724,8 +730,9 @@ function App(): JSX.Element {
 
   async function refreshWallet(): Promise<void> {
     try {
-      const summary = await api.wallet();
+      const [summary, config] = await Promise.all([api.wallet(), api.rechargeConfig().catch(() => null)]);
       setWalletSummary(summary);
+      setRechargeConfig(config);
       setTokenTransactions(summary.transactions);
       setAuth((current) => current ? { ...current, user: { ...current.user, tokenBalance: summary.balance } } : current);
     } catch (error) {
@@ -752,14 +759,33 @@ function App(): JSX.Element {
     setRechargeError("");
     setRechargeBusy(true);
     try {
-      const result = await api.recharge({ amount, unit: rechargeForm.unit });
-      setAuth((current) => current ? { ...current, user: { ...current.user, tokenBalance: result.user.tokenBalance } } : current);
+      const order = await api.recharge({ amount, unit: rechargeForm.unit });
       await refreshWallet();
-      setNotice(`已充值 ${formatTokenCount(tokenAmount)} Token`);
+      setNotice(`已创建充值订单 ${order.orderNo}，请按订单附言转账后提交确认`);
     } catch (error) {
       setRechargeError(messageOf(error));
     } finally {
       setRechargeBusy(false);
+    }
+  }
+
+  async function submitRechargeOrder(orderId: string): Promise<void> {
+    try {
+      await api.submitRecharge(orderId, "已完成银行转账，等待管理员确认到账。");
+      await refreshWallet();
+      setNotice("已提交转账确认，等待管理员审核到账");
+    } catch (error) {
+      setRechargeError(messageOf(error));
+    }
+  }
+
+  async function cancelRechargeOrder(orderId: string): Promise<void> {
+    try {
+      await api.cancelRecharge(orderId);
+      await refreshWallet();
+      setNotice("已取消充值订单");
+    } catch (error) {
+      setRechargeError(messageOf(error));
     }
   }
 
@@ -1170,6 +1196,14 @@ function App(): JSX.Element {
     }
   }
 
+  async function refreshAdminRechargeOrders(): Promise<void> {
+    try {
+      setAdminRechargeOrders(await api.adminRechargeOrders());
+    } catch (error) {
+      setNotice(`刷新充值订单失败：${messageOf(error)}`);
+    }
+  }
+
   async function moderateAgent(agentId: string, action: "dismiss" | "unpublish" | "archive"): Promise<void> {
     const note = action === "dismiss"
       ? "管理员审核后保留"
@@ -1203,6 +1237,21 @@ function App(): JSX.Element {
       setNotice(action === "dismiss" ? "已通过该 Skill 的举报审核" : action === "unpublish" ? "已下架该 Skill" : "已归档该 Skill");
     } catch (error) {
       setNotice(`处理待审核 Skill 失败：${messageOf(error)}`);
+    } finally {
+      setAdminReviewBusyId(null);
+    }
+  }
+
+  async function resolveRechargeOrder(orderId: string, action: "confirm" | "reject"): Promise<void> {
+    const note = action === "confirm" ? "管理员已确认银行转账到账" : "管理员驳回充值订单";
+    setAdminReviewBusyId(`recharge:${orderId}`);
+    try {
+      await api.resolveRechargeOrder(orderId, action, note);
+      await refreshAdminRechargeOrders();
+      await refreshWallet();
+      setNotice(action === "confirm" ? "充值订单已确认并入账" : "充值订单已驳回");
+    } catch (error) {
+      setNotice(`处理充值订单失败：${messageOf(error)}`);
     } finally {
       setAdminReviewBusyId(null);
     }
@@ -1693,12 +1742,15 @@ function App(): JSX.Element {
             <WalletPage
               summary={walletSummary}
               currentUser={auth?.user ?? null}
+              rechargeConfig={rechargeConfig}
               rechargeForm={rechargeForm}
               setRechargeForm={setRechargeForm}
               rechargeBusy={rechargeBusy}
               rechargeError={rechargeError}
               onRefresh={() => void refreshWallet()}
               onRecharge={() => void rechargeWallet()}
+              onSubmitRecharge={(id) => void submitRechargeOrder(id)}
+              onCancelRecharge={(id) => void cancelRechargeOrder(id)}
             />
           )}
 
@@ -1754,6 +1806,27 @@ function App(): JSX.Element {
                         <button disabled={adminReviewBusyId === `skill:${item.skill.skillId}`} onClick={() => void moderateSkill(item.skill.skillId, "dismiss")}><Check size={15} />通过</button>
                         <button disabled={adminReviewBusyId === `skill:${item.skill.skillId}`} onClick={() => void moderateSkill(item.skill.skillId, "unpublish")}><ShieldCheck size={15} />下架</button>
                         <button disabled={adminReviewBusyId === `skill:${item.skill.skillId}`} onClick={() => void moderateSkill(item.skill.skillId, "archive")}><Trash2 size={15} />归档</button>
+                      </footer>
+                    </article>
+                  ))}
+                </div>
+                <div className="panel admin-review-panel">
+                  <div className="panel-title-row">
+                    <h3>待确认充值</h3>
+                    <button onClick={() => void refreshAdminRechargeOrders()}><RefreshCw size={16} />刷新订单</button>
+                  </div>
+                  {adminRechargeOrders.length === 0 && <div className="quiet-empty">暂无待确认充值订单。</div>}
+                  {adminRechargeOrders.map((order) => (
+                    <article key={order.id} className="admin-review-card">
+                      <div>
+                        <strong>{order.orderNo}<small>{rechargeStatusLabel(order.status)}</small></strong>
+                        <p>{order.user.displayName} @{order.user.username} · {formatTokenCount(order.amountTokens)} Token · 应转 {formatCny(order.payableCny)}</p>
+                        <span>附言 {order.paymentReference} · 到期 {formatDateTime(order.expiresAt)}</span>
+                        <em>{order.payerNote || "用户尚未填写转账说明。"}</em>
+                      </div>
+                      <footer>
+                        <button disabled={adminReviewBusyId === `recharge:${order.id}`} onClick={() => void resolveRechargeOrder(order.id, "confirm")}><Check size={15} />确认到账</button>
+                        <button disabled={adminReviewBusyId === `recharge:${order.id}`} onClick={() => void resolveRechargeOrder(order.id, "reject")}><X size={15} />驳回</button>
                       </footer>
                     </article>
                   ))}
@@ -2050,17 +2123,21 @@ function ToolPage(props: { title: string; subtitle: string; children: React.Reac
 function WalletPage(props: {
   summary: WalletSummary | null;
   currentUser: LoginUser | null;
+  rechargeConfig: RechargeConfig | null;
   rechargeForm: { amount: string; unit: RechargeUnit };
   setRechargeForm: (next: { amount: string; unit: RechargeUnit }) => void;
   rechargeBusy: boolean;
   rechargeError: string;
   onRefresh: () => void;
   onRecharge: () => void;
+  onSubmitRecharge: (id: string) => void;
+  onCancelRecharge: (id: string) => void;
 }): JSX.Element {
   const summary = props.summary;
-  const canRecharge = props.currentUser?.username === "chen_zy";
+  const canRecharge = Boolean(props.rechargeConfig?.allowed);
   const factor = props.rechargeForm.unit === "m" ? 1_000_000 : props.rechargeForm.unit === "k" ? 1_000 : 1;
   const preview = Number(props.rechargeForm.amount) * factor;
+  const account = props.rechargeConfig?.paymentAccount ?? summary?.rechargeOrders.find((order) => order.paymentAccount)?.paymentAccount;
   return <ToolPage title="Token 钱包" subtitle="查看模型消耗、Agent 服务费、创作者收益和试点充值记录。所有记录均来自服务器账本。">
     <div className="wallet-page">
       <section className="wallet-balance-band">
@@ -2069,8 +2146,8 @@ function WalletPage(props: {
       </section>
       <section className={canRecharge ? "wallet-recharge-card" : "wallet-recharge-card disabled"}>
         <div>
-          <strong>试点充值</strong>
-          <p>{canRecharge ? "当前仅 chen_zy 账号可用。收款账户配置前，充值会直接写入平台 Token 账本。" : "当前测试阶段只开放 chen_zy 账号充值。"}</p>
+          <strong>银行转账充值</strong>
+          <p>{canRecharge ? `当前汇率 ${formatCny(props.rechargeConfig?.cnyPerMToken ?? 1)} / 1M Token。创建订单后按唯一附言转账，管理员确认到账后入账。` : `当前测试阶段只开放 ${props.rechargeConfig?.allowedUsername ?? "指定账号"} 充值。`}</p>
         </div>
         <div className="wallet-recharge-form">
           <input
@@ -2094,7 +2171,12 @@ function WalletPage(props: {
           </select>
           <button className="primary-button" disabled={!canRecharge || props.rechargeBusy} onClick={props.onRecharge}><WalletCards size={16} />{props.rechargeBusy ? "处理中" : "充值"}</button>
         </div>
-        <small>{Number.isFinite(preview) && preview > 0 ? `预计到账 ${formatTokenCount(preview)} Token` : "请输入充值数量"}</small>
+        <small>{Number.isFinite(preview) && preview > 0 ? `预计到账 ${formatTokenCount(preview)} Token，应转账 ${formatCny(((preview / 1_000_000) * (props.rechargeConfig?.cnyPerMToken ?? 1)))}` : "请输入充值数量"}</small>
+        {account && <div className="wallet-bank-account">
+          <span>{account.bankName}</span>
+          <strong>{account.accountName}</strong>
+          <code>{account.accountNumber ?? account.accountNumberMasked}</code>
+        </div>}
         <FieldError message={props.rechargeError} />
       </section>
       <div className="wallet-metrics">
@@ -2119,6 +2201,23 @@ function WalletPage(props: {
           {!summary?.agentEarnings.length && <div className="quiet-empty">公开 Agent 收到服务费后会显示在这里。</div>}
         </section>
       </div>
+      <section className="wallet-orders">
+        <header><ReceiptText size={17} /><strong>充值订单</strong></header>
+        {summary?.rechargeOrders.map((order) => (
+          <article key={order.id} className={`wallet-order ${order.status}`}>
+            <div>
+              <strong>{order.orderNo}<small>{rechargeStatusLabel(order.status)}</small></strong>
+              <p>{formatTokenCount(order.amountTokens)} Token · 应转 {formatCny(order.payableCny)} · 附言 <code>{order.paymentReference}</code></p>
+              <small>到期 {formatDateTime(order.expiresAt)}{order.adminNote ? ` · ${order.adminNote}` : ""}</small>
+            </div>
+            <footer>
+              {order.status === "pending" && <button onClick={() => props.onSubmitRecharge(order.id)}><Check size={15} />已转账</button>}
+              {order.status === "pending" && <button onClick={() => props.onCancelRecharge(order.id)}><X size={15} />取消</button>}
+            </footer>
+          </article>
+        ))}
+        {!summary?.rechargeOrders.length && <div className="quiet-empty">还没有充值订单。</div>}
+      </section>
     </div>
   </ToolPage>;
 }
@@ -3096,6 +3195,22 @@ function trimNumber(value: number): string {
   return value.toLocaleString("zh-CN", {
     maximumFractionDigits: value >= 100 ? 0 : value >= 10 ? 1 : 2
   });
+}
+
+function formatCny(value: number): string {
+  return `¥${Number(value || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function rechargeStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    pending: "待转账",
+    submitted: "待确认",
+    paid: "已入账",
+    rejected: "已驳回",
+    cancelled: "已取消",
+    expired: "已过期"
+  };
+  return labels[status] ?? status;
 }
 
 function tokenTransactionLabel(kind: TokenTransaction["kind"] | string): string {

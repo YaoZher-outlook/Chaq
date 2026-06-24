@@ -3782,6 +3782,29 @@ p {
   grid-column: 1 / -1;
 }
 
+.wallet-bank-account {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px dashed rgba(255, 255, 255, 0.16);
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.wallet-bank-account span,
+.wallet-bank-account code {
+  color: var(--muted);
+}
+
+.wallet-bank-account code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .wallet-recharge-form {
   display: grid;
   grid-template-columns: 110px 110px auto;
@@ -3840,7 +3863,8 @@ p {
 }
 
 .wallet-ledger,
-.wallet-earnings {
+.wallet-earnings,
+.wallet-orders {
   min-height: 0;
   overflow: auto;
   border: 1px solid var(--line);
@@ -3849,7 +3873,8 @@ p {
 }
 
 .wallet-ledger > header,
-.wallet-earnings > header {
+.wallet-earnings > header,
+.wallet-orders > header {
   position: sticky;
   top: 0;
   z-index: 1;
@@ -3863,7 +3888,8 @@ p {
 }
 
 .wallet-ledger article,
-.wallet-earnings article {
+.wallet-earnings article,
+.wallet-orders article {
   min-width: 0;
   display: grid;
   align-items: center;
@@ -3894,6 +3920,46 @@ p {
 
 .wallet-earnings article {
   grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.wallet-orders {
+  max-height: 260px;
+}
+
+.wallet-order {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.wallet-order div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.wallet-order strong {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.wallet-order strong small {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.wallet-order p,
+.wallet-order small {
+  margin: 0;
+  color: var(--muted);
+}
+
+.wallet-order code {
+  color: var(--text);
+}
+
+.wallet-order footer {
+  display: flex;
+  gap: 8px;
 }
 
 .wallet-earnings article > span,
@@ -4521,6 +4587,15 @@ textarea[aria-invalid="true"] {
 
   .wallet-recharge-form {
     grid-template-columns: minmax(0, 1fr) 104px auto;
+  }
+
+  .wallet-bank-account,
+  .wallet-order {
+    grid-template-columns: 1fr;
+  }
+
+  .wallet-order footer {
+    justify-content: flex-start;
   }
 
   .wallet-columns,

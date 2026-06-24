@@ -31,6 +31,15 @@ const rechargeSchema = z.object({
   note: z.string().max(300).optional()
 });
 
+const rechargeSubmitSchema = z.object({
+  payerNote: z.string().max(300).default("")
+});
+
+const rechargeModerationSchema = z.object({
+  action: z.enum(["confirm", "reject"]),
+  note: z.string().max(500).default("")
+});
+
 const settingsSchema = z.object({
   language: z.enum(["zh", "en"]).optional(),
   theme: z.enum(["light", "dark", "system"]).optional(),
@@ -72,10 +81,36 @@ export class UsersController {
     return this.users.walletSummary(userId);
   }
 
+  @Get("me/recharge/config")
+  rechargeConfig(@CurrentUserId() userId: string) {
+    return this.users.rechargeConfig(userId);
+  }
+
   @Post("me/recharge")
   recharge(@CurrentUserId() userId: string, @Body() body: unknown) {
     const input = parseBody(rechargeSchema, body);
-    return this.users.rechargeTokens(userId, { ...input, unit: input.unit ?? "m" });
+    return this.users.createRechargeOrder(userId, { ...input, unit: input.unit ?? "m" });
+  }
+
+  @Post("me/recharge/:id/submit")
+  submitRecharge(@CurrentUserId() userId: string, @Param("id") id: string, @Body() body: unknown) {
+    return this.users.submitRechargeOrder(userId, id, parseBody(rechargeSubmitSchema, body).payerNote ?? "");
+  }
+
+  @Post("me/recharge/:id/cancel")
+  cancelRecharge(@CurrentUserId() userId: string, @Param("id") id: string) {
+    return this.users.cancelRechargeOrder(userId, id);
+  }
+
+  @Get("admin/recharge/orders")
+  adminRechargeOrders(@CurrentUserId() userId: string) {
+    return this.users.adminRechargeOrders(userId);
+  }
+
+  @Post("admin/recharge/orders/:id/resolve")
+  resolveRechargeOrder(@CurrentUserId() userId: string, @Param("id") id: string, @Body() body: unknown) {
+    const input = parseBody(rechargeModerationSchema, body);
+    return this.users.moderateRechargeOrder(userId, id, input.action, input.note ?? "");
   }
 
   @Get("me/settings")

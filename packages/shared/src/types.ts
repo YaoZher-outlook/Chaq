@@ -7,6 +7,7 @@ export type MessageRole = "user" | "assistant" | "system";
 export type ReactionTarget = "skill" | "comment";
 export type ReactionValue = "up" | "down";
 export type TokenTransactionKind = "recharge" | "cloud_model_usage" | "agent_model_usage" | "agent_service_fee" | "agent_service_earning" | "refund" | "admin_adjustment";
+export type RechargeOrderStatus = "pending" | "submitted" | "paid" | "rejected" | "cancelled" | "expired";
 export type SkillAutoMessageMode = "fixed" | "random";
 export type SkillAutoMessagePeriod = "day" | "week" | "month";
 export type ProviderKind =
@@ -180,6 +181,55 @@ export interface TokenTransaction {
   createdAt: string;
 }
 
+export interface RechargePaymentAccount {
+  bankName: string;
+  accountName: string;
+  accountNumberMasked: string;
+  accountNumber?: string;
+}
+
+export interface RechargeOrder {
+  id: Id;
+  orderNo: string;
+  userId: Id;
+  status: RechargeOrderStatus;
+  amountTokens: number;
+  requestedAmount: number;
+  requestedUnit: "token" | "k" | "m";
+  payableCny: number;
+  paymentMethod: "bank_transfer";
+  paymentReference: string;
+  paymentAccount?: RechargePaymentAccount;
+  payerNote?: string | null;
+  adminNote?: string | null;
+  paidTransactionId?: Id | null;
+  submittedAt?: string | null;
+  reviewedAt?: string | null;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RechargeConfig {
+  enabled: boolean;
+  allowed: boolean;
+  allowedUsername: string;
+  cnyPerMToken: number;
+  minMToken: number;
+  maxMToken: number;
+  orderExpiresMinutes: number;
+  paymentAccount?: RechargePaymentAccount;
+}
+
+export interface AdminRechargeOrder extends RechargeOrder {
+  user: {
+    id: Id;
+    username: string;
+    email?: string | null;
+    displayName: string;
+  };
+}
+
 export interface WalletSummary {
   balance: number;
   totalSpent: number;
@@ -193,6 +243,7 @@ export interface WalletSummary {
     transactionCount: number;
   }>;
   transactions: TokenTransaction[];
+  rechargeOrders: RechargeOrder[];
 }
 
 export interface CloudChatRequest {

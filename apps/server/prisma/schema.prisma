@@ -66,6 +66,15 @@ enum TokenTransactionKind {
   ADMIN_ADJUSTMENT
 }
 
+enum RechargeOrderStatus {
+  PENDING
+  SUBMITTED
+  PAID
+  REJECTED
+  CANCELLED
+  EXPIRED
+}
+
 enum ProviderKind {
   OPENAI
   ANTHROPIC
@@ -257,6 +266,8 @@ model User {
   reactions          Reaction[]
   favorites          Favorite[]
   tokenTransactions  TokenTransaction[]
+  rechargeOrders     RechargeOrder[]
+  reviewedRechargeOrders RechargeOrder[] @relation("RechargeOrderReviewer")
   modelCallLogs      ModelCallLog[]
   modelProviders     ModelProviderConfig[]
   sessions           AuthSession[]
@@ -483,6 +494,34 @@ model TokenTransaction {
   createdAt    DateTime             @default(now())
 
   @@index([userId, createdAt])
+}
+
+model RechargeOrder {
+  id                String              @id @default(cuid())
+  orderNo           String              @unique
+  userId            String
+  user              User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status            RechargeOrderStatus @default(PENDING)
+  amountTokens      Int
+  requestedAmount   Float
+  requestedUnit     String
+  payableCny        Float
+  paymentMethod     String              @default("bank_transfer")
+  paymentReference  String              @unique
+  payerNote         String              @default("")
+  adminNote         String              @default("")
+  reviewedById      String?
+  reviewedBy        User?               @relation("RechargeOrderReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  paidTransactionId String?
+  submittedAt       DateTime?
+  reviewedAt        DateTime?
+  expiresAt         DateTime
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@index([expiresAt])
 }
 
 model ModelProviderConfig {
