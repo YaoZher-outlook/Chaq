@@ -22,7 +22,7 @@ import {
 } from "lucide-react";
 import type { AgentPost, AgentProfile, ConversationMessage } from "@chaq/shared";
 import { api, type LoginUser } from "../lib/api";
-import defaultCoverUrl from "../assets/agent-profile-cover.png";
+import defaultCoverUrl from "../assets/agent-profile-cover-v2.png";
 
 type ProfileTab = "posts" | "about" | "activity";
 

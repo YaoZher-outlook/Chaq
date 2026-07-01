@@ -592,6 +592,7 @@ export class AgentsService {
 
   async addGoal(userId: string, agentId: string, input: any) {
     await this.ownedAgent(userId, agentId);
+    await this.assertGoalBelongsToAgent(agentId, input.parentGoalId, "Parent goal");
     const row = await this.prisma.agentGoal.create({
       data: {
         agentId,
@@ -611,6 +612,10 @@ export class AgentsService {
 
   async updateGoal(userId: string, agentId: string, goalId: string, input: any) {
     await this.ownedAgent(userId, agentId);
+    if (input.parentGoalId !== undefined) {
+      if (input.parentGoalId === goalId) throw new BadRequestException("A goal cannot be its own parent.");
+      await this.assertGoalBelongsToAgent(agentId, input.parentGoalId, "Parent goal");
+    }
     const changed = await this.prisma.agentGoal.updateMany({
       where: { id: goalId, agentId },
       data: {
@@ -633,6 +638,7 @@ export class AgentsService {
 
   async addTask(userId: string, agentId: string, input: any) {
     await this.ownedAgent(userId, agentId);
+    await this.assertGoalBelongsToAgent(agentId, input.goalId);
     const row = await this.prisma.agentTask.create({
       data: {
         agentId,
@@ -833,6 +839,7 @@ export class AgentsService {
   async runNow(userId: string, agentId: string, conversationId?: string) {
     const agent = await this.ownedAgent(userId, agentId);
     if (agent.status !== AgentStatus.ACTIVE) throw new BadRequestException("Agent must be active before it can run.");
+    await this.assertConversationIncludesAgent(agentId, conversationId);
     const row = await this.prisma.agentRun.create({
       data: { agentId, conversationId, trigger: AgentRunTrigger.MANUAL, status: AgentRunStatus.QUEUED }
     });
@@ -853,6 +860,29 @@ export class AgentsService {
     const agent = await this.prisma.agent.findFirst({ where: { id, ownerId: userId } });
     if (!agent) throw new NotFoundException("Agent not found.");
     return agent;
+  }
+
+  private async assertGoalBelongsToAgent(agentId: string, goalId: string | null | undefined, label = "Goal"): Promise<void> {
+    if (!goalId) return;
+    const goal = await this.prisma.agentGoal.findFirst({
+      where: { id: goalId, agentId },
+      select: { id: true }
+    });
+    if (!goal) throw new NotFoundException(`${label} not found.`);
+  }
+
+  private async assertConversationIncludesAgent(agentId: string, conversationId: string | null | undefined): Promise<void> {
+    if (!conversationId) return;
+    const conversation = await this.prisma.conversation.findFirst({
+      where: {
+        id: conversationId,
+        participants: {
+          some: { participantKind: ParticipantKind.AGENT, participantId: agentId }
+        }
+      },
+      select: { id: true }
+    });
+    if (!conversation) throw new NotFoundException("Conversation not found for this agent.");
   }
 
   private async profileAccess(userId: string, id: string) {

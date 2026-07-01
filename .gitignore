@@ -10,6 +10,7 @@ release/
 .npm-cache/
 coverage/
 *.log
+.logs/
 .env
 .env.local
 *.db

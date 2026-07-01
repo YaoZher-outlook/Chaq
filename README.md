@@ -25,22 +25,24 @@ Requirements: Node.js 20.11+, PostgreSQL binaries configured under `E:\Environme
 On Windows, use:
 
 ```bat
-tools\start-server.bat
+tools\start-server-dev.bat
+tools\start-server-prod.bat
 tools\start-client.bat
 ```
 
-Start the server first. `start-server.bat` prepares the environment, starts PostgreSQL and Redis, applies migrations, then launches both the NestJS API and Agent worker. `start-client.bat` launches the Electron desktop app. `tools\start-all.bat` starts both in local-only mode.
+Start the server first. `start-server-dev.bat` prepares the environment, starts PostgreSQL and Redis, applies migrations, then launches both the NestJS API and Agent worker in watch mode on `127.0.0.1:24537`. `start-server-prod.bat` builds and starts the production API and Agent worker on `0.0.0.0:24538`, keeps them in the same console window, and mirrors output into `.logs`. `start-client.bat` launches the packaged Electron desktop app and rebuilds it when desktop source files are newer than the packaged executable.
 
-There are two server bind strategies:
+There are two server modes:
 
-- Local/non-tunnel mode: `tools\start-server.bat` or `tools\start-all.bat`, binding the API to `127.0.0.1:24537`.
-- Exposed LAN/proxy mode: `tools\start-server-public.bat` or `tools\start-all-public.bat`, binding the API to `0.0.0.0:24537` so Cloudflare Tunnel, a reverse proxy, or another machine can reach it.
+- Development server: `tools\start-server-dev.bat`, binding the API to `127.0.0.1:24537`.
+- Production server: `tools\start-server-prod.bat`, binding the API to `0.0.0.0:24538` so Cloudflare Tunnel, a reverse proxy, or another machine can reach it.
 
-The Windows launchers are idempotent: running them again while Chaq is healthy exits successfully instead of starting duplicate API, worker, Vite, or Electron processes. A port owned by a non-Chaq process is still reported as a real conflict.
+The server launchers keep their console window open while the API and Agent worker are running. Close that window or press `Ctrl+C` to stop the server. Running a launcher again while Chaq is already healthy exits successfully instead of starting duplicate API or worker processes. A port owned by a non-Chaq process is still reported as a real conflict.
 
 Default ports:
 
-- API: `24537`
+- Development API: `24537`
+- Production/public API: `24538`
 - Electron renderer: `27337`
 - PostgreSQL: `45432`
 - Redis: `46379`

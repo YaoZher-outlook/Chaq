@@ -8,6 +8,7 @@ import { RateLimitService } from "./common/rate-limit.service";
 import { RealtimeService } from "./common/realtime.service";
 
 type ExpressMiddleware = (request: unknown, response: unknown, next: () => void) => void;
+type CorsOriginCallback = (error: Error | null, allow?: boolean) => void;
 const expressBody = require("express") as {
   json: (options: { limit: string }) => ExpressMiddleware;
   urlencoded: (options: { extended: boolean; limit: string }) => ExpressMiddleware;
@@ -31,8 +32,24 @@ async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule, { bodyParser: false, logger });
   app.use(expressBody.json({ limit: "12mb" }));
   app.use(expressBody.urlencoded({ extended: true, limit: "12mb" }));
+  const configuredOrigins = new Set(
+    (process.env.CLIENT_ORIGIN || "http://localhost:27337")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean)
+  );
   app.enableCors({
-    origin: process.env.CLIENT_ORIGIN?.split(",").map((value) => value.trim()).filter(Boolean) ?? ["http://localhost:27337"],
+    origin: (origin: string | undefined, callback: CorsOriginCallback) => {
+      if (!origin || origin === "null" || origin.startsWith("file://")) {
+        callback(null, true);
+        return;
+      }
+      if (configuredOrigins.has(origin) || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(null, false);
+    },
     credentials: true,
     allowedHeaders: ["content-type", "x-session-token"]
   });

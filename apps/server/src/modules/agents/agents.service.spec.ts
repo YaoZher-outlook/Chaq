@@ -52,3 +52,62 @@ test("knowledge search preview ranks chunks and exposes embedding diagnostics", 
   assert.equal(result.results[0]?.sourceKind, "note");
   assert.equal(result.results[0]?.keywordScore, 2);
 });
+
+test("agent tasks cannot attach to another agent's goal", async () => {
+  const prisma = {
+    agent: {
+      findFirst: async () => ({ id: "agent-1", ownerId: "owner-1" })
+    },
+    agentGoal: {
+      findFirst: async () => null
+    },
+    agentTask: {
+      create: async () => {
+        throw new Error("task should not be created");
+      }
+    }
+  };
+
+  const service = new AgentsService(prisma as never, {} as never, {} as never, {} as never);
+
+  await assert.rejects(
+    service.addTask("owner-1", "agent-1", {
+      goalId: "other-agent-goal",
+      title: "Follow up",
+      description: "",
+      priority: 50,
+      scheduledFor: null
+    }),
+    /Goal not found/
+  );
+});
+
+test("manual agent runs can only bind conversations that include the agent", async () => {
+  let createdRun = false;
+  const prisma = {
+    agent: {
+      findFirst: async () => ({ id: "agent-1", ownerId: "owner-1", status: "ACTIVE" })
+    },
+    conversation: {
+      findFirst: async () => null
+    },
+    agentRun: {
+      create: async () => {
+        createdRun = true;
+      }
+    }
+  };
+  const queue = {
+    enqueueRun: async () => {
+      throw new Error("run should not be queued");
+    }
+  };
+
+  const service = new AgentsService(prisma as never, {} as never, {} as never, queue as never);
+
+  await assert.rejects(
+    service.runNow("owner-1", "agent-1", "conversation-without-agent"),
+    /Conversation not found for this agent/
+  );
+  assert.equal(createdRun, false);
+});

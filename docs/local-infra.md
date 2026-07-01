@@ -12,7 +12,8 @@ Chaq development infrastructure uses local PostgreSQL and Docker Redis. `E:\Envi
 
 ## Ports
 
-- API server: `127.0.0.1:24537`
+- Development API server: `127.0.0.1:24537`
+- Production/public API server: `0.0.0.0:24538`
 - Desktop renderer: `127.0.0.1:27337`
 - PostgreSQL: `127.0.0.1:45432`
 - Redis: `127.0.0.1:46379`
@@ -34,9 +35,11 @@ psql "host=127.0.0.1 port=45432 user=chaq dbname=chaq password=chaq"
 
 ## Startup
 
-Use `tools\start-all.bat` to open both server and desktop windows.
+Use `tools\start-server-dev.bat` to start the development API and Agent worker, then use `tools\start-client.bat` to open the desktop client.
 
-`tools\start-server.bat` prepares the local environment, starts local PostgreSQL, starts Docker Redis with `docker compose up -d redis`, applies migrations, seeds users, then starts the NestJS API server.
+`tools\start-server-dev.bat` prepares the local environment, starts local PostgreSQL, starts Docker Redis with `docker compose up -d redis`, applies migrations, then starts the NestJS API server and Agent worker in watch mode.
+
+For production/public binding, use `tools\start-server-prod.bat`. It starts the production API and Agent worker on `0.0.0.0:24538`, keeps the server processes in the same console window, and writes runtime logs to `.logs\api-prod.log` and `.logs\worker-prod.log`.
 
 The compose file only defines Redis. PostgreSQL is intentionally not managed by Docker for this project.
 

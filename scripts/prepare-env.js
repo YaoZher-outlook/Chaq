@@ -97,7 +97,14 @@ function writeServerEnv() {
     nextLines.push(`${key}=${value}`);
   }
 
-  fs.writeFileSync(serverEnv, `${nextLines.filter((line, index, lines) => line.trim() || index < lines.length - 1).join("\r\n")}\r\n`, "utf8");
+  const serverEnvText = `${nextLines.filter((line, index, lines) => line.trim() || index < lines.length - 1).join("\r\n")}\r\n`;
+  try {
+    fs.writeFileSync(serverEnv, serverEnvText, "utf8");
+  } catch (error) {
+    if (!fs.existsSync(serverEnv)) throw error;
+    console.warn(`[WARN] Could not rewrite ${serverEnv}; using the existing file.`);
+    console.warn(`[WARN] ${error instanceof Error ? error.message : String(error)}`);
+  }
   writeWorkspaceServerEnv(existingSecrets);
   writeSecretBackup(existingSecrets, generatedSecrets);
 }
@@ -142,7 +149,13 @@ function writeSecretBackup(allSecrets, generatedSecrets) {
     "",
     `Newly generated this run: ${[...generatedSecrets.keys()].join(", ")}`
   ];
-  fs.writeFileSync(require("node:path").join(desktop, "Chaq-server-secrets.txt"), `${lines.join("\r\n")}\r\n`, "utf8");
+  const backupPath = require("node:path").join(desktop, "Chaq-server-secrets.txt");
+  try {
+    fs.writeFileSync(backupPath, `${lines.join("\r\n")}\r\n`, "utf8");
+  } catch (error) {
+    console.warn(`[WARN] Could not write ${backupPath}.`);
+    console.warn(`[WARN] ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 writeServerEnv();

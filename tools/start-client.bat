@@ -5,8 +5,10 @@ chcp 65001 >nul
 set "ROOT=%~dp0.."
 cd /d "%ROOT%"
 
+set "EXE=apps\desktop\release\win-unpacked\Chaq.exe"
+
 echo [Chaq] Starting desktop client...
-echo [Chaq] For marketplace and cloud-model features, run tools\start-server.bat in another window.
+echo [Chaq] API auto-detect: http://127.0.0.1:24538/api, fallback http://127.0.0.1:24537/api
 
 where node >nul 2>nul
 if errorlevel 1 (
@@ -15,6 +17,20 @@ if errorlevel 1 (
   exit /b 1
 )
 
+node scripts\check-api-ready.js 24538 24537
+if errorlevel 1 (
+  echo [Chaq] No ready API was found. Restarting production API server first...
+  node scripts\start-production-server.js --restart --public
+  if errorlevel 1 goto :fail
+)
+
+if "%CHAQ_REBUILD_CLIENT%"=="1" goto :package
+if not exist "%EXE%" goto :package
+powershell.exe -NoProfile -Command "$exe = Get-Item '%EXE%' -ErrorAction SilentlyContinue; $latest = Get-ChildItem 'apps\desktop\src','packages\shared\src' -Recurse -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if (-not $exe -or ($latest -and $latest.LastWriteTime -gt $exe.LastWriteTime)) { exit 1 }"
+if errorlevel 1 goto :package
+goto :launch
+
+:package
 where npm.cmd >nul 2>nul
 if errorlevel 1 (
   echo [ERROR] npm.cmd was not found in PATH.
@@ -22,39 +38,20 @@ if errorlevel 1 (
   exit /b 1
 )
 
-set "npm_config_electron_mirror="
-set "npm_config_electron_config_cache="
-set "ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/"
-set "ELECTRON_CACHE=E:\Environment\Chaq\electron-cache"
-set "electron_config_cache=E:\Environment\Chaq\electron-cache"
-set "CHAQ_RUNTIME_CACHE=E:\Environment\Chaq\runtime-cache-v2"
-
-call npm.cmd run env:prepare
+echo [Chaq] Building packaged desktop client...
+call npm.cmd run build -w @chaq/shared
 if errorlevel 1 goto :fail
-
-node scripts\check-ports.js desktop 27337 --running >nul 2>nul
-if not errorlevel 1 (
-  echo [Chaq] Desktop client is already running. No second instance was started.
-  exit /b 0
-)
-
-if not exist "node_modules" (
-  echo [Chaq] node_modules not found. Installing dependencies...
-  call npm.cmd install
-  if errorlevel 1 goto :fail
-)
-
-if not exist "node_modules\electron\dist\electron.exe" (
-  echo [Chaq] Electron runtime not found. Installing Electron runtime...
-  call npm.cmd run electron:install
-  if errorlevel 1 goto :fail
-)
-
-echo [Chaq] Desktop renderer will use http://localhost:27337
-call npm.cmd run dev:desktop
+call npm.cmd run package -w @chaq/desktop
 if errorlevel 1 goto :fail
+if not exist "%EXE%" goto :missing
 
+:launch
+start "Chaq" "%EXE%"
 exit /b 0
+
+:missing
+echo [ERROR] Packaged desktop executable was not found at %EXE%.
+goto :fail
 
 :fail
 echo [ERROR] Chaq desktop startup failed.

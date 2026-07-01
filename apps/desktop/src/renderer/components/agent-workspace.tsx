@@ -399,6 +399,7 @@ function AgentChat(props: {
 }): JSX.Element {
   const listRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [bottomPulse, setBottomPulse] = useState(false);
   const bottomPulseTimer = useRef<number | null>(null);
@@ -443,6 +444,10 @@ function AgentChat(props: {
     window.requestAnimationFrame(() => scrollToBottom(props.messages.length > 1 ? "smooth" : "auto"));
   }, [props.messages.length, props.thinking, isAtBottom]);
 
+  useEffect(() => {
+    textareaRef.current?.focus();
+  }, [props.agent.id]);
+
   return <div className="agent-chat">
     <div ref={listRef} className={bottomPulse ? "agent-message-list bottom-pulse" : "agent-message-list"} onScroll={updateScrollState}>
       {props.messages.map((message) => {
@@ -453,14 +458,16 @@ function AgentChat(props: {
           {mine && <span className="agent-user-avatar">{props.user.displayName.slice(0, 1).toUpperCase()}</span>}
         </div>;
       })}
+      {props.busy && !props.thinking && <div className="agent-chat-thinking"><AgentAvatar agent={props.agent} /><div className="agent-typing"><i /><i /><i /><span>正在发送消息</span></div></div>}
       {props.thinking && <div className="agent-chat-thinking"><AgentAvatar agent={props.agent} /><div className="agent-typing"><i /><i /><i /><span>{props.agent.name} 正在思考</span></div></div>}
-      {!props.messages.length && <div className="agent-chat-empty"><Bot size={32} /><strong>{props.agent.name}</strong></div>}
+      {!props.messages.length && <div className="agent-chat-empty"><Bot size={32} /><strong>{props.agent.name}</strong><span>发送第一条消息，或点击运行让 Agent 主动观察当前上下文。</span></div>}
       <div ref={endRef} />
       {!isAtBottom && <button className="agent-scroll-bottom" type="button" onClick={() => { scrollToBottom(); setIsAtBottom(true); }}><ArrowDown size={15} />到底部</button>}
     </div>
     <form className="agent-composer" onSubmit={props.onSubmit}>
       <div className="agent-composer-input">
         <textarea
+          ref={textareaRef}
           value={props.composer}
           maxLength={CHAT_COMPOSER_MAX_LENGTH}
           onChange={(event) => updateComposer(event.target.value)}

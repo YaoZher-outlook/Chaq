@@ -50,10 +50,16 @@ export class ConversationsService {
     const agent = await this.prisma.agent.findFirst({
       where: {
         id: agentId,
-        OR: [{ ownerId: userId }, { visibility: { in: [AgentVisibility.PUBLIC, AgentVisibility.UNLISTED] } }]
+        OR: [
+          { ownerId: userId },
+          { status: AgentStatus.ACTIVE, visibility: { in: [AgentVisibility.PUBLIC, AgentVisibility.UNLISTED] } }
+        ]
       }
     });
     if (!agent) throw new NotFoundException("Agent not found.");
+    if (agent.ownerId !== userId && agent.status !== AgentStatus.ACTIVE) {
+      throw new NotFoundException("Agent not found.");
+    }
     if (agent.ownerId !== userId) {
       const contact = await this.prisma.agentContact.findUnique({
         where: { userId_agentId: { userId, agentId } },

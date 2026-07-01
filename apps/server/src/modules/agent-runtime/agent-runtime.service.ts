@@ -453,6 +453,13 @@ export class AgentRuntimeService {
     if (action.type === "create_task") {
       if (!action.title) throw new Error("Task title is required.");
       return this.executeDatabaseAction(state, action, idempotencyKey, async (tx) => {
+        if (action.goalId) {
+          const goal = await tx.agentGoal.findFirst({
+            where: { id: action.goalId, agentId: agent.id },
+            select: { id: true }
+          });
+          if (!goal) throw new Error("Goal not found.");
+        }
         const task = await tx.agentTask.create({
           data: {
             agentId: agent.id,
@@ -604,6 +611,11 @@ export class AgentRuntimeService {
       }
     });
     if (!run) throw new NotFoundException("Agent run not found.");
+    if (run.conversation && !run.conversation.participants.some((participant) =>
+      participant.participantKind === ParticipantKind.AGENT && participant.participantId === run.agentId
+    )) {
+      throw new Error("Run conversation does not include this agent.");
+    }
     const messages = (run.conversation?.messages ?? []).reverse();
     const query = messages.slice(-8).map((message) => message.content).join(" ");
     const chunks = await this.prisma.agentKnowledgeChunk.findMany({

@@ -72,8 +72,9 @@ import { heuristicDraftFromMessages, parseImport } from "./lib/importParser";
 import { providerKinds, userModelPresets } from "./lib/provider-presets";
 import { MagneticButton, ShinyText, SpotlightCard } from "./components/react-bits";
 import { AgentWorkspace } from "./components/agent-workspace";
-import coverUrl from "./assets/chaq-cover.png";
-import loginBgUrl from "./assets/chaq-login-bg.png";
+import coverUrl from "./assets/chaq-cover-v2.png";
+import defaultAvatarUrl from "./assets/chaq-default-avatar-v2.png";
+import loginBgUrl from "./assets/chaq-login-bg-v2.png";
 import "./styles.css";
 
 type View = "agents" | "chat" | "skill-editor" | "import" | "market" | "wallet" | "models" | "admin" | "settings";
@@ -83,7 +84,15 @@ type SettingsCategory = "general" | "appearance" | "messages" | "storage" | "dis
 type SkillKind = "friend" | "expert" | "partner" | "custom";
 type LoginMode = "login" | "register";
 type RechargeUnit = "token" | "k" | "m";
+type ServerStatus = "checking" | "online" | "offline";
+type NoticeTone = "info" | "success" | "error";
 type WindowAnchorRect = { x: number; y: number; width: number; height: number };
+type NoticeToastState = {
+  id: number;
+  message: string;
+  tone: NoticeTone;
+  visible: boolean;
+};
 type UserModelFormState = {
   id: string;
   kind: ProviderKind;
@@ -117,7 +126,7 @@ type RememberedAccount = {
 
 const blankSkill: SkillDraft = {
   name: "新的 Skill",
-  avatarUrl: coverUrl,
+  avatarUrl: defaultAvatarUrl,
   description: "一个可以聊天、被导入和分享的虚拟好友。",
   persona: "温和、清醒、会接住用户的话，并主动帮助用户拆解问题。",
   tone: "自然、简洁，像熟悉的人一样回应。",
@@ -183,6 +192,9 @@ function App(): JSX.Element {
   const [newSkillSourceFile, setNewSkillSourceFile] = useState("");
   const [newSkillExpertField, setNewSkillExpertField] = useState("");
   const [notice, setNotice] = useState("准备就绪");
+  const [toast, setToast] = useState<NoticeToastState>({ id: 0, message: "", tone: "info", visible: false });
+  const [serverStatus, setServerStatus] = useState<ServerStatus>("checking");
+  const lastAnnouncedServerStatus = useRef<ServerStatus>("checking");
   const [busy, setBusy] = useState(false);
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
@@ -300,6 +312,51 @@ function App(): JSX.Element {
   useEffect(() => {
     void restoreSession();
   }, []);
+
+  useEffect(() => {
+    if (!notice || notice === "准备就绪") return undefined;
+    const id = Date.now();
+    const tone = noticeTone(notice);
+    setToast({ id, message: notice, tone, visible: true });
+    const timeout = window.setTimeout(() => {
+      setToast((current) => current.id === id ? { ...current, visible: false } : current);
+    }, tone === "error" ? 7200 : 4200);
+    return () => window.clearTimeout(timeout);
+  }, [notice]);
+
+  useEffect(() => {
+    if (!auth) {
+      setServerStatus("checking");
+      lastAnnouncedServerStatus.current = "checking";
+      return undefined;
+    }
+    let closed = false;
+    const applyServerStatus = (next: ServerStatus) => {
+      if (closed) return;
+      const previous = lastAnnouncedServerStatus.current;
+      setServerStatus(next);
+      if (previous !== next) {
+        if (next === "offline") setNotice("服务器暂时离线，部分云端功能可能不可用。");
+        if (previous === "offline" && next === "online") setNotice("服务器已重新连接。");
+        lastAnnouncedServerStatus.current = next;
+      }
+    };
+    const check = async () => {
+      try {
+        const ready = await api.healthReady();
+        applyServerStatus(ready ? "online" : "offline");
+      } catch {
+        applyServerStatus("offline");
+      }
+    };
+    setServerStatus("checking");
+    void check();
+    const timer = window.setInterval(() => void check(), 12_000);
+    return () => {
+      closed = true;
+      window.clearInterval(timer);
+    };
+  }, [auth?.user.id]);
 
   useEffect(() => () => {
     if (skillChatBottomPulseTimer.current) window.clearTimeout(skillChatBottomPulseTimer.current);
@@ -1259,10 +1316,15 @@ function App(): JSX.Element {
 
   async function saveSettings(next: Partial<UserSettings>): Promise<void> {
     previewSettings(next);
-    const saved = await api.saveSettings(next);
-    setAuth((current) => current ? { ...current, settings: saved } : current);
-    setSettingsDraft(saved);
-    applySettings(saved);
+    try {
+      const saved = await api.saveSettings(next);
+      setAuth((current) => current ? { ...current, settings: saved } : current);
+      setSettingsDraft(saved);
+      applySettings(saved);
+      setNotice("设置已保存。");
+    } catch (error) {
+      setNotice(`保存设置失败：${messageOf(error)}`);
+    }
   }
 
   async function sendProfileEmailCode(): Promise<void> {
@@ -1383,6 +1445,7 @@ function App(): JSX.Element {
             onLogout={() => void logout()}
           />
         </ToolPage>
+        <NoticeToast toast={toast} onClose={() => setToast((current) => ({ ...current, visible: false }))} />
       </div>
     );
   }
@@ -1393,6 +1456,7 @@ function App(): JSX.Element {
         <div className="window-drag-strip" aria-hidden="true" />
         <WindowButtons compact />
         <ProfileCard user={auth.user} onEdit={() => void openProfileEditWindow()} onLogout={() => void logout()} />
+        <NoticeToast toast={toast} onClose={() => setToast((current) => ({ ...current, visible: false }))} />
       </div>
     );
   }
@@ -1414,6 +1478,7 @@ function App(): JSX.Element {
           onChooseAvatar={() => void chooseProfileAvatar()}
           onSave={() => void saveProfile()}
         />
+        <NoticeToast toast={toast} onClose={() => setToast((current) => ({ ...current, visible: false }))} />
       </div>
     );
   }
@@ -1442,7 +1507,7 @@ function App(): JSX.Element {
                 }}
                 title={account.user.displayName}
               >
-                <img src={account.user.avatarUrl || coverUrl} alt="" onError={fallbackImage} />
+                <img src={account.user.avatarUrl || defaultAvatarUrl} alt="" onError={fallbackImage} />
               </button>
             ))}
             {rememberedAccounts.length === 0 && <div className="remembered-placeholder"><User size={42} /></div>}
@@ -1503,7 +1568,8 @@ function App(): JSX.Element {
         backgroundImage: `linear-gradient(rgba(18,18,24,var(--window-opacity)), rgba(18,18,24,var(--window-opacity))), url(${activeSettings?.backgroundUrl || coverUrl})`
       }}
     >
-      <TitleBar user={auth.user} />
+      <TitleBar user={auth.user} serverStatus={serverStatus} busy={busy} />
+      <GlobalBusyIndicator active={busy} />
       <div className={["agents", "wallet", "models", "admin", "settings"].includes(view) ? "app-body agent-mode" : "app-body"}>
         <aside className="icon-rail">
           <button
@@ -1511,7 +1577,7 @@ function App(): JSX.Element {
             title="个人资料"
             onClick={(event) => void openProfileWindow(rectToAnchor(event.currentTarget.getBoundingClientRect()))}
           >
-            <img src={auth.user.avatarUrl || coverUrl} alt="" onError={fallbackImage} /><span />
+            <img src={auth.user.avatarUrl || defaultAvatarUrl} alt="" onError={fallbackImage} /><span />
           </button>
           <RailButton active={view === "agents"} title="Agent OS" icon={<Bot />} onClick={() => setView("agents")} />
           <RailButton active={view === "import"} title="导入" icon={<Upload />} onClick={() => setView("import")} />
@@ -1529,15 +1595,23 @@ function App(): JSX.Element {
           <div className="skill-list-qq">
             {filteredSkills.map((skill) => (
               <MagneticButton key={skill.id} className={skill.id === selectedSkillId ? "skill-card active" : "skill-card"} onClick={() => openSkillEditor("profile", skill)}>
-                <img src={skill.avatarUrl || coverUrl} alt="" onError={fallbackImage} />
+                <img src={skill.avatarUrl || defaultAvatarUrl} alt="" onError={fallbackImage} />
                 <span><strong>{skill.name}</strong><small>{skill.description}</small></span>
                 <em>{formatSkillTime(skill.updatedAt)}</em>
               </MagneticButton>
             ))}
+            {filteredSkills.length === 0 && (
+              <div className="skill-list-empty">
+                <Bot size={24} />
+                <strong>{skills.length ? "没有匹配的 Skill" : "还没有 Skill"}</strong>
+                <span>{skills.length ? "换个关键词，或创建一个新的 Skill。" : "先创建一个 Skill，之后可以升级成 Agent。"}</span>
+                <button onClick={() => void addSkill()}><Plus size={15} />新建 Skill</button>
+              </div>
+            )}
           </div>
         </aside>}
 
-        <main className="content">
+        <main className={`content view-${view}`} aria-busy={busy}>
           {view === "agents" && (
             <AgentWorkspace user={auth.user} providers={agentProviders} skills={skills} onNotice={setNotice} />
           )}
@@ -1553,7 +1627,7 @@ function App(): JSX.Element {
               </header>
               <div ref={skillMessagePaneRef} className={skillChatBottomPulse ? "message-pane bottom-pulse" : "message-pane"} onScroll={updateSkillChatScrollState}>
                 {!selectedSkill && <div className="empty-chat"><img src={loginBgUrl} alt="" /><strong>还没有选择 Skill</strong><span>左侧列表会像 QQ 联系人一样展示你的 Skill。</span></div>}
-                {selectedSkill && messages.length === 0 && <div className="empty-chat"><img src={selectedSkill.avatarUrl || coverUrl} alt="" onError={fallbackImage} /><strong>还没有聊天</strong><span>向这个 Skill 发送第一句话。</span></div>}
+                {selectedSkill && messages.length === 0 && <div className="empty-chat"><img src={selectedSkill.avatarUrl || defaultAvatarUrl} alt="" onError={fallbackImage} /><strong>还没有聊天</strong><span>向这个 Skill 发送第一句话。</span></div>}
                 {messages.map((message) => (
                   <div key={message.id} className={`msg ${message.role}`}>
                     <div className="msg-bubble"><p>{message.content}</p>{message.modelLabel && <small>{message.modelLabel}</small>}</div>
@@ -1678,6 +1752,14 @@ function App(): JSX.Element {
                       </div>
                     </article>
                   ))}
+                  {marketItems.length === 0 && (
+                    <div className="market-empty-state">
+                      <Store size={26} />
+                      <strong>广场暂时没有结果</strong>
+                      <span>可以换个关键词，或先发布自己的 Skill。</span>
+                      <button onClick={() => void refreshMarketplace()}><RefreshCw size={15} />刷新</button>
+                    </div>
+                  )}
                 </div>
                 <div className="panel">
                   {selectedMarket ? (
@@ -1942,6 +2024,7 @@ function App(): JSX.Element {
 
         </main>
       </div>
+      <NoticeToast toast={toast} onClose={() => setToast((current) => ({ ...current, visible: false }))} />
     </div>
   );
 }
@@ -2103,12 +2186,46 @@ function WindowButtons({ compact = false }: { compact?: boolean }): JSX.Element 
   );
 }
 
-function TitleBar({ user }: { user: LoginUser }): JSX.Element {
+function TitleBar({ user, serverStatus, busy }: { user: LoginUser; serverStatus: ServerStatus; busy: boolean }): JSX.Element {
   return (
     <header className="title-bar">
       <div className="drag-title"><span className="qq-dot">Chaq</span><strong>{user.displayName}</strong><em>{roleLabel(user.role)}</em></div>
+      <div className="title-status" aria-live="polite">
+        <ServerStatusPill status={serverStatus} />
+        {busy && <span className="title-sync"><RefreshCw className="spin" size={13} />处理中</span>}
+      </div>
       <div className="title-actions"><WindowButtons /></div>
     </header>
+  );
+}
+
+function ServerStatusPill({ status }: { status: ServerStatus }): JSX.Element {
+  const label = status === "online" ? "服务器在线" : status === "offline" ? "服务器离线" : "检查连接";
+  const icon = status === "online"
+    ? <Check size={13} />
+    : status === "offline"
+      ? <AlertCircle size={13} />
+      : <RefreshCw className="spin" size={13} />;
+  return <span className={`server-status-pill ${status}`}>{icon}{label}</span>;
+}
+
+function GlobalBusyIndicator({ active }: { active: boolean }): JSX.Element {
+  return <div className={active ? "global-busy-bar active" : "global-busy-bar"} aria-hidden="true" />;
+}
+
+function NoticeToast(props: { toast: NoticeToastState; onClose: () => void }): JSX.Element | null {
+  if (!props.toast.message) return null;
+  const icon = props.toast.tone === "success"
+    ? <Check size={16} />
+    : props.toast.tone === "error"
+      ? <AlertCircle size={16} />
+      : <Bell size={16} />;
+  return (
+    <div className={props.toast.visible ? `notice-toast ${props.toast.tone} visible` : `notice-toast ${props.toast.tone}`} role="status">
+      <span>{icon}</span>
+      <p>{props.toast.message}</p>
+      <button className="icon-only-button" type="button" title="关闭提示" aria-label="关闭提示" onClick={props.onClose}><X size={15} /></button>
+    </div>
   );
 }
 
@@ -2226,7 +2343,7 @@ function ProfileCard({ user, onEdit, onLogout }: { user: LoginUser; onEdit: () =
   return (
     <SpotlightCard as="section" className="profile-card-window" spotlightColor="rgba(124, 168, 255, 0.16)">
       <header>
-        <img src={user.avatarUrl || coverUrl} alt="" onError={fallbackImage} />
+        <img src={user.avatarUrl || defaultAvatarUrl} alt="" onError={fallbackImage} />
         <h2>{user.displayName}</h2>
         <span>{roleLabel(user.role)}</span>
       </header>
@@ -2270,13 +2387,13 @@ function ProfileEditPanel(props: {
       </header>
       <div className="profile-edit-content">
         <aside>
-          <img src={props.form.avatarUrl || props.user.avatarUrl || coverUrl} alt="" onError={fallbackImage} />
+          <img src={props.form.avatarUrl || props.user.avatarUrl || defaultAvatarUrl} alt="" onError={fallbackImage} />
           <strong>{props.form.displayName || props.user.displayName}</strong>
           <span>UID {props.user.id}</span>
         </aside>
         <div className="profile-edit-form">
           <div className="profile-avatar-upload">
-            <img src={props.form.avatarUrl || props.user.avatarUrl || coverUrl} alt="" onError={fallbackImage} />
+            <img src={props.form.avatarUrl || props.user.avatarUrl || defaultAvatarUrl} alt="" onError={fallbackImage} />
             <div>
               <strong>头像</strong>
               <span>本地选择图片，保存后同步到账号资料。</span>
@@ -2346,7 +2463,7 @@ function SettingsPanel(props: {
         <button type="button" className={props.settingsSection === "storage" ? "active" : ""} onClick={() => props.openSettingsSection("storage")}><HardDrive size={16} />{text.storage}</button>
         <button type="button" className={props.settingsSection === "display" ? "active" : ""} onClick={() => props.openSettingsSection("display")}><SlidersHorizontal size={16} />{text.display}</button>
         <div className="settings-nav-spacer" />
-        {props.user && <div className="settings-account"><img src={props.user.avatarUrl || coverUrl} alt="" onError={fallbackImage} /><span><strong>{props.user.displayName}</strong><small>{props.user.email || props.user.username}</small></span></div>}
+        {props.user && <div className="settings-account"><img src={props.user.avatarUrl || defaultAvatarUrl} alt="" onError={fallbackImage} /><span><strong>{props.user.displayName}</strong><small>{props.user.email || props.user.username}</small></span></div>}
         <button type="button" className="settings-logout" onClick={props.onLogout}><LogOut size={16} />{en ? "Sign out" : "退出登录"}</button>
       </nav>
       <div className="settings-content">
@@ -2474,7 +2591,7 @@ function SkillEditorPage(props: {
         <div className="new-skill-form">
           <SpotlightCard className="new-skill-hero" spotlightColor="rgba(82, 211, 178, 0.14)">
             <div className="new-skill-avatar-block">
-              <img src={props.draft.avatarUrl || coverUrl} alt="" onError={fallbackImage} />
+              <img src={props.draft.avatarUrl || defaultAvatarUrl} alt="" onError={fallbackImage} />
               <button type="button" onClick={props.chooseNewSkillAvatar}><ImageIcon size={16} />上传头像</button>
               <small>保存后头像会随 Skill 同步。</small>
             </div>
@@ -2540,7 +2657,7 @@ function SkillEditorPage(props: {
   return (
     <section className="skill-editor-page">
       <aside className="skill-profile-pane">
-        <img src={props.draft.avatarUrl || coverUrl} alt="" onError={fallbackImage} />
+        <img src={props.draft.avatarUrl || defaultAvatarUrl} alt="" onError={fallbackImage} />
         <h2>{props.draft.name || "新的 Skill"}</h2>
         <p>{props.draft.description}</p>
         <nav>
@@ -2565,7 +2682,7 @@ function SkillEditorPage(props: {
         {props.tab === "profile" && (
           <div className="editor-section">
             <div className="skill-avatar-upload">
-              <img src={props.draft.avatarUrl || coverUrl} alt="" onError={fallbackImage} />
+              <img src={props.draft.avatarUrl || defaultAvatarUrl} alt="" onError={fallbackImage} />
               <div>
                 <strong>头像</strong>
                 <span>保存后会生成新版本并同步。</span>
@@ -2681,7 +2798,7 @@ function SkillInspector({ draft, setDraft, save, busy }: { draft: SkillDraft; se
   };
   return (
     <aside className="skill-inspector">
-      <img className="cover-thumb" src={draft.avatarUrl || coverUrl} alt="" onError={fallbackImage} />
+      <img className="cover-thumb" src={draft.avatarUrl || defaultAvatarUrl} alt="" onError={fallbackImage} />
       <FormField label="名称" error={errors.name}><input aria-invalid={Boolean(errors.name)} value={draft.name} onChange={(event) => update("name", event.target.value)} /></FormField>
       <FormField label="简介" error={errors.description}><input aria-invalid={Boolean(errors.description)} value={draft.description} onChange={(event) => update("description", event.target.value)} /></FormField>
       <FormField label="人格" error={errors.persona}><textarea aria-invalid={Boolean(errors.persona)} value={draft.persona} onChange={(event) => update("persona", event.target.value)} /></FormField>
@@ -3138,7 +3255,7 @@ function roleLabel(role: string): string {
 function skillToDraft(skill: SkillSummary): SkillDraft {
   return {
     name: skill.name,
-    avatarUrl: skill.avatarUrl || coverUrl,
+    avatarUrl: skill.avatarUrl || defaultAvatarUrl,
     description: skill.description,
     persona: skill.persona,
     tone: skill.tone,
@@ -3231,6 +3348,12 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function noticeTone(message: string): NoticeTone {
+  if (/失败|错误|未连接|过长|too long|error|failed|offline/i.test(message)) return "error";
+  if (/已|成功|保存|发布|提交|发送|创建|复制|确认|ok|success/i.test(message)) return "success";
+  return "info";
+}
+
 function tokenTransactionLabelClean(kind: TokenTransaction["kind"] | string): string {
   const labels: Record<string, string> = {
     RECHARGE: "Token 充值",
@@ -3245,7 +3368,7 @@ function tokenTransactionLabelClean(kind: TokenTransaction["kind"] | string): st
 }
 
 function fallbackImage(event: React.SyntheticEvent<HTMLImageElement>): void {
-  event.currentTarget.src = coverUrl;
+  event.currentTarget.src = defaultAvatarUrl;
 }
 
 function loadRememberedAccounts(): RememberedAccount[] {

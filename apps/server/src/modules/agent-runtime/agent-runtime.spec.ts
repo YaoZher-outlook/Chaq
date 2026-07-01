@@ -42,3 +42,78 @@ test("agent runtime converts model failures into safe chat feedback", () => {
   assert.match(runtime.failureReply("Provider API key is not configured."), /API Key/);
   assert.match(runtime.failureReply("Token balance is insufficient"), /Token/);
 });
+
+test("runtime rejects run conversations that do not include the agent", async () => {
+  const prisma = {
+    agentRun: {
+      findUnique: async () => ({
+        id: "run-1",
+        agentId: "agent-1",
+        trigger: "MANUAL",
+        triggerPayload: null,
+        agent: {
+          id: "agent-1",
+          ownerId: "owner-1",
+          relationships: [],
+          goals: [],
+          tasks: [],
+          memories: [],
+          tools: []
+        },
+        conversation: {
+          participants: [{ participantKind: "USER", participantId: "user-1" }],
+          messages: []
+        }
+      })
+    }
+  };
+  const models = {
+    agentEmbedding: async () => {
+      throw new Error("embedding should not be requested");
+    }
+  };
+  const runtime = new AgentRuntimeService(prisma as never, models as never, {} as never) as any;
+
+  await assert.rejects(
+    runtime.loadContext("run-1"),
+    /does not include this agent/
+  );
+});
+
+test("runtime refuses tasks linked to another agent's goal", async () => {
+  const tx = {
+    agentEvent: {
+      findUnique: async () => null,
+      create: async () => {
+        throw new Error("event should not be created");
+      }
+    },
+    agentGoal: {
+      findFirst: async () => null
+    },
+    agentTask: {
+      create: async () => {
+        throw new Error("task should not be created");
+      }
+    }
+  };
+  const prisma = {
+    $transaction: async (callback: (client: typeof tx) => unknown) => callback(tx)
+  };
+  const runtime = new AgentRuntimeService(prisma as never, {} as never, {} as never) as any;
+
+  await assert.rejects(
+    runtime.executeAction(
+      {
+        runId: "run-1",
+        context: {
+          agent: { id: "agent-1" },
+          tools: [{ name: "manage_task", enabled: true }]
+        }
+      },
+      { type: "create_task", title: "Follow up", goalId: "other-agent-goal" },
+      "run-1:action:0"
+    ),
+    /Goal not found/
+  );
+});

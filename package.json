@@ -14,7 +14,7 @@
     "infra:local": "node scripts/start-local-infra.js",
     "build": "npm run build -w @chaq/shared && npm run build -w @chaq/server && npm run build -w @chaq/desktop",
     "typecheck": "npm run typecheck -w @chaq/shared && npm run typecheck -w @chaq/server && npm run typecheck -w @chaq/desktop",
-    "test": "tsx --tsconfig apps/server/tsconfig.json --test packages/shared/src/agent-contract.spec.ts apps/server/src/modules/conversations/conversation-mappers.spec.ts apps/server/src/modules/conversations/conversations.service.spec.ts apps/server/src/modules/agent-runtime/agent-runtime.spec.ts apps/server/src/modules/agents/agent-mappers.spec.ts apps/server/src/modules/agents/agents.service.spec.ts apps/server/src/modules/models/models.service.spec.ts apps/server/src/modules/users/users.service.spec.ts apps/desktop/src/renderer/lib/provider-presets.spec.ts",
+    "test": "node scripts/run-tests.js",
     "test:e2e:agent": "node scripts/e2e-agent.js",
     "test:e2e:billing": "node scripts/e2e-agent-contact-billing.js",
     "electron:install": "node scripts/install-electron.js",

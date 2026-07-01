@@ -60,12 +60,62 @@ export type LoginUser = {
   createdAt: string;
 };
 
-export function getServerUrl(): string {
-  const stored = localStorage.getItem("chaq.serverUrl");
-  if (!stored || /localhost:(4100|4010|8200|8020|4537)\b/.test(stored)) {
-    return (import.meta.env.VITE_SERVER_URL as string | undefined)?.replace(/\/$/, "") || "http://localhost:24537/api";
+export type HealthReadyResponse = {
+  status?: string;
+  database?: string;
+  redis?: string;
+  mode?: string;
+  host?: string;
+};
+
+const LEGACY_LOCAL_SERVER_RE = /localhost:(4100|4010|8200|8020|4537)\b/;
+const RESOLVED_SERVER_URL_KEY = "chaq.resolvedServerUrl";
+
+function normalizeServerUrl(value?: string | null): string | null {
+  const text = value?.trim().replace(/\/$/, "");
+  if (!text || LEGACY_LOCAL_SERVER_RE.test(text)) return null;
+  try {
+    const url = new URL(text);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    if (url.hostname === "localhost") {
+      url.hostname = "127.0.0.1";
+    }
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return null;
   }
-  return stored;
+}
+
+function defaultServerUrls(): string[] {
+  const configured = normalizeServerUrl(import.meta.env.VITE_SERVER_URL as string | undefined);
+  if (configured) return [configured];
+  const dev = "http://127.0.0.1:24537/api";
+  const prod = "http://127.0.0.1:24538/api";
+  return import.meta.env.DEV ? [dev, prod] : [prod, dev];
+}
+
+function uniqueUrls(urls: Array<string | null>): string[] {
+  return urls.filter((url, index, list): url is string => Boolean(url) && list.indexOf(url) === index);
+}
+
+function getServerCandidates(): string[] {
+  const defaults = defaultServerUrls();
+  const stored = normalizeServerUrl(localStorage.getItem("chaq.serverUrl"));
+  const customStored = stored && !defaults.includes(stored) ? stored : null;
+  return uniqueUrls([
+    customStored,
+    normalizeServerUrl(sessionStorage.getItem(RESOLVED_SERVER_URL_KEY)),
+    stored,
+    ...defaults
+  ]);
+}
+
+function rememberResolvedServerUrl(url: string): void {
+  sessionStorage.setItem(RESOLVED_SERVER_URL_KEY, url);
+}
+
+export function getServerUrl(): string {
+  return getServerCandidates()[0] ?? "http://127.0.0.1:24538/api";
 }
 
 export function getRealtimeUrl(sessionToken: string): string {
@@ -118,19 +168,44 @@ export function connectRealtime(onEvent: (event: { type: string; payload: unknow
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const sessionToken = sessionStorage.getItem("chaq.sessionToken") || localStorage.getItem("chaq.sessionToken");
-  const response = await fetch(`${getServerUrl()}${path}`, {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      ...(sessionToken ? { "x-session-token": sessionToken } : {}),
-      ...init?.headers
+  let lastError: unknown = null;
+  for (const baseUrl of getServerCandidates()) {
+    let response: Response;
+    let data: any;
+    try {
+      response = await fetch(`${baseUrl}${path}`, {
+        ...init,
+        headers: {
+          "content-type": "application/json",
+          ...(sessionToken ? { "x-session-token": sessionToken } : {}),
+          ...init?.headers
+        }
+      });
+      data = await response.json().catch(() => null);
+    } catch (error) {
+      lastError = error;
+      continue;
     }
-  });
-  const data = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(formatApiError(data?.message, response.status));
+    if (response.ok) {
+      rememberResolvedServerUrl(baseUrl);
+      return data as T;
+    }
+    const error = new Error(formatApiError(data?.message, response.status));
+    if (shouldTryNextServer(response.status, data)) {
+      lastError = error;
+      continue;
+    }
+    throw error;
   }
-  return data as T;
+  throw new Error(`无法连接 Chaq API。已尝试：${getServerCandidates().join("、")}。${messageOfUnknown(lastError)}`);
+}
+
+function shouldTryNextServer(status: number, data: unknown): boolean {
+  return (status === 404 && !data) || status === 502 || status === 503 || status === 504;
+}
+
+function messageOfUnknown(error: unknown): string {
+  return error instanceof Error ? error.message : String(error ?? "");
 }
 
 function formatApiError(message: unknown, status: number): string {
@@ -176,6 +251,22 @@ function fieldLabel(field: string): string {
 }
 
 export const api = {
+  healthReady: async () => {
+    for (const baseUrl of getServerCandidates()) {
+      try {
+        const response = await fetch(`${baseUrl}/health/ready`);
+        const data = await response.json().catch(() => null) as HealthReadyResponse | null;
+        const ready = response.ok && data?.status === "ok" && data.database === "ready" && data.redis === "ready";
+        if (ready) {
+          rememberResolvedServerUrl(baseUrl);
+          return true;
+        }
+      } catch {
+        // Try the next configured local API endpoint.
+      }
+    }
+    return false;
+  },
   login: (payload: { username: string; password: string }) => request<{
     sessionToken: string;
     expiresAt: string;
