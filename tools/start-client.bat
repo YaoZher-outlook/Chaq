@@ -8,7 +8,8 @@ cd /d "%ROOT%"
 set "EXE=apps\desktop\release\win-unpacked\Chaq.exe"
 
 echo [Chaq] Starting desktop client...
-echo [Chaq] API auto-detect: http://127.0.0.1:24538/api, fallback http://127.0.0.1:24537/api
+echo [Chaq] Public API URL: https://chaq.yaozher.com/api
+echo [Chaq] Cloudflared service target: http://127.0.0.1:24538
 
 where node >nul 2>nul
 if errorlevel 1 (

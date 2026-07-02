@@ -9,6 +9,8 @@ if "%CHAQ_PROD_SERVER_PORT%"=="" set "CHAQ_PROD_SERVER_PORT=24538"
 
 echo [Chaq] Starting production API server and Agent worker...
 echo [Chaq] Production API: http://127.0.0.1:%CHAQ_PROD_SERVER_PORT%/api
+echo [Chaq] Public API URL: https://chaq.yaozher.com/api
+echo [Chaq] Cloudflared service target: http://127.0.0.1:%CHAQ_PROD_SERVER_PORT%
 echo [Chaq] Public bind: 0.0.0.0:%CHAQ_PROD_SERVER_PORT%
 echo [Chaq] Server will be managed in the background. Logs are saved in .logs.
 

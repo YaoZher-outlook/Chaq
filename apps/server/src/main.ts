@@ -32,8 +32,11 @@ async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule, { bodyParser: false, logger });
   app.use(expressBody.json({ limit: "12mb" }));
   app.use(expressBody.urlencoded({ extended: true, limit: "12mb" }));
+  const defaultClientOrigin = process.env.NODE_ENV === "production"
+    ? "https://chaq.yaozher.com"
+    : "http://localhost:27337";
   const configuredOrigins = new Set(
-    (process.env.CLIENT_ORIGIN || "http://localhost:27337")
+    (process.env.CLIENT_ORIGIN || defaultClientOrigin)
       .split(",")
       .map((value) => value.trim())
       .filter(Boolean)

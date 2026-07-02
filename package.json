@@ -17,6 +17,7 @@
     "test": "node scripts/run-tests.js",
     "test:e2e:agent": "node scripts/e2e-agent.js",
     "test:e2e:billing": "node scripts/e2e-agent-contact-billing.js",
+    "admin:create": "node scripts/create-admin-user.js",
     "electron:install": "node scripts/install-electron.js",
     "prisma:generate": "npm run prisma:generate -w @chaq/server",
     "prisma:migrate": "npm run prisma:migrate -w @chaq/server",

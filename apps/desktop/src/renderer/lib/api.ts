@@ -68,8 +68,12 @@ export type HealthReadyResponse = {
   host?: string;
 };
 
-const LEGACY_LOCAL_SERVER_RE = /localhost:(4100|4010|8200|8020|4537)\b/;
+const ONLINE_SERVER_URL = "https://chaq.yaozher.com/api";
+const LOCAL_DEV_SERVER_URL = "http://127.0.0.1:24537/api";
+const LOCAL_PROD_SERVER_URL = "http://127.0.0.1:24538/api";
+const LEGACY_LOCAL_SERVER_RE = /(localhost|127\.0\.0\.1):(4100|4010|8200|8020|4537)\b/;
 const RESOLVED_SERVER_URL_KEY = "chaq.resolvedServerUrl";
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "0.0.0.0", "::1", "[::1]"]);
 
 function normalizeServerUrl(value?: string | null): string | null {
   const text = value?.trim().replace(/\/$/, "");
@@ -80,18 +84,45 @@ function normalizeServerUrl(value?: string | null): string | null {
     if (url.hostname === "localhost") {
       url.hostname = "127.0.0.1";
     }
+    if (!url.pathname || url.pathname === "/") {
+      url.pathname = "/api";
+    }
+    url.hash = "";
+    url.search = "";
     return url.toString().replace(/\/$/, "");
   } catch {
     return null;
   }
 }
 
+function isLoopbackServerUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return LOOPBACK_HOSTS.has(url.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function allowLocalApiFallback(): boolean {
+  return import.meta.env.DEV || import.meta.env.VITE_ALLOW_LOCAL_API_FALLBACK === "1";
+}
+
+function normalizeUsableServerUrl(value?: string | null): string | null {
+  const url = normalizeServerUrl(value);
+  if (!url) return null;
+  if (!allowLocalApiFallback() && isLoopbackServerUrl(url)) return null;
+  return url;
+}
+
 function defaultServerUrls(): string[] {
   const configured = normalizeServerUrl(import.meta.env.VITE_SERVER_URL as string | undefined);
   if (configured) return [configured];
-  const dev = "http://127.0.0.1:24537/api";
-  const prod = "http://127.0.0.1:24538/api";
-  return import.meta.env.DEV ? [dev, prod] : [prod, dev];
+  const online = normalizeServerUrl(import.meta.env.VITE_PUBLIC_SERVER_URL as string | undefined) ?? ONLINE_SERVER_URL;
+  return uniqueUrls([
+    online,
+    ...(allowLocalApiFallback() ? [LOCAL_DEV_SERVER_URL, LOCAL_PROD_SERVER_URL] : [])
+  ]);
 }
 
 function uniqueUrls(urls: Array<string | null>): string[] {
@@ -100,11 +131,11 @@ function uniqueUrls(urls: Array<string | null>): string[] {
 
 function getServerCandidates(): string[] {
   const defaults = defaultServerUrls();
-  const stored = normalizeServerUrl(localStorage.getItem("chaq.serverUrl"));
+  const stored = normalizeUsableServerUrl(localStorage.getItem("chaq.serverUrl"));
   const customStored = stored && !defaults.includes(stored) ? stored : null;
   return uniqueUrls([
     customStored,
-    normalizeServerUrl(sessionStorage.getItem(RESOLVED_SERVER_URL_KEY)),
+    normalizeUsableServerUrl(sessionStorage.getItem(RESOLVED_SERVER_URL_KEY)),
     stored,
     ...defaults
   ]);
@@ -115,7 +146,7 @@ function rememberResolvedServerUrl(url: string): void {
 }
 
 export function getServerUrl(): string {
-  return getServerCandidates()[0] ?? "http://127.0.0.1:24538/api";
+  return getServerCandidates()[0] ?? ONLINE_SERVER_URL;
 }
 
 export function getRealtimeUrl(sessionToken: string): string {
@@ -262,7 +293,7 @@ export const api = {
           return true;
         }
       } catch {
-        // Try the next configured local API endpoint.
+        // Try the next configured API endpoint.
       }
     }
     return false;

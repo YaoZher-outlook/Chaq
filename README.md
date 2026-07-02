@@ -30,14 +30,16 @@ tools\start-server-prod.bat
 tools\start-client.bat
 ```
 
-Start the server first. `start-server-dev.bat` prepares the environment, starts PostgreSQL and Redis, applies migrations, then launches both the NestJS API and Agent worker in watch mode on `127.0.0.1:24537`. `start-server-prod.bat` builds and starts the production API and Agent worker on `0.0.0.0:24538`, keeps them in the same console window, and mirrors output into `.logs`. `start-client.bat` launches the packaged Electron desktop app and rebuilds it when desktop source files are newer than the packaged executable.
+Start the server first. `start-server-dev.bat` prepares the environment, starts PostgreSQL and Redis, applies migrations, then launches both the NestJS API and Agent worker in watch mode on `127.0.0.1:24537`. `start-server-prod.bat` builds and starts the production API and Agent worker on `0.0.0.0:24538`, manages them in the background, and mirrors output into `.logs`. `start-client.bat` launches the packaged Electron desktop app and rebuilds it when desktop source files are newer than the packaged executable.
 
 There are two server modes:
 
 - Development server: `tools\start-server-dev.bat`, binding the API to `127.0.0.1:24537`.
 - Production server: `tools\start-server-prod.bat`, binding the API to `0.0.0.0:24538` so Cloudflare Tunnel, a reverse proxy, or another machine can reach it.
 
-The server launchers keep their console window open while the API and Agent worker are running. Close that window or press `Ctrl+C` to stop the server. Running a launcher again while Chaq is already healthy exits successfully instead of starting duplicate API or worker processes. A port owned by a non-Chaq process is still reported as a real conflict.
+For the live Chaq domain, point Cloudflared hostname `chaq.yaozher.com` to service `http://127.0.0.1:24538`. Do not include `/api` in the Cloudflared service target; the API prefix is handled by the server, so the public API URL is `https://chaq.yaozher.com/api`.
+
+The development launcher keeps its console window open while the API and Agent worker are running. The production launcher manages API and worker pids in `.logs\pids`; use `node scripts\start-production-server.js --stop` to stop them. Running a launcher again while Chaq is already healthy exits successfully instead of starting duplicate API or worker processes. A port owned by a non-Chaq process is still reported as a real conflict.
 
 Default ports:
 
@@ -143,3 +145,13 @@ docker compose --env-file .env.production -f docker-compose.production.yml up -d
 ```
 
 `MODEL_SECRET_KEY` is mandatory in production and encrypts provider credentials with AES-256-GCM. Put the API behind TLS and set `CLIENT_ORIGIN` to the exact desktop/web origin allowed by CORS. See [deployment](docs/deployment.md) before exposing the service publicly.
+
+For a self-hosted Windows production server, run `tools\start-server-prod.bat` and route Cloudflared to `http://127.0.0.1:24538`. Packaged desktop builds default to `https://chaq.yaozher.com/api`; local API fallbacks are used only in development or when `VITE_ALLOW_LOCAL_API_FALLBACK=1` is set.
+
+Create the first production administrator after migrations:
+
+```bat
+set CHAQ_ADMIN_USERNAME=admin
+set CHAQ_ADMIN_PASSWORD=replace-with-a-strong-password
+npm.cmd run admin:create
+```

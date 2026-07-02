@@ -14,6 +14,8 @@ const restart = process.argv.includes("--restart");
 const foreground = process.argv.includes("--foreground");
 const host = publicBind ? "0.0.0.0" : "127.0.0.1";
 const port = Number(process.env.CHAQ_PROD_SERVER_PORT || process.env.SERVER_PORT || 24538);
+const defaultPublicApiUrl = "https://chaq.yaozher.com/api";
+const defaultClientOrigin = "https://chaq.yaozher.com";
 const pidDir = path.join(projectLogs, "pids");
 const apiPidFile = path.join(pidDir, `api-${port}.pid`);
 const workerPidFile = path.join(pidDir, `worker-${port}.pid`);
@@ -60,6 +62,40 @@ function quoteCmdArg(value) {
   const text = String(value);
   if (/^[A-Za-z0-9_@%+=:,./\\-]+$/.test(text)) return text;
   return `"${text.replace(/"/g, '""')}"`;
+}
+
+function normalizeApiUrl(value) {
+  try {
+    const url = new URL(String(value || defaultPublicApiUrl).trim());
+    if (!url.pathname || url.pathname === "/") url.pathname = "/api";
+    url.hash = "";
+    url.search = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return defaultPublicApiUrl;
+  }
+}
+
+function isLocalDevOrigin(value) {
+  return /^https?:\/\/(localhost|127\.0\.0\.1):27337$/i.test(String(value || "").trim());
+}
+
+function resolveProductionClientOrigin(fileEnv) {
+  const configured = process.env.CHAQ_PROD_CLIENT_ORIGIN
+    || process.env.CLIENT_ORIGIN
+    || fileEnv.CHAQ_PROD_CLIENT_ORIGIN
+    || fileEnv.CLIENT_ORIGIN;
+  return configured && !isLocalDevOrigin(configured) ? configured : defaultClientOrigin;
+}
+
+function resolvePublicApiUrl(fileEnv) {
+  return normalizeApiUrl(
+    process.env.CHAQ_PUBLIC_API_URL
+    || process.env.PUBLIC_API_URL
+    || fileEnv.CHAQ_PUBLIC_API_URL
+    || fileEnv.PUBLIC_API_URL
+    || defaultPublicApiUrl
+  );
 }
 
 function run(file, args, env) {
@@ -494,6 +530,7 @@ async function main() {
   ensureEnvironmentFile();
   const envFile = process.env.CHAQ_ENV_FILE || serverEnv;
   const fileEnv = fs.existsSync(envFile) ? parseEnv(fs.readFileSync(envFile, "utf8")) : {};
+  const publicApiUrl = resolvePublicApiUrl(fileEnv);
   const env = {
     ...process.env,
     ...fileEnv,
@@ -502,10 +539,14 @@ async function main() {
     CHAQ_PROD_SERVER_PORT: String(port),
     SERVER_HOST: host,
     SERVER_PORT: String(port),
+    CLIENT_ORIGIN: resolveProductionClientOrigin(fileEnv),
+    PUBLIC_API_URL: publicApiUrl,
     CHAQ_LOG_DIR: projectLogs
   };
 
   console.log(`[Chaq] Starting production API server and Agent worker (${host}:${port}).`);
+  console.log(`[Chaq] Public API URL: ${publicApiUrl}`);
+  console.log(`[Chaq] Cloudflared service target: http://127.0.0.1:${port}`);
   if (await assertPortAvailableOrReady()) {
     ensureProductionWorker(env);
     return;
