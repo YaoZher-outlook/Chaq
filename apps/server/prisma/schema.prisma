@@ -91,6 +91,19 @@ enum ModelProviderScope {
   USER_PRIVATE
 }
 
+enum ModelCallPurpose {
+  CLOUD_CHAT
+  AGENT_COMPLETION
+  EMBEDDING
+  DISTILLATION
+}
+
+enum ModelCallReservationStatus {
+  PENDING
+  SETTLED
+  FAILED
+}
+
 enum AgentStatus {
   DRAFT
   ACTIVE
@@ -222,6 +235,13 @@ enum AgentToolKind {
   HTTP
 }
 
+enum AgentHttpAttemptStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  UNCERTAIN
+}
+
 enum ToolRiskLevel {
   SAFE
   CONFIRM
@@ -269,6 +289,7 @@ model User {
   rechargeOrders     RechargeOrder[]
   reviewedRechargeOrders RechargeOrder[] @relation("RechargeOrderReviewer")
   modelCallLogs      ModelCallLog[]
+  modelCallReservations ModelCallReservation[]
   modelProviders     ModelProviderConfig[]
   sessions           AuthSession[]
   settings           UserSetting?
@@ -541,6 +562,7 @@ model ModelProviderConfig {
   createdAt            DateTime           @default(now())
   updatedAt            DateTime           @updatedAt
   callLogs             ModelCallLog[]
+  callReservations     ModelCallReservation[]
   agents               Agent[]
 
   @@index([scope, ownerId, enabled])
@@ -566,6 +588,36 @@ model ModelCallLog {
 
   @@index([userId, createdAt])
   @@index([providerId])
+}
+
+model ModelCallReservation {
+  id                    String                     @id @default(cuid())
+  requestKey            String                     @unique
+  requestHash           String
+  attempt               Int                        @default(1)
+  purpose               ModelCallPurpose
+  status                ModelCallReservationStatus @default(PENDING)
+  userId                String
+  user                  User                       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  providerId            String?
+  provider              ModelProviderConfig?       @relation(fields: [providerId], references: [id], onDelete: SetNull)
+  model                  String
+  reservedTokens        Int
+  chargedTokens         Int                        @default(0)
+  promptTokenLimit      Int                        @default(0)
+  completionTokenLimit  Int                        @default(0)
+  promptTokens          Int                        @default(0)
+  completionTokens      Int                        @default(0)
+  serviceFee            Int                        @default(0)
+  beneficiaryUserId     String?
+  response              Json?
+  error                 String?
+  settledAt             DateTime?
+  createdAt             DateTime                   @default(now())
+  updatedAt             DateTime                   @updatedAt
+
+  @@index([userId, status, createdAt])
+  @@index([providerId, createdAt])
 }
 
 model Agent {
@@ -622,6 +674,7 @@ model Agent {
   posts                AgentPost[]
   contacts             AgentContact[]
   reports              AgentReport[]
+  httpToolAttempts     AgentHttpToolAttempt[]
 
   @@unique([ownerId, handle])
   @@index([ownerId, status])
@@ -876,6 +929,7 @@ model AgentTool {
   lastUsedAt  DateTime?
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
+  attempts    AgentHttpToolAttempt[]
 
   @@unique([agentId, name])
   @@index([agentId, enabled])
@@ -949,14 +1003,45 @@ model AgentRun {
   promptTokens     Int             @default(0)
   completionTokens Int             @default(0)
   chargedTokens    Int             @default(0)
+  executionId      String?
+  leaseExpiresAt   DateTime?
   startedAt        DateTime?
   completedAt      DateTime?
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
   events           AgentEvent[]
+  httpToolAttempts AgentHttpToolAttempt[]
 
   @@index([agentId, status, createdAt])
+  @@index([status, leaseExpiresAt])
   @@index([conversationId])
+}
+
+model AgentHttpToolAttempt {
+  id               String                 @id @default(cuid())
+  idempotencyKey   String                 @unique
+  outboundKey      String
+  requestHash      String
+  agentId          String
+  agent            Agent                  @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  runId            String
+  run              AgentRun               @relation(fields: [runId], references: [id], onDelete: Cascade)
+  toolId           String
+  tool             AgentTool              @relation(fields: [toolId], references: [id], onDelete: Cascade)
+  method           String
+  targetUrl        String
+  attempt          Int                    @default(1)
+  status           AgentHttpAttemptStatus @default(PENDING)
+  httpStatus       Int?
+  responsePreview  String?
+  error            String?
+  completedAt      DateTime?
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+
+  @@index([agentId, status, createdAt])
+  @@index([runId, createdAt])
+  @@index([toolId, createdAt])
 }
 
 model AgentEvent {

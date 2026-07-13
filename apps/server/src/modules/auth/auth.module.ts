@@ -1,12 +1,12 @@
 import { Module } from "@nestjs/common";
-import { PrismaService } from "../../common/prisma.service";
-import { RateLimitService } from "../../common/rate-limit.service";
+import { RealtimeModule } from "../../common/realtime.module";
 import { AuthController } from "./auth.controller";
 import { AuthService } from "./auth.service";
 
 @Module({
+  imports: [RealtimeModule],
   controllers: [AuthController],
-  providers: [AuthService, PrismaService, RateLimitService],
+  providers: [AuthService],
   exports: [AuthService]
 })
 export class AuthModule {}

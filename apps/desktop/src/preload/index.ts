@@ -5,8 +5,7 @@ import type {
   SkillDraft,
   SkillSourceKind,
   SkillSummary,
-  SkillVersionSnapshot,
-  UserModelConfigPublic
+  SkillVersionSnapshot
 } from "@chaq/shared";
 
 const api = {
@@ -47,54 +46,7 @@ const api = {
   },
   files: {
     openBackgroundImage: (): Promise<{ fileName: string; dataUrl: string } | null> => ipcRenderer.invoke("files:open-background-image"),
-    openImage: (): Promise<{ fileName: string; dataUrl: string } | null> => ipcRenderer.invoke("files:open-image"),
-    openFolder: (): Promise<string | null> => ipcRenderer.invoke("files:open-folder")
-  },
-  models: {
-    listUser: (userId?: string): Promise<UserModelConfigPublic[]> => ipcRenderer.invoke("models:list-user", userId),
-    saveUser: (payload: {
-      userId?: string;
-      id?: string;
-      kind: UserModelConfigPublic["kind"];
-      name: string;
-      baseUrl: string;
-      apiKey: string;
-      defaultModel: string;
-      embeddingModel?: string | null;
-    }): Promise<UserModelConfigPublic> => ipcRenderer.invoke("models:save-user", payload),
-    deleteUser: (id: string, userId?: string): Promise<void> => ipcRenderer.invoke("models:delete-user", { id, userId }),
-    testUser: (payload: {
-      kind: UserModelConfigPublic["kind"];
-      name?: string;
-      baseUrl: string;
-      apiKey: string;
-      defaultModel: string;
-    }): Promise<{
-      ok: boolean;
-      kind: UserModelConfigPublic["kind"];
-      name: string;
-      baseUrl: string;
-      defaultModel: string;
-      message: string;
-      modelCount?: number;
-      suggestedModel?: string;
-    }> => ipcRenderer.invoke("models:test-user", payload),
-    detectUserProvider: (apiKey: string): Promise<{
-      ok: boolean;
-      kind: UserModelConfigPublic["kind"];
-      name: string;
-      baseUrl: string;
-      defaultModel: string;
-      message: string;
-      modelCount?: number;
-      suggestedModel?: string;
-    }> => ipcRenderer.invoke("models:detect-user-provider", apiKey),
-    userChat: (payload: {
-      userId?: string;
-      configId: string;
-      skill: SkillDraft;
-      messages: Pick<ChatMessage, "role" | "content">[];
-    }): Promise<{ content: string; modelLabel: string }> => ipcRenderer.invoke("models:user-chat", payload)
+    openImage: (): Promise<{ fileName: string; dataUrl: string } | null> => ipcRenderer.invoke("files:open-image")
   },
   window: {
     minimize: (): Promise<void> => ipcRenderer.invoke("window:minimize"),
@@ -102,6 +54,7 @@ const api = {
     close: (): Promise<void> => ipcRenderer.invoke("window:close"),
     setMode: (mode: "login" | "main"): Promise<void> => ipcRenderer.invoke("window:set-mode", mode),
     setOpacity: (opacity: number): Promise<void> => ipcRenderer.invoke("window:set-opacity", opacity),
+    flashFrame: (enabled: boolean): Promise<void> => ipcRenderer.invoke("window:flash-frame", enabled),
     openSettings: (token?: string | null): Promise<void> => ipcRenderer.invoke("window:open-settings", token),
     openProfile: (
       token?: string | null,
@@ -111,6 +64,13 @@ const api = {
   },
   auth: {
     broadcastLogout: (): Promise<void> => ipcRenderer.invoke("auth:broadcast-logout"),
+    consumeWindowBootstrap: (): Promise<string | null> => ipcRenderer.invoke("auth:consume-window-bootstrap"),
+    saveRememberedSession: (payload: { accountId: string; sessionToken: string; expiresAt: string }): Promise<void> =>
+      ipcRenderer.invoke("auth:remembered-session:save", payload),
+    getRememberedSession: (accountId: string): Promise<{ accountId: string; sessionToken: string; expiresAt: string } | null> =>
+      ipcRenderer.invoke("auth:remembered-session:get", accountId),
+    deleteRememberedSession: (accountId: string): Promise<void> =>
+      ipcRenderer.invoke("auth:remembered-session:delete", accountId),
     onLoggedOut: (callback: () => void): (() => void) => {
       const listener = () => callback();
       ipcRenderer.on("auth:logged-out", listener);

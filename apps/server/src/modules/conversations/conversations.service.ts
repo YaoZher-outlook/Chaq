@@ -1,4 +1,5 @@
-import { ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
+import { createHash } from "node:crypto";
+import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import {
   AgentEventKind,
   AgentRunStatus,
@@ -24,15 +25,12 @@ export class ConversationsService {
   ) {}
 
   async list(userId: string) {
-    const agentIds = (await this.prisma.agent.findMany({ where: { ownerId: userId }, select: { id: true } })).map((row) => row.id);
     const rows = await this.prisma.conversation.findMany({
       where: {
         participants: {
           some: {
-            OR: [
-              { participantKind: ParticipantKind.USER, participantId: userId },
-              ...(agentIds.length ? [{ participantKind: ParticipantKind.AGENT, participantId: { in: agentIds } }] : [])
-            ]
+            participantKind: ParticipantKind.USER,
+            participantId: userId
           }
         }
       },
@@ -69,68 +67,108 @@ export class ConversationsService {
     }
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw new NotFoundException("User not found.");
-    const row = await this.findDirect(ParticipantKind.USER, userId, ParticipantKind.AGENT, agentId)
-      ?? await this.prisma.conversation.create({
-        data: {
-          kind: ConversationKind.HUMAN_AGENT,
-          title: agent.name,
-          createdByKind: ParticipantKind.USER,
-          createdById: userId,
-          participants: {
-            create: [
-              { participantKind: ParticipantKind.USER, participantId: userId, displayNameSnapshot: user.displayName },
-              { participantKind: ParticipantKind.AGENT, participantId: agent.id, displayNameSnapshot: agent.name }
-            ]
-          }
-        },
-        include: { participants: true, messages: { orderBy: { createdAt: "desc" }, take: 1 } }
-      });
+    const row = await this.serializableTransaction(async (tx) =>
+      await this.findDirect(ParticipantKind.USER, userId, ParticipantKind.AGENT, agentId, tx)
+      ?? await tx.conversation.create({
+          data: {
+            kind: ConversationKind.HUMAN_AGENT,
+            title: agent.name,
+            createdByKind: ParticipantKind.USER,
+            createdById: userId,
+            participants: {
+              create: [
+                { participantKind: ParticipantKind.USER, participantId: userId, displayNameSnapshot: user.displayName },
+                { participantKind: ParticipantKind.AGENT, participantId: agent.id, displayNameSnapshot: agent.name }
+              ]
+            }
+          },
+          include: { participants: true, messages: { orderBy: { createdAt: "desc" }, take: 1 } }
+        })
+    );
     return toConversationSummary(row, userId);
   }
 
   async messages(userId: string, conversationId: string, before?: string) {
     await this.assertAccess(userId, conversationId);
+    const cursor = this.messageCursor(before);
     const rows = await this.prisma.conversationMessage.findMany({
-      where: { conversationId, ...(before ? { createdAt: { lt: new Date(before) } } : {}) },
+      where: { conversationId, ...(cursor ? { createdAt: { lt: cursor } } : {}) },
       orderBy: { createdAt: "desc" },
       take: 200
     });
     return rows.reverse().map(toConversationMessage);
   }
 
-  async sendUserMessage(userId: string, conversationId: string, content: string, replyToId?: string | null) {
+  async sendUserMessage(
+    userId: string,
+    conversationId: string,
+    content: string,
+    replyToId?: string | null,
+    idempotencyKey?: string
+  ) {
     const conversation = await this.assertAccess(userId, conversationId);
-    await this.assertCanMessageAgents(userId, conversation.participants);
-    const result = await this.prisma.$transaction(async (tx) => {
-      const message = await tx.conversationMessage.create({
-        data: {
-          conversationId,
-          authorKind: ParticipantKind.USER,
-          authorId: userId,
-          kind: ConversationMessageKind.TEXT,
-          content,
-          replyToId
-        }
+    const durableIdempotencyKey = idempotencyKey
+      ? this.userMessageIdempotencyKey(userId, conversationId, idempotencyKey)
+      : undefined;
+    if (durableIdempotencyKey) {
+      const existing = await this.prisma.conversationMessage.findUnique({
+        where: { idempotencyKey: durableIdempotencyKey }
       });
-      await tx.conversation.update({ where: { id: conversationId }, data: { lastMessageAt: message.createdAt } });
-      const targetAgents = conversation.participants.filter((participant) => participant.participantKind === ParticipantKind.AGENT);
-      const runs = [];
-      for (const participant of targetAgents) {
-        const agent = await tx.agent.findUnique({ where: { id: participant.participantId } });
-        if (!agent || agent.status !== AgentStatus.ACTIVE) continue;
-        const run = await tx.agentRun.create({
+      if (existing) {
+        return this.assertUserIdempotencyMatch(existing, userId, conversationId, content, replyToId);
+      }
+    }
+    await this.assertCanMessageAgents(userId, conversation.participants);
+    if (replyToId) {
+      const reply = await this.prisma.conversationMessage.findFirst({
+        where: { id: replyToId, conversationId },
+        select: { id: true }
+      });
+      if (!reply) throw new NotFoundException("Reply target not found in this conversation.");
+    }
+
+    let result: { message: any; runs: string[] };
+    try {
+      result = await this.prisma.$transaction(async (tx) => {
+        const message = await tx.conversationMessage.create({
           data: {
-            agentId: agent.id,
             conversationId,
-            trigger: AgentRunTrigger.USER_MESSAGE,
-            status: AgentRunStatus.QUEUED,
-            triggerPayload: { messageId: message.id, authorId: userId }
+            idempotencyKey: durableIdempotencyKey,
+            authorKind: ParticipantKind.USER,
+            authorId: userId,
+            kind: ConversationMessageKind.TEXT,
+            content,
+            replyToId
           }
         });
-        runs.push(run.id);
+        await tx.conversation.update({ where: { id: conversationId }, data: { lastMessageAt: message.createdAt } });
+        const targetAgents = conversation.participants.filter((participant) => participant.participantKind === ParticipantKind.AGENT);
+        const runs = [];
+        for (const participant of targetAgents) {
+          const agent = await tx.agent.findUnique({ where: { id: participant.participantId } });
+          if (!agent || agent.status !== AgentStatus.ACTIVE) continue;
+          const run = await tx.agentRun.create({
+            data: {
+              agentId: agent.id,
+              conversationId,
+              trigger: AgentRunTrigger.USER_MESSAGE,
+              status: AgentRunStatus.QUEUED,
+              triggerPayload: { messageId: message.id, authorId: userId }
+            }
+          });
+          runs.push(run.id);
+        }
+        return { message, runs };
+      });
+    } catch (error) {
+      if (durableIdempotencyKey && this.isUniqueConstraintError(error)) {
+        const existing = await this.prisma.conversationMessage.findUnique({
+          where: { idempotencyKey: durableIdempotencyKey }
+        });
+        if (existing) return this.assertUserIdempotencyMatch(existing, userId, conversationId, content, replyToId);
       }
-      return { message, runs };
-    });
+      throw error;
+    }
     await Promise.all(result.runs.map((runId) => this.queue.enqueueRun(runId)));
     const mapped = toConversationMessage(result.message);
     await this.broadcastConversation(conversationId, "conversation.message", mapped);
@@ -155,15 +193,30 @@ export class ConversationsService {
     runId?: string;
     idempotencyKey?: string;
   }) {
-    if (input.idempotencyKey) {
-      const existing = await this.prisma.conversationMessage.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
-      if (existing) return toConversationMessage(existing);
+    if (input.targetKind !== ParticipantKind.USER && input.targetKind !== ParticipantKind.AGENT) {
+      throw new BadRequestException("Agent messages can only target a user or another agent.");
     }
     const source = await this.prisma.agent.findUnique({ where: { id: input.sourceAgentId } });
     if (!source) throw new NotFoundException("Source agent not found.");
+    if (input.idempotencyKey) {
+      const existing = await this.prisma.conversationMessage.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
+      if (existing) {
+        return this.assertAgentIdempotencyMatch(
+          existing,
+          source.id,
+          input.conversationId,
+          input.content,
+          input.targetKind,
+          input.targetId
+        );
+      }
+    }
     const parentRun = input.runId
-      ? await this.prisma.agentRun.findUnique({ where: { id: input.runId }, select: { triggerPayload: true } })
+      ? await this.prisma.agentRun.findUnique({ where: { id: input.runId }, select: { agentId: true, triggerPayload: true } })
       : null;
+    if (input.runId && (!parentRun || parentRun.agentId !== source.id)) {
+      throw new ForbiddenException("The parent run does not belong to the source agent.");
+    }
     const chainDepth = Number((parentRun?.triggerPayload as Record<string, unknown> | null)?.chainDepth ?? 0);
     const target = await this.resolveTarget(input.targetKind, input.targetId);
     const direct = input.conversationId
@@ -181,21 +234,24 @@ export class ConversationsService {
     const conversation = input.conversationId
       ? await this.prisma.conversation.findUnique({ where: { id: input.conversationId }, include: { participants: true } })
       : direct
-        ?? await this.prisma.conversation.create({
-          data: {
-            kind: input.targetKind === ParticipantKind.AGENT ? ConversationKind.AGENT_AGENT : ConversationKind.HUMAN_AGENT,
-            title: input.targetKind === ParticipantKind.AGENT ? `${source.name} · ${target.label}` : source.name,
-            createdByKind: ParticipantKind.AGENT,
-            createdById: source.id,
-            participants: {
-              create: [
-                { participantKind: ParticipantKind.AGENT, participantId: source.id, displayNameSnapshot: source.name },
-                { participantKind: input.targetKind, participantId: input.targetId, displayNameSnapshot: target.label }
-              ]
-            }
-          },
-          include: { participants: true }
-        });
+        ?? await this.serializableTransaction(async (tx) =>
+          await this.findDirect(ParticipantKind.AGENT, source.id, input.targetKind, input.targetId, tx)
+          ?? await tx.conversation.create({
+            data: {
+              kind: input.targetKind === ParticipantKind.AGENT ? ConversationKind.AGENT_AGENT : ConversationKind.HUMAN_AGENT,
+              title: input.targetKind === ParticipantKind.AGENT ? `${source.name} · ${target.label}` : source.name,
+              createdByKind: ParticipantKind.AGENT,
+              createdById: source.id,
+              participants: {
+                create: [
+                  { participantKind: ParticipantKind.AGENT, participantId: source.id, displayNameSnapshot: source.name },
+                  { participantKind: input.targetKind, participantId: input.targetId, displayNameSnapshot: target.label }
+                ]
+              }
+            },
+            include: { participants: true }
+          })
+        );
     if (!conversation) throw new NotFoundException("Conversation not found.");
     if (input.conversationId) {
       const includesSource = conversation.participants.some((participant) =>
@@ -209,15 +265,21 @@ export class ConversationsService {
       }
     }
 
-    const result = await this.prisma.$transaction(async (tx) => {
-      const message = await tx.conversationMessage.create({
+    let result: { message: any; targetRunId?: string };
+    try {
+      result = await this.prisma.$transaction(async (tx) => {
+        const message = await tx.conversationMessage.create({
         data: {
           conversationId: conversation.id,
           idempotencyKey: input.idempotencyKey,
           authorKind: ParticipantKind.AGENT,
           authorId: source.id,
           content: input.content,
-          metadata: input.runId ? { runId: input.runId } : undefined
+          metadata: {
+            ...(input.runId ? { runId: input.runId } : {}),
+            targetKind: input.targetKind,
+            targetId: input.targetId
+          }
         }
       });
       await tx.conversation.update({ where: { id: conversation.id }, data: { lastMessageAt: message.createdAt } });
@@ -272,8 +334,24 @@ export class ConversationsService {
           targetRunId = run.id;
         }
       }
-      return { message, targetRunId };
-    });
+        return { message, targetRunId };
+      });
+    } catch (error) {
+      if (input.idempotencyKey && this.isUniqueConstraintError(error)) {
+        const existing = await this.prisma.conversationMessage.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
+        if (existing) {
+          return this.assertAgentIdempotencyMatch(
+            existing,
+            source.id,
+            input.conversationId,
+            input.content,
+            input.targetKind,
+            input.targetId
+          );
+        }
+      }
+      throw error;
+    }
     if (result.targetRunId) await this.queue.enqueueRun(result.targetRunId);
     const mapped = toConversationMessage(result.message);
     await this.broadcastConversation(conversation.id, "conversation.message", mapped);
@@ -289,30 +367,17 @@ export class ConversationsService {
     for (const participant of participants) {
       if (participant.participantKind === ParticipantKind.USER) userIds.add(participant.participantId);
     }
-    const agentIds = participants
-      .filter((participant) => participant.participantKind === ParticipantKind.AGENT)
-      .map((participant) => participant.participantId);
-    if (agentIds.length) {
-      const agents = await this.prisma.agent.findMany({
-        where: { id: { in: agentIds } },
-        select: { ownerId: true }
-      });
-      for (const agent of agents) userIds.add(agent.ownerId);
-    }
     this.realtime.emitToUsers(userIds, type, payload);
   }
 
   private async assertAccess(userId: string, conversationId: string) {
-    const agentIds = (await this.prisma.agent.findMany({ where: { ownerId: userId }, select: { id: true } })).map((row) => row.id);
     const row = await this.prisma.conversation.findFirst({
       where: {
         id: conversationId,
         participants: {
           some: {
-            OR: [
-              { participantKind: ParticipantKind.USER, participantId: userId },
-              ...(agentIds.length ? [{ participantKind: ParticipantKind.AGENT, participantId: { in: agentIds } }] : [])
-            ]
+            participantKind: ParticipantKind.USER,
+            participantId: userId
           }
         }
       },
@@ -322,17 +387,113 @@ export class ConversationsService {
     return row;
   }
 
-  private findDirect(aKind: ParticipantKind, aId: string, bKind: ParticipantKind, bId: string) {
-    return this.prisma.conversation.findFirst({
+  private findDirect(
+    aKind: ParticipantKind,
+    aId: string,
+    bKind: ParticipantKind,
+    bId: string,
+    client: Pick<Prisma.TransactionClient, "conversation"> = this.prisma
+  ) {
+    const kind = aKind === ParticipantKind.AGENT && bKind === ParticipantKind.AGENT
+      ? ConversationKind.AGENT_AGENT
+      : ConversationKind.HUMAN_AGENT;
+    return client.conversation.findFirst({
       where: {
+        kind,
         AND: [
           { participants: { some: { participantKind: aKind, participantId: aId } } },
           { participants: { some: { participantKind: bKind, participantId: bId } } }
-        ]
+        ],
+        participants: {
+          every: {
+            OR: [
+              { participantKind: aKind, participantId: aId },
+              { participantKind: bKind, participantId: bId }
+            ]
+          }
+        }
       },
       include: { participants: true, messages: { orderBy: { createdAt: "desc" }, take: 1 } },
       orderBy: { updatedAt: "desc" }
     });
+  }
+
+  private messageCursor(before: string | undefined): Date | undefined {
+    if (!before) return undefined;
+    const cursor = new Date(before);
+    if (!Number.isFinite(cursor.getTime())) {
+      throw new BadRequestException("Invalid conversation message cursor.");
+    }
+    return cursor;
+  }
+
+  private userMessageIdempotencyKey(userId: string, conversationId: string, key: string): string {
+    const digest = createHash("sha256").update(`${userId}\0${conversationId}\0${key}`).digest("hex");
+    return `user-message:${digest}`;
+  }
+
+  private assertUserIdempotencyMatch(
+    message: { authorKind: ParticipantKind; authorId: string | null; conversationId: string } & Parameters<typeof toConversationMessage>[0],
+    userId: string,
+    conversationId: string,
+    content: string,
+    replyToId?: string | null
+  ) {
+    if (
+      message.authorKind !== ParticipantKind.USER
+      || message.authorId !== userId
+      || message.conversationId !== conversationId
+      || message.content !== content
+      || (message.replyToId ?? null) !== (replyToId ?? null)
+    ) {
+      throw new ConflictException("The idempotency key was already used for a different message.");
+    }
+    return toConversationMessage(message);
+  }
+
+  private assertAgentIdempotencyMatch(
+    message: { authorKind: ParticipantKind; authorId: string | null; conversationId: string } & Parameters<typeof toConversationMessage>[0],
+    sourceAgentId: string,
+    conversationId: string | null | undefined,
+    content: string,
+    targetKind: ParticipantKind,
+    targetId: string
+  ) {
+    const metadata = typeof message.metadata === "object" && message.metadata && !Array.isArray(message.metadata)
+      ? message.metadata as Record<string, unknown>
+      : null;
+    if (
+      message.authorKind !== ParticipantKind.AGENT
+      || message.authorId !== sourceAgentId
+      || (conversationId && message.conversationId !== conversationId)
+      || message.content !== content
+      || (metadata?.targetKind !== undefined && metadata.targetKind !== targetKind)
+      || (metadata?.targetId !== undefined && metadata.targetId !== targetId)
+    ) {
+      throw new ConflictException("The idempotency key was already used for a different agent message.");
+    }
+    return toConversationMessage(message);
+  }
+
+  private async serializableTransaction<T>(action: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await this.prisma.$transaction(action, {
+          isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+        });
+      } catch (error) {
+        if (!this.isTransactionConflict(error) || attempt === 2) throw error;
+      }
+    }
+    throw new ConflictException("Could not serialize conversation creation.");
+  }
+
+  private isTransactionConflict(error: unknown): boolean {
+    return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "P2034");
+  }
+
+  private isUniqueConstraintError(error: unknown): boolean {
+    return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "P2002");
   }
 
   private async assertCanMessageAgents(userId: string, participants: Array<{ participantKind: ParticipantKind; participantId: string }>): Promise<void> {

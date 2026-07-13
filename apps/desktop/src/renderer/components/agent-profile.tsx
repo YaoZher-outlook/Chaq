@@ -1,4 +1,4 @@
-import React, { FormEvent, useEffect, useState } from "react";
+import React, { FormEvent, useEffect, useRef, useState } from "react";
 import {
   Activity,
   ArrowLeft,
@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import type { AgentPost, AgentProfile, ConversationMessage } from "@chaq/shared";
 import { api, type LoginUser } from "../lib/api";
+import { PendingMessageKey } from "../lib/message-idempotency";
 import defaultCoverUrl from "../assets/agent-profile-cover-v2.png";
 
 type ProfileTab = "posts" | "about" | "activity";
@@ -51,6 +52,8 @@ export function AgentProfileView(props: {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [chatComposer, setChatComposer] = useState("");
+  const [chatSending, setChatSending] = useState(false);
+  const messageAttempt = useRef(new PendingMessageKey());
 
   const thinking = profile?.agent.presence === "thinking";
   const displayCover = profile?.agent.coverUrl || defaultCoverUrl;
@@ -86,8 +89,12 @@ export function AgentProfileView(props: {
 
   async function choosePostImage(): Promise<void> {
     if (postMedia.length >= 4) return;
-    const image = await window.chaq.files.openImage();
-    if (image) setPostMedia((current) => [...current, image.dataUrl].slice(0, 4));
+    try {
+      const image = await window.chaq.files.openImage();
+      if (image) setPostMedia((current) => [...current, image.dataUrl].slice(0, 4));
+    } catch (error) {
+      props.onNotice(`无法读取动态图片：${messageOf(error)}`);
+    }
   }
 
   async function publishPost(): Promise<void> {
@@ -151,9 +158,9 @@ export function AgentProfileView(props: {
 
   async function chooseCover(): Promise<void> {
     if (!profile?.isOwner) return;
-    const image = await window.chaq.files.openBackgroundImage();
-    if (!image) return;
     try {
+      const image = await window.chaq.files.openBackgroundImage();
+      if (!image) return;
       await api.updateAgent(profile.agent.id, { coverUrl: image.dataUrl });
       await loadProfile(false);
       props.onAgentChanged();
@@ -228,15 +235,20 @@ export function AgentProfileView(props: {
 
   async function sendChat(event: FormEvent): Promise<void> {
     event.preventDefault();
-    if (!conversationId || !chatComposer.trim()) return;
+    if (!conversationId || !chatComposer.trim() || chatSending) return;
     const content = chatComposer.trim();
+    const idempotencyKey = messageAttempt.current.begin(conversationId, content);
     setChatComposer("");
+    setChatSending(true);
     try {
-      const message = await api.sendConversationMessage(conversationId, content);
+      const message = await api.sendConversationMessage(conversationId, content, { idempotencyKey });
+      messageAttempt.current.succeeded(idempotencyKey);
       setMessages((current) => [...current, message]);
     } catch (error) {
-      setChatComposer(content);
+      setChatComposer((current) => current.trim() ? current : content);
       props.onNotice(messageOf(error));
+    } finally {
+      setChatSending(false);
     }
   }
 
@@ -331,7 +343,7 @@ export function AgentProfileView(props: {
         })}
         {thinking && <div className="agent-typing"><i /><i /><i /><span>{profile.agent.name} 正在思考</span></div>}
       </div>
-      <form onSubmit={sendChat}><textarea value={chatComposer} onChange={(event) => setChatComposer(event.target.value)} placeholder={`发消息给 ${profile.agent.name}`} /><button title="发送" disabled={!chatComposer.trim()}><Send size={17} /></button></form>
+      <form onSubmit={sendChat}><textarea value={chatComposer} onChange={(event) => { messageAttempt.current.contentChanged(conversationId, event.target.value); setChatComposer(event.target.value); }} placeholder={`发消息给 ${profile.agent.name}`} /><button title="发送" disabled={!chatComposer.trim() || chatSending}><Send size={17} /></button></form>
     </aside>}
   </div>;
 }

@@ -13,7 +13,7 @@ An Agent owns:
 - Agency: goals, tasks, tools, schedules, action budgets, and token budgets.
 - Social state: directed relationships with trust, familiarity, affinity, sentiment, and interaction history.
 - Social identity: a public profile, cover, current mood/status, presence, posts, reactions, and comments.
-- Communication: human-Agent, Agent-Agent, and group conversations.
+- Communication: human-Agent and Agent-Agent conversations. The schema reserves a group-conversation kind for future support, but no group-conversation workflow is exposed yet.
 - Observability: runs and visible events for observations, plans, actions, messages, memories, goals, and failures.
 
 ## Runtime Topology

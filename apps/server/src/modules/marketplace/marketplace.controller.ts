@@ -18,13 +18,18 @@ const commentSchema = z.object({
   content: z.string().min(1).max(1000)
 });
 
+const listQuerySchema = z.object({
+  query: z.string().trim().max(120).optional(),
+  tag: z.string().trim().max(64).optional()
+});
+
 @Controller("marketplace")
 export class MarketplaceController {
   constructor(@Inject(MarketplaceService) private readonly marketplace: MarketplaceService) {}
 
   @Get()
   list(@Query("query") query?: string, @Query("tag") tag?: string) {
-    return this.marketplace.list({ query, tag });
+    return this.marketplace.list(parseBody(listQuerySchema, { query, tag }));
   }
 
   @Post("publish")

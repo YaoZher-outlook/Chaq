@@ -6,21 +6,32 @@ Use `.env.production.example` as a template. Required secrets:
 
 - `POSTGRES_PASSWORD`: long random database password.
 - `MODEL_SECRET_KEY`: at least 32 random characters, stored in a secret manager.
+- `SESSION_HASH_SECRET`: a different random secret used to hash bearer sessions at rest.
 - `CLIENT_ORIGIN`: exact allowed origin; for the live Chaq host use `https://chaq.yaozher.com`.
 - `PUBLIC_API_URL`: public API base URL; for the live Chaq host use `https://chaq.yaozher.com/api`.
 - `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, and `SMTP_FROM`: transactional email credentials used by registration and email binding.
 
-The production Compose file runs five services: PostgreSQL, Redis, one-shot migration, API, and Agent worker.
+The production Compose file runs five services: PostgreSQL, Redis, one-shot migration, API, and Agent worker. The API and Agent worker also invoke the same production environment validator inside their own bootstrap, before creating a NestJS container. Directly launching either compiled entry therefore fails closed instead of relying on a wrapper or Compose command for validation.
 
 ```bash
 docker compose --env-file .env.production -f docker-compose.production.yml up -d --build
 ```
 
-Do not run `prisma:seed` in production. The development seed creates only `admin / 123456` with `9999` platform tokens and refuses to run when `NODE_ENV=production`.
+Do not run `prisma:seed` in production. The development seed creates only `admin / 123456` with `9999` platform tokens, is denied by default unless `CHAQ_ALLOW_DEMO_SEED=1` is explicitly set, and refuses to run when `NODE_ENV=production` even when that flag is present. Keep `CHAQ_ALLOW_DEMO_SEED=0` in production configuration.
+
+For a deliberate local seed on PowerShell:
+
+```powershell
+$env:CHAQ_ALLOW_DEMO_SEED="1"
+npm.cmd run prisma:seed
+Remove-Item Env:CHAQ_ALLOW_DEMO_SEED
+```
 
 ## Network And TLS
 
 Expose only the API through a TLS reverse proxy. PostgreSQL and Redis have no public port mappings in the production Compose file. Chaq applies Redis-backed application limits; add a second layer of request limits at the proxy and forward only trusted headers. The proxy must pass WebSocket upgrades for `/api/realtime`.
+
+Set `TRUST_PROXY` to the exact trusted hop count or proxy subnet so per-IP limits use the real client address. The Compose example defaults to one hop because its API port is bound only to loopback. Never use `TRUST_PROXY=true`, and do not expose the API directly when trusting forwarded headers.
 
 For the Windows production launcher, Cloudflared should use:
 
@@ -28,7 +39,13 @@ For the Windows production launcher, Cloudflared should use:
 - Service: `http://127.0.0.1:24538`
 - Public API URL: `https://chaq.yaozher.com/api`
 
-Do not put `/api` in the Cloudflared service target. Docker Compose exposes the API through `${PUBLIC_API_PORT:-24537}`; set `PUBLIC_API_PORT=24538` to use the same Cloudflared service target.
+In the Cloudflare Zero Trust dashboard, add a public hostname on the existing tunnel with subdomain `chaq`, domain `yaozher.com`, service type `HTTP`, and service URL `127.0.0.1:24538`. Do not put `/api` in the Cloudflared service target. Docker Compose exposes the API through `${PUBLIC_API_PORT:-24537}`; set `PUBLIC_API_PORT=24538` to use the same Cloudflared service target.
+
+Verify the public entry from the server machine:
+
+```bash
+npm run public:check
+```
 
 Readiness checks use `GET /api/health/ready`; liveness checks use `GET /api/health/live`.
 
@@ -55,6 +72,10 @@ For Docker Compose:
 ```bash
 docker compose --env-file .env.production -f docker-compose.production.yml run --rm -e CHAQ_ADMIN_USERNAME=admin -e CHAQ_ADMIN_PASSWORD='replace-with-a-strong-password' api node scripts/create-admin-user.js
 ```
+
+## Bank Transfer Recharge
+
+Bank-transfer recharge is disabled while `PAYMENT_ACCOUNT_NUMBER` is blank. After configuring the payment account, leave `PAYMENT_PILOT_USERNAME` blank to allow every authenticated account, or set it to one exact username for a limited rollout. The pilot username is enforced only on the server and is not returned to clients. Submitted orders credit no tokens until an administrator confirms that the transfer arrived.
 
 ## Desktop Build
 
@@ -95,12 +116,18 @@ Sign installers before distribution. Keep Electron and Chromium current and test
 
 ## Release Gate
 
+The Agent E2E script accepts only loopback URLs by default. To target a disposable remote staging environment, set both `CHAQ_E2E_SERVER_URL` and `CHAQ_ALLOW_REMOTE_E2E=1`. The script refuses all targets when `NODE_ENV=production`, regardless of the remote opt-in. Never point this destructive development test at a persistent or production environment.
+
 Before a release:
 
 ```bash
 npm test
+npm run lint
 npm run typecheck
+npm run test:coverage
 npm run build
+npm run audit:prod
+node scripts/validate-production-env.js --env-file .env.production
 docker compose --env-file .env.production -f docker-compose.production.yml config
 ```
 

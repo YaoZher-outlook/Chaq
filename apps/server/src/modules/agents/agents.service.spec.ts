@@ -82,14 +82,18 @@ test("agent tasks cannot attach to another agent's goal", async () => {
   );
 });
 
-test("manual agent runs can only bind conversations that include the agent", async () => {
+test("manual agent runs require both the owner user and agent in the conversation", async () => {
   let createdRun = false;
+  let conversationWhere: any;
   const prisma = {
     agent: {
       findFirst: async () => ({ id: "agent-1", ownerId: "owner-1", status: "ACTIVE" })
     },
     conversation: {
-      findFirst: async () => null
+      findFirst: async (input: any) => {
+        conversationWhere = input.where;
+        return null;
+      }
     },
     agentRun: {
       create: async () => {
@@ -107,7 +111,11 @@ test("manual agent runs can only bind conversations that include the agent", asy
 
   await assert.rejects(
     service.runNow("owner-1", "agent-1", "conversation-without-agent"),
-    /Conversation not found for this agent/
+    /Conversation not found for this user and agent/
   );
   assert.equal(createdRun, false);
+  assert.deepEqual(conversationWhere.AND, [
+    { participants: { some: { participantKind: "AGENT", participantId: "agent-1" } } },
+    { participants: { some: { participantKind: "USER", participantId: "owner-1" } } }
+  ]);
 });

@@ -6,7 +6,6 @@ import { hashPassword, hashSessionToken, verifyPassword } from "../../common/pas
 import { PrismaService } from "../../common/prisma.service";
 import { RateLimitService } from "../../common/rate-limit.service";
 
-const defaultRechargePilotUser = "chen_zy";
 const maxTokenBalance = 2_000_000_000;
 
 @Injectable()
@@ -90,8 +89,8 @@ export class UsersService {
   async requestEmailCode(userId: string, emailInput: string): Promise<{ ok: true }> {
     await this.findOrThrow(userId);
     const email = normalizeEmail(emailInput);
+    await this.assertEmailCodeRateLimit(email, "bind_email", userId);
     await this.assertEmailAvailable(email, userId);
-    await this.assertEmailCodeRateLimit(email, "bind_email");
     const code = String(randomInt(100000, 1000000));
     await (this.prisma as any).emailVerificationCode.create({
       data: {
@@ -120,23 +119,36 @@ export class UsersService {
     note?: string
   ) {
     await this.assertAdmin(adminUserId);
-    const target = await this.ensureUser(targetUserId);
-    const balanceAfter = target.tokenBalance + amount;
-    if (balanceAfter < 0) {
-      throw new ForbiddenException("Token balance cannot become negative.");
+    await this.ensureUser(targetUserId);
+    if (!Number.isSafeInteger(amount) || amount === 0) {
+      throw new BadRequestException("Token adjustment must be a non-zero safe integer.");
     }
 
     return this.prisma.$transaction(async (tx) => {
-      const user = await tx.user.update({
-        where: { id: targetUserId },
-        data: { tokenBalance: balanceAfter }
-      });
+      if (amount < 0) {
+        const changed = await tx.user.updateMany({
+          where: { id: targetUserId, tokenBalance: { gte: -amount } },
+          data: { tokenBalance: { decrement: -amount } }
+        });
+        if (!changed.count) {
+          throw new ForbiddenException("Token balance cannot become negative.");
+        }
+      } else {
+        const changed = await tx.user.updateMany({
+          where: { id: targetUserId, tokenBalance: { lte: maxTokenBalance - amount } },
+          data: { tokenBalance: { increment: amount } }
+        });
+        if (!changed.count) {
+          throw new ForbiddenException(`Token balance cannot exceed ${maxTokenBalance}.`);
+        }
+      }
+      const user = await tx.user.findUniqueOrThrow({ where: { id: targetUserId } });
       const transaction = await tx.tokenTransaction.create({
         data: {
           userId: targetUserId,
           kind,
           amount,
-          balanceAfter,
+          balanceAfter: user.tokenBalance,
           note
         }
       });
@@ -182,6 +194,95 @@ export class UsersService {
       }
     });
     return user.tokenBalance;
+  }
+
+  /**
+   * Places a temporary hold by removing tokens from the spendable balance.
+   * No ledger entry is written until the external call is settled, so failed
+   * calls can be released without creating artificial usage/refund rows.
+   */
+  async reserveTokensInTransaction(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    amount: number
+  ): Promise<number> {
+    if (!Number.isInteger(amount) || amount < 0) {
+      throw new BadRequestException("Token reservation amount must be a non-negative integer.");
+    }
+    if (amount > 0) {
+      const changed = await tx.user.updateMany({
+        where: { id: userId, tokenBalance: { gte: amount } },
+        data: { tokenBalance: { decrement: amount } }
+      });
+      if (!changed.count) {
+        throw new ForbiddenException("Token balance is insufficient for the maximum cost of this model call.");
+      }
+    }
+    const user = await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { tokenBalance: true } });
+    return user.tokenBalance;
+  }
+
+  async releaseTokenReservationInTransaction(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    reservedTokens: number
+  ): Promise<number> {
+    if (!Number.isInteger(reservedTokens) || reservedTokens < 0) {
+      throw new BadRequestException("Reserved token amount must be a non-negative integer.");
+    }
+    if (reservedTokens === 0) {
+      return (await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { tokenBalance: true } })).tokenBalance;
+    }
+    const user = await tx.user.update({
+      where: { id: userId },
+      data: { tokenBalance: { increment: reservedTokens } },
+      select: { tokenBalance: true }
+    });
+    return user.tokenBalance;
+  }
+
+  async settleTokenReservationInTransaction(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    reservedTokens: number,
+    charges: Array<{
+      amount: number;
+      kind: TokenTransactionKind;
+      note: string;
+      metadata?: Prisma.InputJsonValue;
+    }>
+  ): Promise<number> {
+    const actualCharge = charges.reduce((sum, charge) => sum + charge.amount, 0);
+    if (!Number.isInteger(reservedTokens) || reservedTokens < 0 || charges.some((charge) => !Number.isInteger(charge.amount) || charge.amount < 0)) {
+      throw new BadRequestException("Token settlement amounts must be non-negative integers.");
+    }
+    if (actualCharge > reservedTokens) {
+      throw new BadRequestException("Actual model charge exceeded the reserved maximum.");
+    }
+    const refund = reservedTokens - actualCharge;
+    const finalBalance = refund > 0
+      ? (await tx.user.update({
+        where: { id: userId },
+        data: { tokenBalance: { increment: refund } },
+        select: { tokenBalance: true }
+      })).tokenBalance
+      : (await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { tokenBalance: true } })).tokenBalance;
+    let followingCharges = actualCharge;
+    for (const charge of charges) {
+      followingCharges -= charge.amount;
+      if (charge.amount === 0) continue;
+      await tx.tokenTransaction.create({
+        data: {
+          userId,
+          kind: charge.kind,
+          amount: -charge.amount,
+          balanceAfter: finalBalance + followingCharges,
+          note: charge.note,
+          metadata: charge.metadata
+        }
+      });
+    }
+    return finalBalance;
   }
 
   async creditTokensInTransaction(
@@ -279,11 +380,10 @@ export class UsersService {
   async rechargeConfig(userId: string) {
     const user = await this.ensureUser(userId);
     const settings = this.paymentSettings();
-    const allowed = user.username === settings.allowedUsername;
+    const allowed = !settings.allowedUsername || user.username === settings.allowedUsername;
     return {
       enabled: settings.enabled,
       allowed,
-      allowedUsername: settings.allowedUsername,
       cnyPerMToken: settings.cnyPerMToken,
       minMToken: settings.minMToken,
       maxMToken: settings.maxMToken,
@@ -299,7 +399,13 @@ export class UsersService {
     if (!settings.enabled) {
       throw new BadRequestException("Recharge collection account is not configured.");
     }
-    const rate = await this.rateLimit.consume("recharge-order-create", userId, 6, 60 * 60);
+    const rate = await this.rateLimit.consume(
+      "recharge-order-create",
+      userId,
+      6,
+      60 * 60,
+      { failureMode: "local" }
+    );
     if (!rate.allowed) {
       throw new BadRequestException(`Recharge order requests are too frequent. Retry after ${rate.retryAfterSeconds} seconds.`);
     }
@@ -453,8 +559,8 @@ export class UsersService {
   }
 
   private assertRechargeAllowed(user: User, settings = this.paymentSettings()): void {
-    if (user.username !== settings.allowedUsername) {
-      throw new ForbiddenException(`Recharge is currently only available for ${settings.allowedUsername}.`);
+    if (settings.allowedUsername && user.username !== settings.allowedUsername) {
+      throw new ForbiddenException("Recharge is not available for this account.");
     }
   }
 
@@ -493,7 +599,7 @@ export class UsersService {
     const cnyPerMToken = this.positiveNumberEnv("PAYMENT_CNY_PER_M_TOKEN", 1);
     return {
       enabled: Boolean(accountNumber),
-      allowedUsername: String(process.env.PAYMENT_PILOT_USERNAME || defaultRechargePilotUser),
+      allowedUsername: String(process.env.PAYMENT_PILOT_USERNAME ?? "").trim() || null,
       bankName: String(process.env.PAYMENT_BANK_NAME || "Manual bank transfer"),
       accountName: String(process.env.PAYMENT_ACCOUNT_NAME || ""),
       accountNumber,
@@ -637,24 +743,35 @@ export class UsersService {
       },
       orderBy: { createdAt: "desc" }
     });
-    if (!record || record.codeHash !== hashSessionToken(code.trim())) {
+    const codeHash = hashSessionToken(code.trim());
+    if (!record || record.codeHash !== codeHash) {
       throw new BadRequestException("邮箱验证码错误或已过期。");
     }
-    await (this.prisma as any).emailVerificationCode.update({
-      where: { id: record.id },
+    const consumed = await (this.prisma as any).emailVerificationCode.updateMany({
+      where: { id: record.id, codeHash, consumedAt: null, expiresAt: { gt: new Date() } },
       data: { consumedAt: new Date() }
     });
+    if (consumed.count !== 1) {
+      throw new BadRequestException("邮箱验证码错误或已过期。");
+    }
   }
 
-  private async assertEmailCodeRateLimit(email: string, purpose: string): Promise<void> {
-    const result = await this.rateLimit.consume(`email-code:${purpose}`, email, 3, 10 * 60);
-    if (!result.allowed) {
-      throw new BadRequestException(`验证码请求过于频繁，请 ${result.retryAfterSeconds} 秒后再试。`);
+  private async assertEmailCodeRateLimit(email: string, purpose: string, actorId?: string): Promise<void> {
+    const checks = [
+      this.rateLimit.consume(`email-code:${purpose}`, email, 3, 10 * 60, { failureMode: "local" })
+    ];
+    if (actorId) {
+      checks.push(this.rateLimit.consume(`email-code-actor:${purpose}`, actorId, 5, 10 * 60, { failureMode: "local" }));
+    }
+    const results = await Promise.all(checks);
+    const blocked = results.find((result) => !result.allowed);
+    if (blocked) {
+      throw new BadRequestException(`验证码请求过于频繁，请 ${blocked.retryAfterSeconds} 秒后再试。`);
     }
   }
 
   private async assertEmailCodeVerifyRateLimit(email: string, purpose: string): Promise<void> {
-    const result = await this.rateLimit.consume(`email-code-verify:${purpose}`, email, 8, 10 * 60);
+    const result = await this.rateLimit.consume(`email-code-verify:${purpose}`, email, 8, 10 * 60, { failureMode: "local" });
     if (!result.allowed) {
       throw new BadRequestException(`验证码尝试过于频繁，请 ${result.retryAfterSeconds} 秒后再试。`);
     }

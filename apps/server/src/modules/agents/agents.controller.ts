@@ -23,7 +23,9 @@ import { CurrentUserId } from "../../common/current-user.decorator";
 import { parseBody } from "../../common/http-errors";
 import { AgentsService } from "./agents.service";
 
-const runSchema = z.object({ conversationId: z.string().optional() });
+const runSchema = z.object({ conversationId: z.string().min(1).max(128).optional() });
+const discoverQuerySchema = z.object({ query: z.string().trim().max(120).optional() });
+const activityQuerySchema = z.object({ agentId: z.string().min(1).max(128).optional() });
 
 @Controller("agents")
 export class AgentsController {
@@ -36,12 +38,12 @@ export class AgentsController {
 
   @Get("activity")
   activity(@CurrentUserId() userId: string, @Query("agentId") agentId?: string) {
-    return this.agents.activity(userId, agentId);
+    return this.agents.activity(userId, parseBody(activityQuerySchema, { agentId }).agentId);
   }
 
   @Get("discover")
   discover(@CurrentUserId() userId: string, @Query("query") query?: string) {
-    return this.agents.discover(userId, query);
+    return this.agents.discover(userId, parseBody(discoverQuerySchema, { query }).query);
   }
 
   @Get("admin/reports")

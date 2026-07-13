@@ -6,10 +6,21 @@ const maxLogBytes = 8 * 1024 * 1024;
 
 export class FileLogger implements LoggerService {
   private readonly logDir: string;
+  private fileLoggingEnabled: boolean;
+  private logDate = "";
+  private logIndex = 0;
 
   constructor() {
     this.logDir = process.env.CHAQ_LOG_DIR || join(findProjectRoot(), ".logs");
-    mkdirSync(this.logDir, { recursive: true });
+    this.fileLoggingEnabled = process.env.CHAQ_LOG_STDOUT_ONLY !== "1";
+    if (this.fileLoggingEnabled) {
+      try {
+        mkdirSync(this.logDir, { recursive: true });
+      } catch (error) {
+        this.fileLoggingEnabled = false;
+        console.warn(`[FileLogger] File logging disabled: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
 
   log(message: unknown, context?: string): void {
@@ -39,23 +50,32 @@ export class FileLogger implements LoggerService {
       context,
       message: message instanceof Error ? message.stack || message.message : String(message)
     });
-    const file = this.filePath();
-    try {
-      appendFileSync(file, `${line}\n`, "utf8");
-      this.console(level, message, context);
-    } catch {
-      this.console(level, message, context);
+    if (this.fileLoggingEnabled) {
+      try {
+        appendFileSync(this.filePath(), `${line}\n`, "utf8");
+      } catch {
+        this.fileLoggingEnabled = false;
+      }
     }
+    this.console(level, message, context);
   }
 
   private filePath(): string {
     const date = new Date().toISOString().slice(0, 10);
-    const base = join(this.logDir, `server-${date}.log`);
-    try {
-      if (statSync(base).size <= maxLogBytes) return base;
-      return join(this.logDir, `server-${date}-${Date.now()}.log`);
-    } catch {
-      return base;
+    if (date !== this.logDate) {
+      this.logDate = date;
+      this.logIndex = 0;
+    }
+
+    while (true) {
+      const suffix = this.logIndex === 0 ? "" : `-${String(this.logIndex).padStart(3, "0")}`;
+      const file = join(this.logDir, `server-${date}${suffix}.log`);
+      try {
+        if (statSync(file).size < maxLogBytes) return file;
+        this.logIndex += 1;
+      } catch {
+        return file;
+      }
     }
   }
 

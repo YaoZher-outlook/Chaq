@@ -20,7 +20,7 @@ See [Agent runtime](docs/agent-runtime.md), [architecture](docs/architecture.md)
 
 ## Local Start
 
-Requirements: Node.js 20.11+, PostgreSQL binaries configured under `E:\Environment\pgsql`, and Docker Desktop for Redis.
+Requirements: Node.js 22.12+, npm 11.18.0 (the version pinned in `package.json`), PostgreSQL binaries available under the repository-relative `.chaq-data\postgresql\bin` directory (or configured with `CHAQ_PG_BIN`), and Docker Desktop for Redis.
 
 On Windows, use:
 
@@ -30,7 +30,7 @@ tools\start-server-prod.bat
 tools\start-client.bat
 ```
 
-Start the server first. `start-server-dev.bat` prepares the environment, starts PostgreSQL and Redis, applies migrations, then launches both the NestJS API and Agent worker in watch mode on `127.0.0.1:24537`. `start-server-prod.bat` builds and starts the production API and Agent worker on `0.0.0.0:24538`, manages them in the background, and mirrors output into `.logs`. `start-client.bat` launches the packaged Electron desktop app and rebuilds it when desktop source files are newer than the packaged executable.
+Start the server first. `start-server-dev.bat` prepares the environment, starts PostgreSQL and Redis, applies migrations, explicitly enables the idempotent demo seed for that one initialization step, then launches both the NestJS API and Agent worker in watch mode on `127.0.0.1:24537`. `start-server-prod.bat` builds and starts the production API and Agent worker on `0.0.0.0:24538`, manages them in the background, and mirrors output into `.logs`. `start-client.bat` launches the packaged Electron desktop app and rebuilds it when desktop source files are newer than the packaged executable.
 
 There are two server modes:
 
@@ -52,11 +52,14 @@ Default ports:
 Manual commands:
 
 ```bat
-npm.cmd install
+node scripts\install-dependencies.js
 npm.cmd run env:prepare
 npm.cmd run infra:local
 npm.cmd run prisma:generate
 npm.cmd exec -w @chaq/server -- prisma migrate deploy
+set "CHAQ_ALLOW_DEMO_SEED=1"
+npm.cmd run prisma:seed
+set "CHAQ_ALLOW_DEMO_SEED=0"
 npm.cmd run dev:server
 npm.cmd run dev:desktop
 ```
@@ -86,12 +89,12 @@ Use the Agent memory tab's RAG preview box to test a query against the Agent kno
 
 ## Local Storage
 
-The default local environment root is `E:\Environment\Chaq`, unless `CHAQ_ENV_ROOT` is set.
+Development data defaults to the repository-relative `.chaq-data` directory. A packaged desktop build first tries `.chaq-data` beside the executable and falls back to `Desktop\Chaq` only when that location is not writable. `CHAQ_ENV_ROOT` remains an explicit override and stores Chaq data in its `Chaq` child directory.
 
-- Electron user data and local SQLite: `E:\Environment\Chaq\user-data\chaq.db`.
-- Chromium/runtime cache: `E:\Environment\Chaq\runtime-cache-v2\`.
-- Electron download cache: `E:\Environment\Chaq\electron-cache\`.
-- npm cache used by the launchers: `E:\Environment\Chaq\npm-cache\`.
+- Electron user data and local SQLite: `.chaq-data\user-data\chaq.db`.
+- Chromium/runtime cache: `.chaq-data\runtime-cache-v2\`.
+- Electron download cache: `.chaq-data\electron-cache\`.
+- npm cache: `.chaq-data\npm-cache\`.
 
 Local SQLite table IDs use generated IDs from the app or synced cloud IDs. Imported chat files keep the selected original file name in the `imports.fileName` column; selected images are stored as data URLs in the relevant settings/profile fields for now, not copied into a separate media directory.
 
@@ -106,14 +109,12 @@ For a reply triggered by a human message, the message author pays the platform m
 ## Validation
 
 ```bat
-npm.cmd test
-npm.cmd run typecheck
-npm.cmd run build
+npm.cmd run ci:check
 npm.cmd run test:e2e:agent
 npm.cmd run test:e2e:billing
 ```
 
-Run the E2E commands while the API and worker are running. `test:e2e:agent` uses `admin` by default. `test:e2e:billing` needs an existing non-admin test account set with `CHAQ_E2E_BILLING_USER` and optionally `CHAQ_E2E_BILLING_PASSWORD`; it uses a local mock model to verify contacts, Agent replies, caller debits, and creator earnings. Never run development E2E tests against production.
+`ci:check` generates Prisma Client, lints, type-checks, runs tests with coverage, builds every workspace, and audits dependencies. Run the E2E commands while the API and worker are running. `test:e2e:agent` uses `admin` by default and only accepts a loopback `CHAQ_E2E_SERVER_URL`; targeting a disposable remote staging environment requires the explicit `CHAQ_ALLOW_REMOTE_E2E=1` opt-in. It always refuses to run when `NODE_ENV=production`. `test:e2e:billing` needs an existing non-admin test account set with `CHAQ_E2E_BILLING_USER` and optionally `CHAQ_E2E_BILLING_PASSWORD`; it uses a local mock model to verify contacts, Agent replies, caller debits, and creator earnings. Never run development E2E tests against production.
 
 Health endpoints:
 
@@ -125,7 +126,9 @@ Health endpoints:
 Demo data is development-only and is never seeded automatically in production.
 
 ```bat
+set "CHAQ_ALLOW_DEMO_SEED=1"
 npm.cmd run prisma:seed
+set "CHAQ_ALLOW_DEMO_SEED=0"
 ```
 
 The development seed creates one admin account only:
@@ -134,7 +137,7 @@ The development seed creates one admin account only:
 - Password: `123456`
 - Balance: `9999` platform tokens
 
-The seed refuses to run when `NODE_ENV=production`, and app startup no longer upserts missing users automatically.
+The seed is denied by default and requires the exact `CHAQ_ALLOW_DEMO_SEED=1` local opt-in. It refuses to run when `NODE_ENV=production` even if that flag is present. The development launcher scopes the opt-in to its seed command, and app startup no longer upserts missing users automatically.
 
 ## Production
 
@@ -144,9 +147,17 @@ Copy `.env.production.example` to a secure environment file, replace every place
 docker compose --env-file .env.production -f docker-compose.production.yml up -d --build
 ```
 
-`MODEL_SECRET_KEY` is mandatory in production and encrypts provider credentials with AES-256-GCM. Put the API behind TLS and set `CLIENT_ORIGIN` to the exact desktop/web origin allowed by CORS. See [deployment](docs/deployment.md) before exposing the service publicly.
+`MODEL_SECRET_KEY` is mandatory in production and encrypts provider credentials with AES-256-GCM. Both the API and Agent worker validate the production environment inside their own bootstrap and fail before creating a NestJS container when configuration is invalid, including when launched without the provided wrapper. Put the API behind TLS and set `CLIENT_ORIGIN` to the exact desktop/web origin allowed by CORS. See [deployment](docs/deployment.md) before exposing the service publicly.
 
 For a self-hosted Windows production server, run `tools\start-server-prod.bat` and route Cloudflared to `http://127.0.0.1:24538`. Packaged desktop builds default to `https://chaq.yaozher.com/api`; local API fallbacks are used only in development or when `VITE_ALLOW_LOCAL_API_FALLBACK=1` is set.
+
+Check the public entry before launching the online desktop client:
+
+```bat
+npm.cmd run public:check
+```
+
+If DNS does not resolve, add a Cloudflare Zero Trust public hostname on the existing tunnel: subdomain `chaq`, domain `yaozher.com`, service type `HTTP`, service URL `127.0.0.1:24538`.
 
 Create the first production administrator after migrations:
 

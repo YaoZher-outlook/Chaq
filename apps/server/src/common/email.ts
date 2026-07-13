@@ -49,23 +49,33 @@ async function sendMail(options: MailOptions): Promise<void> {
   let socket: SmtpSocket = secure
     ? tlsConnect({ host, port, servername: host })
     : createConnection({ host, port });
+  setSmtpTimeout(socket);
 
-  const reader = createSmtpReader(socket);
-  await reader.expect();
-  await writeCommand(socket, reader, `EHLO ${process.env.SMTP_EHLO_HOST || "localhost"}`);
+  try {
+    const reader = createSmtpReader(socket);
+    await reader.expect();
+    await writeCommand(socket, reader, `EHLO ${process.env.SMTP_EHLO_HOST || "localhost"}`);
 
-  if (!secure && process.env.SMTP_STARTTLS !== "0") {
-    await writeCommand(socket, reader, "STARTTLS");
-    socket = tlsConnect({ socket, servername: host });
-    const tlsReader = createSmtpReader(socket);
-    await writeCommand(socket, tlsReader, `EHLO ${process.env.SMTP_EHLO_HOST || "localhost"}`);
-    await authenticate(socket, tlsReader, user, pass);
-    await sendMessage(socket, tlsReader, from, options);
-    return;
+    if (!secure && process.env.SMTP_STARTTLS !== "0") {
+      await writeCommand(socket, reader, "STARTTLS");
+      reader.dispose();
+      socket = tlsConnect({ socket, servername: host });
+      setSmtpTimeout(socket);
+      const tlsReader = createSmtpReader(socket);
+      await writeCommand(socket, tlsReader, `EHLO ${process.env.SMTP_EHLO_HOST || "localhost"}`);
+      await authenticate(socket, tlsReader, user, pass);
+      await sendMessage(socket, tlsReader, from, options);
+      tlsReader.dispose();
+      return;
+    }
+
+    await authenticate(socket, reader, user, pass);
+    await sendMessage(socket, reader, from, options);
+    reader.dispose();
+  } catch (error) {
+    socket.destroy();
+    throw error;
   }
-
-  await authenticate(socket, reader, user, pass);
-  await sendMessage(socket, reader, from, options);
 }
 
 async function authenticate(socket: SmtpSocket, reader: ReturnType<typeof createSmtpReader>, user?: string, pass?: string): Promise<void> {
@@ -94,31 +104,48 @@ async function sendMessage(socket: SmtpSocket, reader: ReturnType<typeof createS
   socket.end();
 }
 
-function createSmtpReader(socket: SmtpSocket) {
+export function createSmtpReader(socket: SmtpSocket) {
   let buffer = "";
-  const waiters: Array<(line: string) => void> = [];
+  const lines: string[] = [];
+  const waiters: Array<{ resolve: (line: string) => void; reject: (error: Error) => void }> = [];
 
   socket.setEncoding("utf8");
-  socket.on("data", (chunk) => {
+  const onData = (chunk: string | Buffer) => {
     buffer += chunk;
     flush();
-  });
+  };
+  const onError = (error: Error) => fail(error);
+  const onClose = () => fail(new Error("SMTP connection closed before a complete response was received."));
+  socket.on("data", onData);
+  socket.on("error", onError);
+  socket.on("close", onClose);
 
   function flush() {
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
+    const complete = buffer.split(/\r?\n/);
+    buffer = complete.pop() ?? "";
+    for (const line of complete) {
       const waiter = waiters.shift();
-      if (waiter) waiter(line);
+      if (waiter) waiter.resolve(line);
+      else lines.push(line);
     }
   }
 
+  function fail(error: Error) {
+    for (const waiter of waiters.splice(0)) waiter.reject(error);
+  }
+
+  function nextLine(): Promise<string> {
+    const line = lines.shift();
+    if (line !== undefined) return Promise.resolve(line);
+    return new Promise<string>((resolve, reject) => waiters.push({ resolve, reject }));
+  }
+
   async function readResponse(): Promise<string[]> {
-    const lines: string[] = [];
+    const responseLines: string[] = [];
     while (true) {
-      const line = await new Promise<string>((resolve) => waiters.push(resolve));
-      lines.push(line);
-      if (/^\d{3} /.test(line)) return lines;
+      const line = await nextLine();
+      responseLines.push(line);
+      if (/^\d{3} /.test(line)) return responseLines;
     }
   }
 
@@ -130,8 +157,19 @@ function createSmtpReader(socket: SmtpSocket) {
         throw new Error(`SMTP error: ${lines.join(" | ")}`);
       }
       return lines;
+    },
+    dispose(): void {
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("close", onClose);
     }
   };
+}
+
+function setSmtpTimeout(socket: SmtpSocket): void {
+  const configured = Number(process.env.SMTP_TIMEOUT_MS ?? 15_000);
+  const timeoutMs = Math.min(60_000, Math.max(5_000, Number.isFinite(configured) ? configured : 15_000));
+  socket.setTimeout(timeoutMs, () => socket.destroy(new Error(`SMTP operation timed out after ${timeoutMs}ms.`)));
 }
 
 async function writeCommand(socket: SmtpSocket, reader: ReturnType<typeof createSmtpReader>, command: string, allowed?: number[]): Promise<string[]> {

@@ -91,11 +91,20 @@ export class AgentWorkerService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async recoverQueuedRuns(): Promise<void> {
-    const staleBefore = new Date(Date.now() - 30 * 60_000);
+    const now = new Date();
+    const legacyStaleBefore = new Date(now.getTime() - 30 * 60_000);
     const recovered = await this.prisma.agentRun.updateMany({
-      where: { status: AgentRunStatus.RUNNING, startedAt: { lt: staleBefore } },
+      where: {
+        status: AgentRunStatus.RUNNING,
+        OR: [
+          { leaseExpiresAt: { lt: now } },
+          { leaseExpiresAt: null, startedAt: { lt: legacyStaleBefore } }
+        ]
+      },
       data: {
         status: AgentRunStatus.QUEUED,
+        executionId: null,
+        leaseExpiresAt: null,
         startedAt: null,
         error: "Recovered after the worker stopped before completing this run."
       }

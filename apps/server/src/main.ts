@@ -1,11 +1,14 @@
 import "reflect-metadata";
-import { createHash } from "node:crypto";
 import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./app.module";
 import { FileLogger } from "./common/file-logger";
 import { AuthService } from "./modules/auth/auth.service";
 import { RateLimitService } from "./common/rate-limit.service";
 import { RealtimeService } from "./common/realtime.service";
+import { apiRateLimitIdentities, credentialRateLimitIdentities } from "./common/credential-rate-limit";
+import { isAllowedClientOrigin } from "./common/cors-origin";
+import { isPublicHealthPath } from "./common/public-route";
+import { assertProductionEnvironmentOnBootstrap } from "./common/production-env-bootstrap";
 
 type ExpressMiddleware = (request: unknown, response: unknown, next: () => void) => void;
 type CorsOriginCallback = (error: Error | null, allow?: boolean) => void;
@@ -15,6 +18,8 @@ const expressBody = require("express") as {
 };
 
 type SessionRequest = {
+  body?: unknown;
+  ip?: string;
   method?: string;
   path?: string;
   headers: Record<string, string | string[] | undefined>;
@@ -28,8 +33,10 @@ type SessionResponse = {
 };
 
 async function bootstrap(): Promise<void> {
+  assertProductionEnvironmentOnBootstrap("Chaq API");
   const logger = new FileLogger();
   const app = await NestFactory.create(AppModule, { bodyParser: false, logger });
+  configureTrustedProxy(app.getHttpAdapter().getInstance() as { set: (name: string, value: string | number | string[]) => void });
   app.use(expressBody.json({ limit: "12mb" }));
   app.use(expressBody.urlencoded({ extended: true, limit: "12mb" }));
   const defaultClientOrigin = process.env.NODE_ENV === "production"
@@ -47,7 +54,7 @@ async function bootstrap(): Promise<void> {
         callback(null, true);
         return;
       }
-      if (configuredOrigins.has(origin) || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) {
+      if (isAllowedClientOrigin(origin, configuredOrigins, process.env.NODE_ENV === "production")) {
         callback(null, true);
         return;
       }
@@ -62,13 +69,17 @@ async function bootstrap(): Promise<void> {
   app.get(RealtimeService).bind(app.getHttpServer(), auth);
   app.use(async (request: SessionRequest, response: SessionResponse, next: () => void) => {
     const path = request.path ?? "";
-    const isHealth = path.includes("/health/");
+    const isHealth = isPublicHealthPath(path);
     const isCredentialRoute = path.endsWith("/auth/login") || path.endsWith("/auth/register") || path.endsWith("/auth/register/code");
     if (!isHealth && request.method !== "OPTIONS") {
-      const header = request.headers["x-session-token"];
-      const token = Array.isArray(header) ? header[0] : header;
-      const identity = createHash("sha256").update(token || request.socket?.remoteAddress || "unknown").digest("hex").slice(0, 24);
-      const result = await rateLimit.consume(isCredentialRoute ? "credential" : "api", identity, isCredentialRoute ? 20 : 300, isCredentialRoute ? 600 : 60);
+      const results = isCredentialRoute
+        ? await credentialRateLimits(rateLimit, request)
+        : await apiRateLimits(rateLimit, request);
+      const result = results.reduce((strictest, current) => {
+        if (!current.allowed && strictest.allowed) return current;
+        if (current.allowed === strictest.allowed && current.remaining < strictest.remaining) return current;
+        return strictest;
+      });
       response.setHeader("X-RateLimit-Limit", result.limit);
       response.setHeader("X-RateLimit-Remaining", result.remaining);
       if (!result.allowed) {
@@ -106,6 +117,43 @@ async function bootstrap(): Promise<void> {
   const host = process.env.SERVER_HOST || "127.0.0.1";
   await app.listen(port, host);
   logger.log(`Chaq server listening on http://${host}:${port}/api`, "Bootstrap");
+}
+
+async function apiRateLimits(rateLimit: RateLimitService, request: SessionRequest) {
+  const identities = apiRateLimitIdentities(request);
+  const checks = [
+    rateLimit.consume("api:ip", identities.ip, 600, 60, { failureMode: "local" })
+  ];
+  if (identities.session) {
+    checks.push(rateLimit.consume("api:session", identities.session, 300, 60, { failureMode: "local" }));
+  }
+  return Promise.all(checks);
+}
+
+async function credentialRateLimits(rateLimit: RateLimitService, request: SessionRequest) {
+  const identities = credentialRateLimitIdentities(request);
+  const checks = [
+    rateLimit.consume("credential:ip", identities.ip, 60, 10 * 60, { failureMode: "local" })
+  ];
+  if (identities.account) {
+    checks.push(rateLimit.consume("credential:account", identities.account, 10, 10 * 60, { failureMode: "local" }));
+  }
+  return Promise.all(checks);
+}
+
+function configureTrustedProxy(expressApp: { set: (name: string, value: string | number | string[]) => void }): void {
+  const raw = process.env.TRUST_PROXY?.trim();
+  if (!raw) return;
+  if (raw.toLowerCase() === "true") {
+    throw new Error("TRUST_PROXY=true is unsafe; configure a hop count or explicit proxy subnet instead.");
+  }
+  if (/^\d+$/.test(raw)) {
+    const hops = Number(raw);
+    if (hops < 1 || hops > 10) throw new Error("TRUST_PROXY hop count must be between 1 and 10.");
+    expressApp.set("trust proxy", hops);
+    return;
+  }
+  expressApp.set("trust proxy", raw.split(",").map((value) => value.trim()).filter(Boolean));
 }
 
 bootstrap().catch((error) => {

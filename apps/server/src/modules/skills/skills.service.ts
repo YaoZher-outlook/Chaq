@@ -158,6 +158,13 @@ export class SkillsService {
     }
   ) {
     await this.users.ensureUser(userId);
+    if (input.skillId) {
+      const ownedSkill = await this.prisma.skill.findFirst({
+        where: { id: input.skillId, ownerId: userId },
+        select: { id: true }
+      });
+      if (!ownedSkill) throw new NotFoundException("Skill not found.");
+    }
     return this.prisma.skillSource.create({
       data: {
         userId,

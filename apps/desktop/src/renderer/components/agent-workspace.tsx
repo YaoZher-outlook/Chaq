@@ -43,6 +43,8 @@ import type {
   SkillSummary
 } from "@chaq/shared";
 import { api, type LoginUser } from "../lib/api";
+import { LatestRequestGate, isSupersededRequest } from "../lib/latest-request";
+import { PendingMessageKey } from "../lib/message-idempotency";
 import { AgentProfileView } from "./agent-profile";
 
 type AgentTab = "chat" | "identity" | "goals" | "memory" | "relationships" | "activity";
@@ -81,6 +83,12 @@ export function AgentWorkspace(props: {
   const [agentSearch, setAgentSearch] = useState("");
   const [profileAgentId, setProfileAgentId] = useState<string | null>(null);
   const [profileInitialChat, setProfileInitialChat] = useState(false);
+  const selectionRequests = useRef(new LatestRequestGate());
+  const pollRequests = useRef(new LatestRequestGate());
+  const sendRequests = useRef(new LatestRequestGate());
+  const selectedAgentIdRef = useRef<string | null>(null);
+  const conversationIdRef = useRef<string | null>(null);
+  const messageAttempt = useRef(new PendingMessageKey());
 
   const filteredAgents = useMemo(() => {
     const query = agentSearch.trim().toLowerCase();
@@ -95,6 +103,11 @@ export function AgentWorkspace(props: {
 
   useEffect(() => {
     void refreshDirectory();
+    return () => {
+      selectionRequests.current.cancel();
+      pollRequests.current.cancel();
+      sendRequests.current.cancel();
+    };
   }, []);
 
   useEffect(() => {
@@ -104,22 +117,18 @@ export function AgentWorkspace(props: {
   useEffect(() => {
     const timer = setInterval(() => void poll(), 10_000);
     return () => clearInterval(timer);
-  }, [selectedAgentId, conversationId]);
+  }, []);
 
   useEffect(() => {
     const listener = (event: Event) => {
       const detail = (event as CustomEvent<{ type?: string; payload?: unknown }>).detail;
       if (detail?.type !== "conversation.message") return;
       const message = detail.payload as Partial<ConversationMessage> | null;
-      if (message?.id && message.conversationId === conversationId && typeof message.content === "string") {
+      if (message?.id && message.conversationId === conversationIdRef.current && typeof message.content === "string") {
         setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message as ConversationMessage]);
-        void api.markConversationRead(conversationId);
+        void api.markConversationRead(message.conversationId);
       }
-      void api.conversations().then(setConversations).catch(() => undefined);
-      if (selectedAgentId) {
-        void api.agentActivity(selectedAgentId).then(setActivity).catch(() => undefined);
-        void api.agent(selectedAgentId).then(setAgent).catch(() => undefined);
-      }
+      void poll();
     };
     window.addEventListener("chaq:realtime", listener);
     return () => window.removeEventListener("chaq:realtime", listener);
@@ -127,51 +136,78 @@ export function AgentWorkspace(props: {
 
   async function refreshDirectory(): Promise<void> {
     try {
-      const [nextAgents, nextContacts, nextConversations, nextActivity] = await Promise.all([
+      const [nextAgents, nextContacts, nextConversations] = await Promise.all([
         api.agents(),
         api.agentContacts(),
-        api.conversations(),
-        api.agentActivity()
+        api.conversations()
       ]);
       setAgents(nextAgents);
       setContacts(nextContacts);
       setConversations(nextConversations);
-      setActivity(nextActivity);
     } catch (error) {
       props.onNotice(messageOf(error));
     }
   }
 
   async function poll(): Promise<void> {
+    const agentId = selectedAgentIdRef.current;
+    const activeConversationId = conversationIdRef.current;
+    const resourceId = selectionResource(agentId, activeConversationId);
+    const request = pollRequests.current.begin(resourceId);
     try {
-      const tasks: Promise<unknown>[] = [api.agents().then(setAgents), api.agentContacts().then(setContacts), api.conversations().then(setConversations)];
-      if (selectedAgentId) tasks.push(api.agent(selectedAgentId).then(setAgent), api.agentActivity(selectedAgentId).then(setActivity));
-      if (conversationId) tasks.push(api.conversationMessages(conversationId).then(setMessages));
-      await Promise.all(tasks);
-    } catch {
+      const [nextAgents, nextContacts, nextConversations, nextAgent, nextActivity, nextMessages] = await pollRequests.current.guard(request, Promise.all([
+        api.agents(request.signal),
+        api.agentContacts(request.signal),
+        api.conversations(request.signal),
+        agentId ? api.agent(agentId, request.signal) : Promise.resolve(null),
+        agentId ? api.agentActivity(agentId, request.signal) : Promise.resolve(null),
+        activeConversationId ? api.conversationMessages(activeConversationId, request.signal) : Promise.resolve(null)
+      ]));
+      if (!pollRequests.current.isCurrent(request, selectionResource(selectedAgentIdRef.current, conversationIdRef.current))) return;
+      setAgents(nextAgents);
+      setContacts(nextContacts);
+      setConversations(nextConversations);
+      if (nextAgent) setAgent(nextAgent);
+      if (nextActivity) setActivity(nextActivity);
+      if (nextMessages) setMessages(nextMessages);
+    } catch (error) {
+      if (isSupersededRequest(error)) return;
       // Polling is best effort; foreground actions surface errors.
     }
   }
 
   async function selectAgent(id: string): Promise<void> {
+    const resourceId = `agent:${id}`;
+    const request = selectionRequests.current.begin(resourceId);
+    pollRequests.current.cancel();
+    sendRequests.current.cancel();
+    messageAttempt.current.clear();
+    selectedAgentIdRef.current = id;
+    conversationIdRef.current = null;
     setSelectedAgentId(id);
+    setConversationId(null);
+    setAgent(null);
+    setActivity([]);
+    setMessages([]);
     setBusy(true);
     try {
-      const [detail, conversation, events] = await Promise.all([
-        api.agent(id),
-        api.conversationWithAgent(id),
-        api.agentActivity(id)
-      ]);
+      const [detail, conversation, events] = await selectionRequests.current.guard(request, Promise.all([
+        api.agent(id, request.signal),
+        api.conversationWithAgent(id, request.signal),
+        api.agentActivity(id, request.signal)
+      ]));
+      const rows = await selectionRequests.current.guard(request, api.conversationMessages(conversation.id, request.signal));
+      if (!selectionRequests.current.isCurrent(request, resourceId) || selectedAgentIdRef.current !== id) return;
+      conversationIdRef.current = conversation.id;
       setAgent(detail);
       setConversationId(conversation.id);
       setActivity(events);
-      const rows = await api.conversationMessages(conversation.id);
       setMessages(rows);
       void api.markConversationRead(conversation.id);
     } catch (error) {
-      props.onNotice(messageOf(error));
+      if (!isSupersededRequest(error) && selectionRequests.current.isCurrent(request, resourceId)) props.onNotice(messageOf(error));
     } finally {
-      setBusy(false);
+      if (selectionRequests.current.isCurrent(request, resourceId)) setBusy(false);
     }
   }
 
@@ -183,57 +219,98 @@ export function AgentWorkspace(props: {
       setProfileAgentId(participant.participantId);
       return;
     }
-    if (participant && owned) {
-      setSelectedAgentId(participant.participantId);
-      setAgent(await api.agent(participant.participantId));
-      setActivity(await api.agentActivity(participant.participantId));
-    }
+    const agentId = participant && owned ? participant.participantId : null;
+    const resourceId = `conversation:${conversation.id}:agent:${agentId ?? "none"}`;
+    const request = selectionRequests.current.begin(resourceId);
+    pollRequests.current.cancel();
+    sendRequests.current.cancel();
+    messageAttempt.current.clear();
+    selectedAgentIdRef.current = agentId;
+    conversationIdRef.current = conversation.id;
+    setSelectedAgentId(agentId);
     setConversationId(conversation.id);
-    setMessages(await api.conversationMessages(conversation.id));
+    setAgent(null);
+    setActivity([]);
+    setMessages([]);
     setTab("chat");
-    void api.markConversationRead(conversation.id);
+    setBusy(true);
+    try {
+      const [nextAgent, nextActivity, nextMessages] = await selectionRequests.current.guard(request, Promise.all([
+        agentId ? api.agent(agentId, request.signal) : Promise.resolve(null),
+        agentId ? api.agentActivity(agentId, request.signal) : Promise.resolve([]),
+        api.conversationMessages(conversation.id, request.signal)
+      ]));
+      if (!selectionRequests.current.isCurrent(request, resourceId)
+        || conversationIdRef.current !== conversation.id
+        || selectedAgentIdRef.current !== agentId) return;
+      setAgent(nextAgent);
+      setActivity(nextActivity);
+      setMessages(nextMessages);
+      void api.markConversationRead(conversation.id);
+    } catch (error) {
+      if (!isSupersededRequest(error) && selectionRequests.current.isCurrent(request, resourceId)) props.onNotice(messageOf(error));
+    } finally {
+      if (selectionRequests.current.isCurrent(request, resourceId)) setBusy(false);
+    }
   }
 
   async function sendMessage(event: FormEvent): Promise<void> {
     event.preventDefault();
-    if (!conversationId || !composer.trim() || busy) return;
+    const targetConversationId = conversationIdRef.current;
+    if (!targetConversationId || !composer.trim() || busy) return;
     if (composer.length > CHAT_COMPOSER_MAX_LENGTH) {
       props.onNotice(`Message is too long. Keep it under ${CHAT_COMPOSER_MAX_LENGTH} characters.`);
       return;
     }
     const content = composer.trim();
+    const resourceId = `conversation:${targetConversationId}`;
+    const request = sendRequests.current.begin(resourceId);
+    pollRequests.current.cancel();
+    const idempotencyKey = messageAttempt.current.begin(targetConversationId, content);
     setComposer("");
     setBusy(true);
     try {
-      const created = await api.sendConversationMessage(conversationId, content);
-      setMessages((current) => [...current, created]);
+      const created = await sendRequests.current.guard(request, api.sendConversationMessage(targetConversationId, content, { idempotencyKey }, request.signal));
+      messageAttempt.current.succeeded(idempotencyKey);
+      if (!sendRequests.current.isCurrent(request, resourceId) || conversationIdRef.current !== targetConversationId) return;
+      setMessages((current) => current.some((item) => item.id === created.id) ? current : [...current, created]);
       props.onNotice("消息已发送，Agent 正在思考");
     } catch (error) {
-      setComposer(content);
+      if (isSupersededRequest(error)) return;
+      if (!sendRequests.current.isCurrent(request, resourceId) || conversationIdRef.current !== targetConversationId) return;
+      setComposer((current) => current.trim() ? current : content);
       props.onNotice(messageOf(error));
     } finally {
-      setBusy(false);
+      if (sendRequests.current.isCurrent(request, resourceId)) setBusy(false);
     }
   }
 
   async function runNow(): Promise<void> {
     if (!agent) return;
+    const targetAgent = agent;
+    const selectionGeneration = selectionRequests.current.snapshot();
     setBusy(true);
     try {
-      await api.runAgent(agent.id, conversationId ?? undefined);
-      props.onNotice(`${agent.name} 已进入运行队列`);
+      await api.runAgent(targetAgent.id, conversationIdRef.current ?? undefined);
+      if (selectionRequests.current.snapshot() !== selectionGeneration || selectedAgentIdRef.current !== targetAgent.id) return;
+      props.onNotice(`${targetAgent.name} 已进入运行队列`);
       setTab("activity");
       await poll();
     } catch (error) {
-      props.onNotice(messageOf(error));
+      if (selectionRequests.current.snapshot() === selectionGeneration && selectedAgentIdRef.current === targetAgent.id) {
+        props.onNotice(messageOf(error));
+      }
     } finally {
-      setBusy(false);
+      if (selectionRequests.current.snapshot() === selectionGeneration && selectedAgentIdRef.current === targetAgent.id) setBusy(false);
     }
   }
 
   async function togglePause(): Promise<void> {
     if (!agent) return;
-    const next = await api.updateAgent(agent.id, { status: agent.status === "paused" ? "active" : "paused" });
+    const targetAgent = agent;
+    const selectionGeneration = selectionRequests.current.snapshot();
+    const next = await api.updateAgent(targetAgent.id, { status: targetAgent.status === "paused" ? "active" : "paused" });
+    if (selectionRequests.current.snapshot() !== selectionGeneration || selectedAgentIdRef.current !== targetAgent.id) return;
     setAgent(next);
     await refreshDirectory();
   }
@@ -307,8 +384,8 @@ export function AgentWorkspace(props: {
               <AgentTabButton active={tab === "activity"} icon={<Activity />} label="活动" onClick={() => setTab("activity")} />
             </nav>
             <div className="agent-stage-body">
-              {tab === "chat" && <AgentChat agent={agent} user={props.user} messages={messages} composer={composer} setComposer={setComposer} busy={busy} thinking={agent.presence === "thinking"} onSubmit={sendMessage} />}
-              {tab === "identity" && <AgentIdentityEditor agent={agent} providers={props.providers} onSaved={(next) => { setAgent(next); void refreshDirectory(); }} onNotice={props.onNotice} />}
+              {tab === "chat" && <AgentChat agent={agent} user={props.user} messages={messages} composer={composer} setComposer={(value) => { messageAttempt.current.contentChanged(conversationIdRef.current, value); setComposer(value); }} busy={busy} thinking={agent.presence === "thinking"} onSubmit={sendMessage} />}
+              {tab === "identity" && <AgentIdentityEditor key={agent.id} agent={agent} providers={props.providers} onSaved={(next) => { setAgent((current) => current?.id === next.id ? next : current); void refreshDirectory(); }} onNotice={props.onNotice} />}
               {tab === "goals" && <AgentGoals agent={agent} onChanged={() => void selectAgent(agent.id)} onNotice={props.onNotice} />}
               {tab === "memory" && <AgentMemoryPanel agent={agent} onChanged={() => void selectAgent(agent.id)} onNotice={props.onNotice} />}
               {tab === "relationships" && <AgentRelationships agent={agent} onOpenProfile={setProfileAgentId} onChanged={() => void selectAgent(agent.id)} onNotice={props.onNotice} />}
@@ -323,7 +400,7 @@ export function AgentWorkspace(props: {
       {agent && <AgentPulse agent={agent} events={activity} />}
       {showExplore && <AgentExplore onClose={() => setShowExplore(false)} onOpenProfile={(id) => { setShowExplore(false); setProfileInitialChat(false); setProfileAgentId(id); }} onChanged={() => void refreshDirectory()} onNotice={props.onNotice} />}
       {showCreate && <CreateAgentDialog providers={props.providers} skills={props.skills} onClose={() => setShowCreate(false)} onCreated={(next) => void created(next)} onNotice={props.onNotice} />}
-      {profileAgentId && <AgentProfileView agentId={profileAgentId} user={props.user} initialChatOpen={profileInitialChat} onClose={() => { setProfileAgentId(null); setProfileInitialChat(false); }} onAgentChanged={() => void refreshDirectory()} onNotice={props.onNotice} />}
+      {profileAgentId && <AgentProfileView key={profileAgentId} agentId={profileAgentId} user={props.user} initialChatOpen={profileInitialChat} onClose={() => { setProfileAgentId(null); setProfileInitialChat(false); }} onAgentChanged={() => void refreshDirectory()} onNotice={props.onNotice} />}
     </section>
   );
 }
@@ -486,26 +563,30 @@ function AgentChat(props: {
   </div>;
 }
 
+function agentIdentityForm(agent: AgentDetail) {
+  return {
+    name: agent.name,
+    tagline: agent.tagline,
+    biography: agent.biography,
+    persona: agent.persona,
+    tone: agent.tone,
+    worldview: agent.worldview,
+    boundaries: agent.boundaries,
+    values: agent.values.join(", "),
+    autonomyMode: agent.autonomyMode,
+    visibility: agent.visibility,
+    serviceFee: agent.serviceFee,
+    modelProviderId: agent.modelProviderId ?? "",
+    model: agent.model ?? "",
+    initiative: agent.initiative,
+    scheduleEveryMinutes: agent.scheduleEveryMinutes,
+    dailyTokenBudget: agent.dailyTokenBudget,
+    dailyActionBudget: agent.dailyActionBudget
+  };
+}
+
 function AgentIdentityEditor(props: { agent: AgentDetail; providers: ModelProviderPublic[]; onSaved: (agent: AgentDetail) => void; onNotice: (message: string) => void }): JSX.Element {
-  const [form, setForm] = useState({
-    name: props.agent.name,
-    tagline: props.agent.tagline,
-    biography: props.agent.biography,
-    persona: props.agent.persona,
-    tone: props.agent.tone,
-    worldview: props.agent.worldview,
-    boundaries: props.agent.boundaries,
-    values: props.agent.values.join(", "),
-    autonomyMode: props.agent.autonomyMode,
-    visibility: props.agent.visibility,
-    serviceFee: props.agent.serviceFee,
-    modelProviderId: props.agent.modelProviderId ?? "",
-    model: props.agent.model ?? "",
-    initiative: props.agent.initiative,
-    scheduleEveryMinutes: props.agent.scheduleEveryMinutes,
-    dailyTokenBudget: props.agent.dailyTokenBudget,
-    dailyActionBudget: props.agent.dailyActionBudget
-  });
+  const [form, setForm] = useState(() => agentIdentityForm(props.agent));
   const [errors, setErrors] = useState<FieldErrors>({});
   const [toolForm, setToolForm] = useState<HttpToolForm>({
     name: "",
@@ -517,6 +598,18 @@ function AgentIdentityEditor(props: { agent: AgentDetail; providers: ModelProvid
   });
   const [toolErrors, setToolErrors] = useState<FieldErrors>({});
   const [toolBusy, setToolBusy] = useState(false);
+  const formOwnerId = useRef<string | null>(props.agent.id);
+
+  useEffect(() => {
+    formOwnerId.current = props.agent.id;
+    setForm(agentIdentityForm(props.agent));
+    setErrors({});
+    setToolErrors({});
+    return () => {
+      formOwnerId.current = null;
+    };
+  }, [props.agent.id]);
+
   const eligibleProviders = form.visibility === "private"
     ? props.providers
     : props.providers.filter((item) => item.scope === "platform");
@@ -526,6 +619,7 @@ function AgentIdentityEditor(props: { agent: AgentDetail; providers: ModelProvid
     setToolErrors(clearAgentError(toolErrors, key));
   }
   async function save(): Promise<void> {
+    const ownerId = props.agent.id;
     const nextErrors = validateAgentIdentity(form);
     setErrors(nextErrors);
     if (Object.values(nextErrors).some(Boolean)) {
@@ -533,19 +627,21 @@ function AgentIdentityEditor(props: { agent: AgentDetail; providers: ModelProvid
       return;
     }
     try {
-      const next = await api.updateAgent(props.agent.id, {
+      const next = await api.updateAgent(ownerId, {
         ...form,
         values: splitList(form.values),
         modelProviderId: form.modelProviderId || null,
         model: form.model || null
       });
+      if (formOwnerId.current !== ownerId) return;
       props.onSaved(next);
       props.onNotice("Agent 身份已保存");
     } catch (error) {
-      props.onNotice(messageOf(error));
+      if (formOwnerId.current === ownerId) props.onNotice(messageOf(error));
     }
   }
   async function addHttpTool(): Promise<void> {
+    const ownerId = props.agent.id;
     const nextErrors = validateHttpToolForm(toolForm);
     setToolErrors(nextErrors);
     if (Object.values(nextErrors).some(Boolean)) {
@@ -554,7 +650,7 @@ function AgentIdentityEditor(props: { agent: AgentDetail; providers: ModelProvid
     }
     setToolBusy(true);
     try {
-      await api.addAgentTool(props.agent.id, {
+      await api.addAgentTool(ownerId, {
         name: toolForm.name.trim(),
         kind: "http",
         description: toolForm.description.trim(),
@@ -568,22 +664,29 @@ function AgentIdentityEditor(props: { agent: AgentDetail; providers: ModelProvid
         },
         permissions: { allowHttp: toolForm.allowHttp }
       });
+      if (formOwnerId.current !== ownerId) return;
       setToolForm({ name: "", description: "", url: "", method: "GET", riskLevel: "safe", allowHttp: false });
       setToolErrors({});
-      props.onSaved(await api.agent(props.agent.id));
+      const next = await api.agent(ownerId);
+      if (formOwnerId.current !== ownerId) return;
+      props.onSaved(next);
       props.onNotice("HTTP 工具已添加");
     } catch (error) {
-      props.onNotice(messageOf(error));
+      if (formOwnerId.current === ownerId) props.onNotice(messageOf(error));
     } finally {
-      setToolBusy(false);
+      if (formOwnerId.current === ownerId) setToolBusy(false);
     }
   }
   async function toggleTool(toolId: string, enabled: boolean): Promise<void> {
+    const ownerId = props.agent.id;
     try {
-      await api.updateAgentTool(props.agent.id, toolId, { enabled });
-      props.onSaved(await api.agent(props.agent.id));
+      await api.updateAgentTool(ownerId, toolId, { enabled });
+      if (formOwnerId.current !== ownerId) return;
+      const next = await api.agent(ownerId);
+      if (formOwnerId.current !== ownerId) return;
+      props.onSaved(next);
     } catch (error) {
-      props.onNotice(messageOf(error));
+      if (formOwnerId.current === ownerId) props.onNotice(messageOf(error));
     }
   }
   return <div className="agent-form-scroll">
@@ -937,6 +1040,10 @@ function formatTime(value: string): string {
 
 function formatDate(value: string): string {
   return new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function selectionResource(agentId: string | null, conversationId: string | null): string {
+  return `agent:${agentId ?? "none"}:conversation:${conversationId ?? "none"}`;
 }
 
 function messageOf(error: unknown): string {

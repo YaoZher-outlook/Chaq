@@ -16,7 +16,7 @@ echo [Chaq] Server will be managed in the background. Logs are saved in .logs.
 
 where node >nul 2>nul
 if errorlevel 1 (
-  echo [ERROR] Node.js was not found in PATH. Please install Node.js 20.11 or newer.
+  echo [ERROR] Node.js was not found in PATH. Please install Node.js 22.12 or newer.
   pause
   exit /b 1
 )
@@ -30,6 +30,12 @@ if errorlevel 1 (
 
 node scripts\start-production-server.js --restart --public
 if errorlevel 1 goto :fail
+
+node scripts\check-public-api.js https://chaq.yaozher.com/api
+if errorlevel 1 (
+  echo [WARN] Local production API is ready, but the public Cloudflared hostname is not ready yet.
+  echo [WARN] In Cloudflare Zero Trust, add public hostname chaq.yaozher.com with service http://127.0.0.1:%CHAQ_PROD_SERVER_PORT%.
+)
 
 echo [Chaq] Production server is ready. You can close this window; API and worker will keep running.
 pause

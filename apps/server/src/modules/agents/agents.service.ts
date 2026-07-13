@@ -59,7 +59,8 @@ export class AgentsService {
         _count: { select: { goals: { where: { status: AgentGoalStatus.ACTIVE } } } },
         runs: { where: { status: { in: [AgentRunStatus.QUEUED, AgentRunStatus.RUNNING] } }, select: { status: true }, take: 1 }
       },
-      orderBy: [{ status: "asc" }, { updatedAt: "desc" }]
+      orderBy: [{ status: "asc" }, { updatedAt: "desc" }],
+      take: 200
     });
     return rows.map(toAgentSummary);
   }
@@ -382,7 +383,7 @@ export class AgentsService {
 
   async create(userId: string, input: AgentDraft) {
     await this.users.ensureUser(userId);
-    await this.models.assertAgentProviderAccess(userId, input.modelProviderId, input.visibility);
+    await this.models.assertAgentProviderAccess(userId, input.modelProviderId, input.visibility, input.model);
     const handle = await this.uniqueHandle(userId, input.handle);
     const now = new Date();
     const snapshot = this.cleanJson({ ...input, handle });
@@ -454,7 +455,8 @@ export class AgentsService {
     const current = await this.ownedAgent(userId, id);
     const nextProviderId = input.modelProviderId === undefined ? current.modelProviderId : input.modelProviderId;
     const nextVisibility = input.visibility ?? current.visibility.toLowerCase();
-    await this.models.assertAgentProviderAccess(userId, nextProviderId, nextVisibility);
+    const nextModel = input.model === undefined ? current.model : input.model;
+    await this.models.assertAgentProviderAccess(userId, nextProviderId, nextVisibility, nextModel);
     const data: Prisma.AgentUpdateInput = {};
     const direct = [
       "name", "avatarUrl", "coverUrl", "tagline", "biography", "profileStatus", "mood", "persona", "tone", "values", "worldview", "boundaries",
@@ -839,7 +841,7 @@ export class AgentsService {
   async runNow(userId: string, agentId: string, conversationId?: string) {
     const agent = await this.ownedAgent(userId, agentId);
     if (agent.status !== AgentStatus.ACTIVE) throw new BadRequestException("Agent must be active before it can run.");
-    await this.assertConversationIncludesAgent(agentId, conversationId);
+    await this.assertManualRunConversation(userId, agentId, conversationId);
     const row = await this.prisma.agentRun.create({
       data: { agentId, conversationId, trigger: AgentRunTrigger.MANUAL, status: AgentRunStatus.QUEUED }
     });
@@ -871,18 +873,19 @@ export class AgentsService {
     if (!goal) throw new NotFoundException(`${label} not found.`);
   }
 
-  private async assertConversationIncludesAgent(agentId: string, conversationId: string | null | undefined): Promise<void> {
+  private async assertManualRunConversation(userId: string, agentId: string, conversationId: string | null | undefined): Promise<void> {
     if (!conversationId) return;
     const conversation = await this.prisma.conversation.findFirst({
       where: {
         id: conversationId,
-        participants: {
-          some: { participantKind: ParticipantKind.AGENT, participantId: agentId }
-        }
+        AND: [
+          { participants: { some: { participantKind: ParticipantKind.AGENT, participantId: agentId } } },
+          { participants: { some: { participantKind: ParticipantKind.USER, participantId: userId } } }
+        ]
       },
       select: { id: true }
     });
-    if (!conversation) throw new NotFoundException("Conversation not found for this agent.");
+    if (!conversation) throw new NotFoundException("Conversation not found for this user and agent.");
   }
 
   private async profileAccess(userId: string, id: string) {
@@ -993,8 +996,15 @@ export class AgentsService {
 
   private async indexKnowledgeChunks(userId: string, agentId: string, sourceId: string, chunks: string[]): Promise<void> {
     const embeddedChunks: Array<{ vector: number[]; model: string }> = [];
-    for (const content of chunks) {
-      embeddedChunks.push(await this.models.agentEmbedding(agentId, content, userId));
+    for (let position = 0; position < chunks.length; position += 1) {
+      const content = chunks[position];
+      const contentHash = createHash("sha256").update(content).digest("hex").slice(0, 16);
+      embeddedChunks.push(await this.models.agentEmbedding(
+        agentId,
+        content,
+        userId,
+        `knowledge:${sourceId}:${position}:${contentHash}`
+      ));
     }
     await this.prisma.$transaction(async (tx) => {
       await tx.agentKnowledgeChunk.deleteMany({ where: { sourceId } });

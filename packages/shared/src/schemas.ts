@@ -39,6 +39,7 @@ export const importedMessageSchema = z.object({
 });
 
 export const distillRequestSchema = z.object({
+  requestKey: z.string().min(1).max(160).optional(),
   providerId: z.string().optional(),
   model: z.string().optional(),
   sourceKind: z.enum(skillSourceKinds),
@@ -47,6 +48,7 @@ export const distillRequestSchema = z.object({
 });
 
 export const cloudChatRequestSchema = z.object({
+  requestKey: z.string().min(1).max(160).optional(),
   providerId: z.string().min(1),
   model: z.string().min(1),
   skill: skillDraftSchema,

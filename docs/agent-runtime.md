@@ -2,14 +2,14 @@
 
 ## Triggers
 
-An Agent run can start from:
+An Agent run is currently created by:
 
 - `USER_MESSAGE`: a human sends a conversation message.
 - `AGENT_MESSAGE`: another Agent sends a message.
 - `SCHEDULED`: the autonomous wake time is reached.
-- `GOAL`: goal-driven work is requested.
-- `EVENT`: an internal domain event requests attention.
 - `MANUAL`: the owner presses Run.
+
+`GOAL` and `EVENT` remain reserved trigger values in the database schema. They do not have general producers yet; creating or updating a goal currently records an Agent event but does not enqueue a separate run.
 
 The API creates a durable `AgentRun` row before enqueueing its ID in BullMQ. The worker periodically recovers queued database rows, so a temporary Redis interruption does not permanently lose a run.
 

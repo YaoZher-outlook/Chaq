@@ -1,41 +1,28 @@
 import { app, BrowserWindow, dialog, ipcMain, safeStorage, screen } from "electron";
-import type { OpenDialogOptions } from "electron";
+import type { IpcMainInvokeEvent, OpenDialogOptions } from "electron";
 import { cpSync, existsSync, mkdirSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ChatMessage, SkillAutoMessageSettings, SkillDraft, SkillSourceKind, SkillSummary } from "@chaq/shared";
 import { LocalDatabase } from "./local-db";
-import { callUserModel, detectUserModelProvider, testUserModelConfig } from "./model-adapters";
+import { MAX_IMAGE_FILE_BYTES, MAX_IMPORT_FILE_BYTES, readFileWithLimit } from "./limited-file-reader";
+import { RememberedSessionVault } from "./remembered-session-vault";
+import { createStorageLayout, selectWritableStorageRoot, storageRootCandidates } from "./storage-paths";
+import { normalizeSessionToken, UtilityBootstrapTokenStore } from "./utility-bootstrap-tokens";
 
 let mainWindow: BrowserWindow | null = null;
 let localDb: LocalDatabase;
+let rememberedSessionVault: RememberedSessionVault;
+const utilityBootstrapTokens = new UtilityBootstrapTokenStore();
 
-const chaqEnvironmentRoot = join(process.env.CHAQ_ENV_ROOT || "E:\\Environment", "Chaq");
-const chaqUserDataPath = join(chaqEnvironmentRoot, "user-data");
-const chaqRuntimeCachePath = process.env.CHAQ_RUNTIME_CACHE || join(chaqEnvironmentRoot, "runtime-cache-v2");
-const chaqDiskCachePath = join(chaqRuntimeCachePath, "chromium");
-const chaqSessionDataPath = join(chaqRuntimeCachePath, "session-data");
 const rendererFileUrl = pathToFileURL(join(__dirname, "../renderer/index.html"));
 
-mkdirSync(chaqUserDataPath, { recursive: true });
-mkdirSync(chaqDiskCachePath, { recursive: true });
-mkdirSync(chaqSessionDataPath, { recursive: true });
-const previousLocalStorage = join(chaqUserDataPath, "Local Storage");
-const migratedLocalStorage = join(chaqSessionDataPath, "Local Storage");
-if (!existsSync(migratedLocalStorage) && existsSync(previousLocalStorage)) {
-  cpSync(previousLocalStorage, migratedLocalStorage, { recursive: true });
-}
-app.setPath("userData", chaqUserDataPath);
-app.setPath("sessionData", chaqSessionDataPath);
-app.commandLine.appendSwitch("disk-cache-dir", chaqDiskCachePath);
-if (process.env.NODE_ENV !== "production" && /^\d{2,5}$/.test(process.env.CHAQ_DEVTOOLS_PORT ?? "")) {
-  app.commandLine.appendSwitch("remote-debugging-port", process.env.CHAQ_DEVTOOLS_PORT);
-}
+const storageReady = configureStoragePaths();
 
 // electron-vite shares electron.exe with other local apps, so its strict port
 // check is the reliable development lock. Packaged Chaq keeps the OS lock.
-const hasSingleInstanceLock = Boolean(process.env.ELECTRON_RENDERER_URL) || app.requestSingleInstanceLock();
+const hasSingleInstanceLock = storageReady
+  && (Boolean(process.env.ELECTRON_RENDERER_URL) || app.requestSingleInstanceLock());
 if (!hasSingleInstanceLock) app.quit();
 
 app.on("second-instance", () => {
@@ -44,6 +31,45 @@ app.on("second-instance", () => {
   mainWindow.show();
   mainWindow.focus();
 });
+
+function configureStoragePaths(): boolean {
+  try {
+    const candidates = storageRootCandidates({
+      isPackaged: app.isPackaged,
+      executablePath: process.execPath,
+      moduleDir: __dirname,
+      desktopPath: app.getPath("desktop"),
+      environmentRoot: process.env.CHAQ_ENV_ROOT,
+      projectRoot: process.env.CHAQ_PROJECT_ROOT
+    });
+    const root = selectWritableStorageRoot(candidates);
+    if (!root) {
+      throw new Error(`没有可写的数据目录。已尝试：${candidates.join("、")}`);
+    }
+    const layout = createStorageLayout(root, process.env.CHAQ_RUNTIME_CACHE);
+    mkdirSync(layout.userData, { recursive: true });
+    mkdirSync(layout.diskCache, { recursive: true });
+    mkdirSync(layout.sessionData, { recursive: true });
+    const previousLocalStorage = join(layout.userData, "Local Storage");
+    const migratedLocalStorage = join(layout.sessionData, "Local Storage");
+    if (!existsSync(migratedLocalStorage) && existsSync(previousLocalStorage)) {
+      cpSync(previousLocalStorage, migratedLocalStorage, { recursive: true });
+    }
+    app.setPath("userData", layout.userData);
+    app.setPath("sessionData", layout.sessionData);
+    app.commandLine.appendSwitch("disk-cache-dir", layout.diskCache);
+    if (process.env.NODE_ENV !== "production" && /^\d{2,5}$/.test(process.env.CHAQ_DEVTOOLS_PORT ?? "")) {
+      app.commandLine.appendSwitch("remote-debugging-port", process.env.CHAQ_DEVTOOLS_PORT);
+    }
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Chaq storage initialization failed: ${message}`);
+    dialog.showErrorBox("Chaq 无法启动", `无法初始化本地数据目录。\n\n${message}`);
+    app.quit();
+    return false;
+  }
+}
 
 function isTrustedRendererUrl(target: string): boolean {
   try {
@@ -54,6 +80,21 @@ function isTrustedRendererUrl(target: string): boolean {
     return targetUrl.protocol === "file:" && targetUrl.pathname === rendererFileUrl.pathname;
   } catch {
     return false;
+  }
+}
+
+function assertTrustedIpcSender(event: IpcMainInvokeEvent): void {
+  const senderUrl = event.senderFrame?.url ?? event.sender.getURL();
+  if (!isTrustedRendererUrl(senderUrl)) {
+    throw new Error("Blocked IPC call from an untrusted renderer.");
+  }
+}
+
+function assertMainWindowIpcSender(event: IpcMainInvokeEvent): void {
+  assertTrustedIpcSender(event);
+  const senderWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!mainWindow || senderWindow !== mainWindow || (event.senderFrame && event.senderFrame !== event.sender.mainFrame)) {
+    throw new Error("Blocked credential-vault access outside the main application window.");
   }
 }
 
@@ -150,53 +191,17 @@ function registerIpc(): void {
       return null;
     }
     const filePath = result.filePaths[0];
+    const bytes = await readFileWithLimit(filePath, MAX_IMPORT_FILE_BYTES, "导入文件");
     return {
       filePath,
       fileName: filePath.split(/[\\/]/).pop() ?? "import.txt",
-      content: await readFile(filePath, "utf8")
+      content: bytes.toString("utf8")
     };
   });
   ipcMain.handle("imports:save", (_event, payload: Parameters<LocalDatabase["saveImport"]>[0]) => localDb.saveImport(payload));
 
   ipcMain.handle("files:open-background-image", () => openImageFile());
   ipcMain.handle("files:open-image", () => openImageFile());
-
-  ipcMain.handle("files:open-folder", async () => {
-    const options: OpenDialogOptions = { properties: ["openDirectory"] };
-    const result = mainWindow
-      ? await dialog.showOpenDialog(mainWindow, options)
-      : await dialog.showOpenDialog(options);
-    if (result.canceled || !result.filePaths[0]) {
-      return null;
-    }
-    return result.filePaths[0];
-  });
-
-  ipcMain.handle("models:list-user", (_event, userId?: string) => localDb.listUserModelConfigs(userId));
-  ipcMain.handle("models:save-user", (_event, payload: Parameters<LocalDatabase["saveUserModelConfig"]>[0]) =>
-    localDb.saveUserModelConfig(payload)
-  );
-  ipcMain.handle("models:delete-user", (_event, payload: { id: string; userId?: string }) =>
-    localDb.deleteUserModelConfig(payload.id, payload.userId)
-  );
-  ipcMain.handle("models:test-user", (_event, payload: Parameters<typeof testUserModelConfig>[0]) =>
-    testUserModelConfig(payload)
-  );
-  ipcMain.handle("models:detect-user-provider", (_event, apiKey: string) =>
-    detectUserModelProvider(apiKey)
-  );
-  ipcMain.handle(
-    "models:user-chat",
-    async (
-      _event,
-      payload: {
-        userId?: string;
-        configId: string;
-        skill: SkillDraft;
-        messages: Pick<ChatMessage, "role" | "content">[];
-      }
-    ) => callUserModel(localDb.getSecretModelConfig(payload.configId, payload.userId), payload.skill, payload.messages)
-  );
 
   ipcMain.handle("window:minimize", (event) => {
     const target = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
@@ -219,6 +224,25 @@ function registerIpc(): void {
     }
     target?.close();
   });
+  ipcMain.handle("auth:consume-window-bootstrap", (event) => {
+    assertTrustedIpcSender(event);
+    if (event.senderFrame && event.senderFrame !== event.sender.mainFrame) {
+      throw new Error("Blocked bootstrap credential request from a child frame.");
+    }
+    return utilityBootstrapTokens.consume(event.sender.id);
+  });
+  ipcMain.handle("auth:remembered-session:save", (event, payload: { accountId: string; sessionToken: string; expiresAt: string }) => {
+    assertMainWindowIpcSender(event);
+    rememberedSessionVault.save(payload);
+  });
+  ipcMain.handle("auth:remembered-session:get", (event, accountId: string) => {
+    assertMainWindowIpcSender(event);
+    return rememberedSessionVault.get(accountId);
+  });
+  ipcMain.handle("auth:remembered-session:delete", (event, accountId: string) => {
+    assertMainWindowIpcSender(event);
+    rememberedSessionVault.delete(accountId);
+  });
   ipcMain.handle("auth:broadcast-logout", () => {
     for (const window of BrowserWindow.getAllWindows()) {
       if (!window.isDestroyed()) window.webContents.send("auth:logged-out");
@@ -240,6 +264,10 @@ function registerIpc(): void {
   });
   ipcMain.handle("window:set-opacity", (_event, opacity: number) => {
     mainWindow?.setOpacity(Math.min(1, Math.max(0.7, opacity)));
+  });
+  ipcMain.handle("window:flash-frame", (event, enabled: boolean) => {
+    const target = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+    target?.flashFrame(Boolean(enabled));
   });
   ipcMain.handle("window:open-settings", (_event, token?: string | null) => {
     openUtilityWindow({ settingsWindow: "1" }, token, { width: 980, height: 640, title: "Chaq Settings" });
@@ -285,7 +313,7 @@ async function openImageFile(): Promise<{ fileName: string; dataUrl: string } | 
       : extension === "gif"
         ? "image/gif"
         : "image/png";
-  const bytes = await readFile(filePath);
+  const bytes = await readFileWithLimit(filePath, MAX_IMAGE_FILE_BYTES, "图片");
   return {
     fileName: filePath.split(/[\\/]/).pop() ?? "image",
     dataUrl: `data:${mimeType};base64,${bytes.toString("base64")}`
@@ -305,9 +333,11 @@ function profilePopupPosition(parent: BrowserWindow, anchor: AnchorRect, width: 
 
 function openUtilityWindow(
   queryInput: Record<string, string>,
-  token: string | null | undefined,
+  token: unknown,
   options: { width: number; height: number; title: string; x?: number; y?: number }
 ): void {
+  const bootstrapToken = normalizeSessionToken(token);
+  if (!bootstrapToken) throw new Error("登录状态无效，无法打开工具窗口。请重新登录后重试。");
   const utilityWindow = new BrowserWindow({
     width: options.width,
     height: options.height,
@@ -330,8 +360,11 @@ function openUtilityWindow(
     }
   });
   hardenWindow(utilityWindow);
+  utilityBootstrapTokens.issue(utilityWindow.webContents.id, bootstrapToken);
+  utilityWindow.on("closed", () => {
+    utilityBootstrapTokens.revoke(utilityWindow.webContents.id);
+  });
   const query = new URLSearchParams(queryInput);
-  if (token) query.set("token", token);
   if (process.env.ELECTRON_RENDERER_URL) {
     void utilityWindow.loadURL(`${process.env.ELECTRON_RENDERER_URL}?${query.toString()}`);
   } else {
@@ -361,6 +394,14 @@ function createCodec() {
 
 if (hasSingleInstanceLock) app.whenReady().then(async () => {
   localDb = await LocalDatabase.create(join(app.getPath("userData"), "chaq.db"), createCodec());
+  rememberedSessionVault = new RememberedSessionVault(
+    join(app.getPath("userData"), "remembered-sessions.json"),
+    {
+      isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
+      encryptString: (value) => safeStorage.encryptString(value),
+      decryptString: (value) => safeStorage.decryptString(value)
+    }
+  );
   registerIpc();
   createWindow();
 
@@ -375,6 +416,20 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
 }).catch((error) => {
   console.error(error);
   app.quit();
+});
+
+app.on("before-quit", (event) => {
+  if (typeof localDb === "undefined") {
+    return;
+  }
+  try {
+    localDb.close();
+  } catch (error) {
+    event.preventDefault();
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("Failed to flush the local database before quitting.", error);
+    dialog.showErrorBox("Chaq 无法安全退出", `本地数据尚未成功保存，请检查数据目录后重试。\n\n${message}`);
+  }
 });
 
 app.on("window-all-closed", () => {

@@ -1,4 +1,4 @@
-import { ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
+import { ConflictException, ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import { DistillationStatus, Prisma, ReactionTarget, ReactionValue, SkillSourceKind, SkillVisibility } from "@prisma/client";
 import type { MarketplaceComment, MarketplaceSkill, SkillDraft } from "@chaq/shared";
 import { PrismaService } from "../../common/prisma.service";
@@ -160,28 +160,21 @@ export class MarketplaceService {
 
   async toggleFavorite(userId: string, marketplaceSkillId: string) {
     await this.users.ensureUser(userId);
-    const existing = await this.prisma.favorite.findUnique({
-      where: { userId_marketplaceSkillId: { userId, marketplaceSkillId } }
+    return this.serializableTransaction(async (tx) => {
+      const target = await tx.marketplaceSkill.findUnique({ where: { id: marketplaceSkillId }, select: { id: true } });
+      if (!target) throw new NotFoundException("Marketplace skill not found.");
+      const existing = await tx.favorite.findUnique({
+        where: { userId_marketplaceSkillId: { userId, marketplaceSkillId } }
+      });
+      if (existing) {
+        await tx.favorite.delete({ where: { id: existing.id } });
+      } else {
+        await tx.favorite.create({ data: { userId, marketplaceSkillId } });
+      }
+      const favorites = await tx.favorite.count({ where: { marketplaceSkillId } });
+      await tx.marketplaceSkill.update({ where: { id: marketplaceSkillId }, data: { favorites } });
+      return { favorited: !existing };
     });
-    if (existing) {
-      await this.prisma.$transaction([
-        this.prisma.favorite.delete({ where: { id: existing.id } }),
-        this.prisma.marketplaceSkill.update({
-          where: { id: marketplaceSkillId },
-          data: { favorites: { decrement: 1 } }
-        })
-      ]);
-      return { favorited: false };
-    }
-
-    await this.prisma.$transaction([
-      this.prisma.favorite.create({ data: { userId, marketplaceSkillId } }),
-      this.prisma.marketplaceSkill.update({
-        where: { id: marketplaceSkillId },
-        data: { favorites: { increment: 1 } }
-      })
-    ]);
-    return { favorited: true };
   }
 
   async comments(marketplaceSkillId: string): Promise<MarketplaceComment[]> {
@@ -243,12 +236,16 @@ export class MarketplaceService {
   }
 
   private async setReaction(userId: string, target: ReactionTarget, targetId: string, value: ReactionValue): Promise<void> {
-    const existing = await this.prisma.reaction.findUnique({
-      where: { userId_target_targetId: { userId, target, targetId } }
-    });
-    const delta = this.reactionDelta(existing?.value, value);
-
-    await this.prisma.$transaction(async (tx) => {
+    await this.serializableTransaction(async (tx) => {
+      const targetRow = target === ReactionTarget.SKILL
+        ? await tx.marketplaceSkill.findUnique({ where: { id: targetId }, select: { id: true } })
+        : await tx.comment.findUnique({ where: { id: targetId }, select: { id: true } });
+      if (!targetRow) {
+        throw new NotFoundException(target === ReactionTarget.SKILL ? "Marketplace skill not found." : "Comment not found.");
+      }
+      const existing = await tx.reaction.findUnique({
+        where: { userId_target_targetId: { userId, target, targetId } }
+      });
       if (existing?.value === value) {
         await tx.reaction.delete({ where: { id: existing.id } });
       } else if (existing) {
@@ -257,37 +254,40 @@ export class MarketplaceService {
         await tx.reaction.create({ data: { userId, target, targetId, value } });
       }
 
+      const [upvotes, downvotes] = await Promise.all([
+        tx.reaction.count({ where: { target, targetId, value: ReactionValue.UP } }),
+        tx.reaction.count({ where: { target, targetId, value: ReactionValue.DOWN } })
+      ]);
       if (target === ReactionTarget.SKILL) {
         await tx.marketplaceSkill.update({
           where: { id: targetId },
-          data: {
-            upvotes: { increment: delta.up },
-            downvotes: { increment: delta.down }
-          }
+          data: { upvotes, downvotes }
         });
       } else {
         await tx.comment.update({
           where: { id: targetId },
-          data: {
-            upvotes: { increment: delta.up },
-            downvotes: { increment: delta.down }
-          }
+          data: { upvotes, downvotes }
         });
       }
     });
   }
 
-  private reactionDelta(previous: ReactionValue | undefined, next: ReactionValue) {
-    if (previous === next) {
-      return next === ReactionValue.UP ? { up: -1, down: 0 } : { up: 0, down: -1 };
+  private async serializableTransaction<T>(action: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        return await this.prisma.$transaction(action, {
+          isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+        });
+      } catch (error) {
+        if (!this.isRetryableTransactionError(error) || attempt === 3) throw error;
+      }
     }
-    if (previous === ReactionValue.UP && next === ReactionValue.DOWN) {
-      return { up: -1, down: 1 };
-    }
-    if (previous === ReactionValue.DOWN && next === ReactionValue.UP) {
-      return { up: 1, down: -1 };
-    }
-    return next === ReactionValue.UP ? { up: 1, down: 0 } : { up: 0, down: 1 };
+    throw new ConflictException("Could not serialize marketplace update.");
+  }
+
+  private isRetryableTransactionError(error: unknown): boolean {
+    if (!error || typeof error !== "object" || !("code" in error)) return false;
+    return ["P2002", "P2025", "P2034"].includes(String((error as { code?: unknown }).code));
   }
 
   private toMarketplaceSkill(row: {

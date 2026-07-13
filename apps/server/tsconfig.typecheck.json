@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "../..",
+    "paths": {
+      "@chaq/shared": ["../../packages/shared/src/index.ts"]
+    }
+  }
+}

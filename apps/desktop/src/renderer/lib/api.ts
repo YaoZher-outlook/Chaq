@@ -32,6 +32,8 @@ import type {
   ConversationMessage,
   ConversationSummary
 } from "@chaq/shared";
+import { fetchWithTimeout } from "./request-timeout";
+import { realtimeWebSocketProtocols, realtimeWebSocketUrl } from "./realtime-transport";
 
 export type UserRole = "USER" | "CREATOR" | "ADMIN";
 
@@ -73,7 +75,23 @@ const LOCAL_DEV_SERVER_URL = "http://127.0.0.1:24537/api";
 const LOCAL_PROD_SERVER_URL = "http://127.0.0.1:24538/api";
 const LEGACY_LOCAL_SERVER_RE = /(localhost|127\.0\.0\.1):(4100|4010|8200|8020|4537)\b/;
 const RESOLVED_SERVER_URL_KEY = "chaq.resolvedServerUrl";
+const AUTHENTICATED_SERVER_URL_KEY = "chaq.authenticatedServerUrl";
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "0.0.0.0", "::1", "[::1]"]);
+const RENDERER_ENV = import.meta.env ?? {};
+const REQUEST_TIMEOUT_MS = positiveNumber(RENDERER_ENV.VITE_REQUEST_TIMEOUT_MS, 15_000);
+const HEALTH_TIMEOUT_MS = positiveNumber(RENDERER_ENV.VITE_HEALTH_TIMEOUT_MS, 5_000);
+
+type RequestSecurity = {
+  containsUnauthenticatedSecrets?: boolean;
+  establishesAuthenticatedSession?: boolean;
+};
+
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 
 function normalizeServerUrl(value?: string | null): string | null {
   const text = value?.trim().replace(/\/$/, "");
@@ -105,7 +123,7 @@ function isLoopbackServerUrl(value: string): boolean {
 }
 
 function allowLocalApiFallback(): boolean {
-  return import.meta.env.DEV || import.meta.env.VITE_ALLOW_LOCAL_API_FALLBACK === "1";
+  return Boolean(RENDERER_ENV.DEV) || RENDERER_ENV.VITE_ALLOW_LOCAL_API_FALLBACK === "1";
 }
 
 function normalizeUsableServerUrl(value?: string | null): string | null {
@@ -116,9 +134,9 @@ function normalizeUsableServerUrl(value?: string | null): string | null {
 }
 
 function defaultServerUrls(): string[] {
-  const configured = normalizeServerUrl(import.meta.env.VITE_SERVER_URL as string | undefined);
+  const configured = normalizeServerUrl(RENDERER_ENV.VITE_SERVER_URL as string | undefined);
   if (configured) return [configured];
-  const online = normalizeServerUrl(import.meta.env.VITE_PUBLIC_SERVER_URL as string | undefined) ?? ONLINE_SERVER_URL;
+  const online = normalizeServerUrl(RENDERER_ENV.VITE_PUBLIC_SERVER_URL as string | undefined) ?? ONLINE_SERVER_URL;
   return uniqueUrls([
     online,
     ...(allowLocalApiFallback() ? [LOCAL_DEV_SERVER_URL, LOCAL_PROD_SERVER_URL] : [])
@@ -141,24 +159,48 @@ function getServerCandidates(): string[] {
   ]);
 }
 
-function rememberResolvedServerUrl(url: string): void {
+function rememberResolvedServerUrl(url: string, authenticated = false): void {
   sessionStorage.setItem(RESOLVED_SERVER_URL_KEY, url);
+  if (authenticated) sessionStorage.setItem(AUTHENTICATED_SERVER_URL_KEY, url);
+}
+
+function requestMethod(init?: RequestInit): string {
+  return (init?.method ?? "GET").toUpperCase();
+}
+
+function requestServerCandidates(
+  init: RequestInit | undefined,
+  sessionToken: string | null,
+  security: RequestSecurity = {}
+): string[] {
+  const candidates = getServerCandidates();
+  const authenticatedAffinity = sessionToken
+    ? normalizeUsableServerUrl(sessionStorage.getItem(AUTHENTICATED_SERVER_URL_KEY))
+      ?? normalizeUsableServerUrl(sessionStorage.getItem(RESOLVED_SERVER_URL_KEY))
+    : null;
+
+  // Never spray a session credential across candidate services. Once a server
+  // succeeds for the session, it remains the session's only destination.
+  if (authenticatedAffinity) return [authenticatedAffinity];
+
+  const method = requestMethod(init);
+  const mayFailOver = !sessionToken
+    && !security.containsUnauthenticatedSecrets
+    && (method === "GET" || method === "HEAD");
+  return mayFailOver ? candidates : candidates.slice(0, 1);
 }
 
 export function getServerUrl(): string {
-  return getServerCandidates()[0] ?? ONLINE_SERVER_URL;
+  const sessionToken = sessionStorage.getItem("chaq.sessionToken");
+  return requestServerCandidates(undefined, sessionToken)[0] ?? ONLINE_SERVER_URL;
 }
 
-export function getRealtimeUrl(sessionToken: string): string {
-  const url = new URL(getServerUrl());
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.pathname = `${url.pathname.replace(/\/$/, "")}/realtime`;
-  url.searchParams.set("token", sessionToken);
-  return url.toString();
+export function getRealtimeUrl(): string {
+  return realtimeWebSocketUrl(getServerUrl());
 }
 
 export function connectRealtime(onEvent: (event: { type: string; payload: unknown; at?: string }) => void): () => void {
-  const sessionToken = sessionStorage.getItem("chaq.sessionToken") || localStorage.getItem("chaq.sessionToken");
+  const sessionToken = sessionStorage.getItem("chaq.sessionToken");
   if (!sessionToken) return () => undefined;
   let closed = false;
   let socket: WebSocket | null = null;
@@ -166,7 +208,7 @@ export function connectRealtime(onEvent: (event: { type: string; payload: unknow
   let retryAttempt = 0;
   const open = () => {
     if (closed) return;
-    socket = new WebSocket(getRealtimeUrl(sessionToken));
+    socket = new WebSocket(getRealtimeUrl(), realtimeWebSocketProtocols(sessionToken));
     socket.onopen = () => {
       retryAttempt = 0;
     };
@@ -197,38 +239,45 @@ export function connectRealtime(onEvent: (event: { type: string; payload: unknow
   };
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const sessionToken = sessionStorage.getItem("chaq.sessionToken") || localStorage.getItem("chaq.sessionToken");
+async function request<T>(path: string, init?: RequestInit, security: RequestSecurity = {}): Promise<T> {
+  const sessionToken = sessionStorage.getItem("chaq.sessionToken");
+  const candidates = requestServerCandidates(init, sessionToken, security);
   let lastError: unknown = null;
-  for (const baseUrl of getServerCandidates()) {
+  for (const baseUrl of candidates) {
     let response: Response;
     let data: any;
     try {
-      response = await fetch(`${baseUrl}${path}`, {
+      response = await fetchWithTimeout(`${baseUrl}${path}`, {
         ...init,
         headers: {
           "content-type": "application/json",
           ...(sessionToken ? { "x-session-token": sessionToken } : {}),
           ...init?.headers
         }
-      });
+      }, REQUEST_TIMEOUT_MS);
       data = await response.json().catch(() => null);
     } catch (error) {
+      if (init?.signal?.aborted) throw error;
       lastError = error;
       continue;
     }
     if (response.ok) {
-      rememberResolvedServerUrl(baseUrl);
+      rememberResolvedServerUrl(baseUrl, Boolean(sessionToken) || security.establishesAuthenticatedSession);
       return data as T;
     }
-    const error = new Error(formatApiError(data?.message, response.status));
+    const error = new ApiError(formatApiError(data?.message, response.status), response.status);
     if (shouldTryNextServer(response.status, data)) {
       lastError = error;
       continue;
     }
     throw error;
   }
-  throw new Error(`无法连接 Chaq API。已尝试：${getServerCandidates().join("、")}。${messageOfUnknown(lastError)}`);
+  throw new Error(`无法连接 Chaq API。已尝试：${candidates.join("、")}。${messageOfUnknown(lastError)}`);
+}
+
+function positiveNumber(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function shouldTryNextServer(status: number, data: unknown): boolean {
@@ -283,9 +332,10 @@ function fieldLabel(field: string): string {
 
 export const api = {
   healthReady: async () => {
-    for (const baseUrl of getServerCandidates()) {
+    const sessionToken = sessionStorage.getItem("chaq.sessionToken");
+    for (const baseUrl of requestServerCandidates(undefined, sessionToken)) {
       try {
-        const response = await fetch(`${baseUrl}/health/ready`);
+        const response = await fetchWithTimeout(`${baseUrl}/health/ready`, {}, HEALTH_TIMEOUT_MS);
         const data = await response.json().catch(() => null) as HealthReadyResponse | null;
         const ready = response.ok && data?.status === "ok" && data.database === "ready" && data.redis === "ready";
         if (ready) {
@@ -306,10 +356,15 @@ export const api = {
   }>("/auth/login", {
     method: "POST",
     body: JSON.stringify(payload)
+  }, {
+    containsUnauthenticatedSecrets: true,
+    establishesAuthenticatedSession: true
   }),
   requestRegisterCode: (payload: { email: string }) => request<{ ok: true }>("/auth/register/code", {
     method: "POST",
     body: JSON.stringify(payload)
+  }, {
+    containsUnauthenticatedSecrets: true
   }),
   register: (payload: { email: string; password: string; confirmPassword: string; code: string }) => request<{
     sessionToken: string;
@@ -319,6 +374,9 @@ export const api = {
   }>("/auth/register", {
     method: "POST",
     body: JSON.stringify(payload)
+  }, {
+    containsUnauthenticatedSecrets: true,
+    establishesAuthenticatedSession: true
   }),
   logout: () => request<{ ok: true }>("/auth/logout", {
     method: "POST",
@@ -390,9 +448,10 @@ export const api = {
     method: "POST",
     body: JSON.stringify({ enabled })
   }),
-  cloudChat: (payload: CloudChatRequest) => request<CloudChatResponse>("/models/cloud/chat", {
+  cloudChat: (payload: CloudChatRequest, signal?: AbortSignal) => request<CloudChatResponse>("/models/cloud/chat", {
     method: "POST",
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    signal
   }),
   distill: (payload: DistillRequest) => request<DistillResponse>("/skills/distill", {
     method: "POST",
@@ -456,8 +515,8 @@ export const api = {
     method: "POST",
     body: JSON.stringify({ value })
   }),
-  agents: () => request<AgentSummary[]>("/agents"),
-  agentContacts: () => request<AgentContact[]>("/agents/contacts"),
+  agents: (signal?: AbortSignal) => request<AgentSummary[]>("/agents", { signal }),
+  agentContacts: (signal?: AbortSignal) => request<AgentContact[]>("/agents/contacts", { signal }),
   addAgentContact: (id: string) => request<AgentContact>(`/agents/${id}/contact`, {
     method: "POST",
     body: JSON.stringify({})
@@ -467,7 +526,7 @@ export const api = {
     body: JSON.stringify({})
   }),
   discoverAgents: (query?: string) => request<PublicAgentSummary[]>(`/agents/discover${query ? `?query=${encodeURIComponent(query)}` : ""}`),
-  agent: (id: string) => request<AgentDetail>(`/agents/${id}`),
+  agent: (id: string, signal?: AbortSignal) => request<AgentDetail>(`/agents/${id}`, { signal }),
   agentProfile: (id: string) => request<AgentProfile>(`/agents/${id}/profile`),
   createAgent: (payload: AgentDraft) => request<AgentDetail>("/agents", {
     method: "POST",
@@ -554,16 +613,18 @@ export const api = {
     method: "POST",
     body: JSON.stringify({ conversationId })
   }),
-  agentActivity: (agentId?: string) => request<AgentEvent[]>(`/agents/activity${agentId ? `?agentId=${encodeURIComponent(agentId)}` : ""}`),
-  conversations: () => request<ConversationSummary[]>("/conversations"),
-  conversationWithAgent: (agentId: string) => request<ConversationSummary>(`/conversations/with-agent/${agentId}`, {
+  agentActivity: (agentId?: string, signal?: AbortSignal) => request<AgentEvent[]>(`/agents/activity${agentId ? `?agentId=${encodeURIComponent(agentId)}` : ""}`, { signal }),
+  conversations: (signal?: AbortSignal) => request<ConversationSummary[]>("/conversations", { signal }),
+  conversationWithAgent: (agentId: string, signal?: AbortSignal) => request<ConversationSummary>(`/conversations/with-agent/${agentId}`, {
     method: "POST",
-    body: JSON.stringify({})
+    body: JSON.stringify({}),
+    signal
   }),
-  conversationMessages: (id: string) => request<ConversationMessage[]>(`/conversations/${id}/messages`),
-  sendConversationMessage: (id: string, content: string, replyToId?: string) => request<ConversationMessage>(`/conversations/${id}/messages`, {
+  conversationMessages: (id: string, signal?: AbortSignal) => request<ConversationMessage[]>(`/conversations/${id}/messages`, { signal }),
+  sendConversationMessage: (id: string, content: string, options: { replyToId?: string; idempotencyKey?: string } = {}, signal?: AbortSignal) => request<ConversationMessage>(`/conversations/${id}/messages`, {
     method: "POST",
-    body: JSON.stringify({ content, replyToId })
+    body: JSON.stringify({ content, ...options }),
+    signal
   }),
   markConversationRead: (id: string) => request<{ ok: true }>(`/conversations/${id}/read`, {
     method: "POST",

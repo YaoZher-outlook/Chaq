@@ -50,6 +50,7 @@ import {
 } from "lucide-react";
 import type {
   ChatMessage,
+  ConversationMessage,
   AgentReviewItem,
   AdminRechargeOrder,
   ImportPreview,
@@ -67,8 +68,10 @@ import type {
   WalletSummary,
   UserModelConfigPublic
 } from "@chaq/shared";
-import { api, connectRealtime, type LoginUser, type UserSettings } from "./lib/api";
+import { api, ApiError, connectRealtime, type LoginUser, type UserSettings } from "./lib/api";
 import { heuristicDraftFromMessages, parseImport } from "./lib/importParser";
+import { LatestRequestGate, isSupersededRequest } from "./lib/latest-request";
+import { PendingMessageKey } from "./lib/message-idempotency";
 import { providerKinds, userModelPresets } from "./lib/provider-presets";
 import { MagneticButton, ShinyText, SpotlightCard } from "./components/react-bits";
 import { AgentWorkspace } from "./components/agent-workspace";
@@ -118,10 +121,15 @@ type ProfileFormState = {
 };
 
 type RememberedAccount = {
-  sessionToken: string;
   expiresAt: string;
   user: LoginUser;
   settings: UserSettings;
+};
+
+type LegacyRememberedSession = {
+  accountId: string;
+  sessionToken: string;
+  expiresAt: string;
 };
 
 const blankSkill: SkillDraft = {
@@ -156,6 +164,29 @@ function defaultAutoSettings(skillId = ""): SkillAutoMessageSettings {
     lastSyncedAt: null,
     updatedAt: new Date().toISOString()
   };
+}
+
+function playMessageNotificationSound(): void {
+  try {
+    const context = new AudioContext();
+    void context.resume().then(() => {
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(740, context.currentTime);
+      oscillator.frequency.exponentialRampToValueAtTime(980, context.currentTime + 0.11);
+      gain.gain.setValueAtTime(0.0001, context.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.045, context.currentTime + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.16);
+      oscillator.connect(gain);
+      gain.connect(context.destination);
+      oscillator.addEventListener("ended", () => void context.close(), { once: true });
+      oscillator.start();
+      oscillator.stop(context.currentTime + 0.17);
+    }).catch(() => void context.close());
+  } catch {
+    // Audio output can be unavailable or blocked; notifications remain best effort.
+  }
 }
 
 function App(): JSX.Element {
@@ -196,6 +227,7 @@ function App(): JSX.Element {
   const [serverStatus, setServerStatus] = useState<ServerStatus>("checking");
   const lastAnnouncedServerStatus = useRef<ServerStatus>("checking");
   const [busy, setBusy] = useState(false);
+  const [skillSending, setSkillSending] = useState(false);
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
   const [draft, setDraft] = useState<SkillDraft>(blankSkill);
@@ -205,6 +237,12 @@ function App(): JSX.Element {
   const [skillChatAtBottom, setSkillChatAtBottom] = useState(true);
   const [skillChatBottomPulse, setSkillChatBottomPulse] = useState(false);
   const skillChatBottomPulseTimer = useRef<number | null>(null);
+  const skillMessageLoadRequests = useRef(new LatestRequestGate());
+  const skillAutoSettingsLoadRequests = useRef(new LatestRequestGate());
+  const skillModelRequests = useRef(new LatestRequestGate());
+  const selectedSkillIdRef = useRef<string | null>(null);
+  const skillModelAttempt = useRef(new PendingMessageKey());
+  const distillModelAttempt = useRef(new PendingMessageKey());
   const [composer, setComposer] = useState("");
   const [modelMode, setModelMode] = useState<ModelMode>("cloud");
   const [cloudProviders, setCloudProviders] = useState<ModelProviderPublic[]>([]);
@@ -296,11 +334,28 @@ function App(): JSX.Element {
   }
 
   function updateSkillComposer(value: string): void {
-    setComposer(value.slice(0, CHAT_COMPOSER_MAX_LENGTH));
+    const normalized = value.slice(0, CHAT_COMPOSER_MAX_LENGTH);
+    const providerId = modelMode === "cloud" ? cloudProviderId : userModelId;
+    const model = modelMode === "cloud"
+      ? cloudModel
+      : userModels.find((item) => item.id === userModelId)?.defaultModel ?? "";
+    skillModelAttempt.current.contentChanged(`${selectedSkillId ?? ""}:${providerId}:${model}`, normalized);
+    setComposer(normalized);
   }
 
   function canSendSkillMessage(): boolean {
-    return Boolean(selectedSkill && composer.trim() && !busy && composer.length <= CHAT_COMPOSER_MAX_LENGTH);
+    return Boolean(selectedSkill && composer.trim() && !busy && !skillSending && composer.length <= CHAT_COMPOSER_MAX_LENGTH);
+  }
+
+  function changeSelectedSkillId(skillId: string | null): void {
+    if (selectedSkillIdRef.current !== skillId) {
+      selectedSkillIdRef.current = skillId;
+      skillMessageLoadRequests.current.cancel();
+      skillAutoSettingsLoadRequests.current.cancel();
+      skillModelRequests.current.cancel();
+      setSkillSending(false);
+    }
+    setSelectedSkillId(skillId);
   }
 
   function handleSkillComposerKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>): void {
@@ -360,6 +415,9 @@ function App(): JSX.Element {
 
   useEffect(() => () => {
     if (skillChatBottomPulseTimer.current) window.clearTimeout(skillChatBottomPulseTimer.current);
+    skillMessageLoadRequests.current.cancel();
+    skillAutoSettingsLoadRequests.current.cancel();
+    skillModelRequests.current.cancel();
   }, []);
 
   useEffect(() => {
@@ -394,24 +452,50 @@ function App(): JSX.Element {
   }, [auth?.settings]);
 
   useEffect(() => {
-    if (!auth) return undefined;
+    const media = window.matchMedia("(prefers-color-scheme: light)");
+    const syncSystemTheme = () => {
+      const theme = (settingsDraft ?? auth?.settings)?.theme;
+      if (theme === "system") document.documentElement.dataset.theme = media.matches ? "light" : "dark";
+    };
+    syncSystemTheme();
+    media.addEventListener("change", syncSystemTheme);
+    return () => media.removeEventListener("change", syncSystemTheme);
+  }, [auth?.settings.theme, settingsDraft?.theme]);
+
+  useEffect(() => {
+    if (!auth || isSettingsWindowMode || isProfileWindowMode || isProfileEditWindowMode) return undefined;
     return connectRealtime((event) => {
       window.dispatchEvent(new CustomEvent("chaq:realtime", { detail: event }));
+      if (event.type !== "conversation.message") return;
+      const message = event.payload as Partial<ConversationMessage> | null;
+      if (message?.authorKind === "user" && message.authorId === auth.user.id) return;
+      const notificationSettings = settingsDraft ?? auth.settings;
+      if (notificationSettings.notificationSound) playMessageNotificationSound();
+      if (notificationSettings.iconFlash && !document.hasFocus()) void window.chaq.window.flashFrame(true);
     });
-  }, [auth?.user.id]);
+  }, [auth?.user.id, auth?.settings.notificationSound, auth?.settings.iconFlash, settingsDraft?.notificationSound, settingsDraft?.iconFlash]);
+
+  useEffect(() => {
+    const stopFlashing = () => void window.chaq.window.flashFrame(false);
+    window.addEventListener("focus", stopFlashing);
+    return () => window.removeEventListener("focus", stopFlashing);
+  }, []);
 
   useEffect(() => {
     if (!selectedSkillId && skills[0]) {
-      setSelectedSkillId(skills[0].id);
+      changeSelectedSkillId(skills[0].id);
     }
   }, [skills, selectedSkillId]);
 
   useEffect(() => {
+    skillModelAttempt.current.clear();
     if (selectedSkill) {
       setDraft(skillToDraft(selectedSkill));
       void loadMessages(selectedSkill.id);
       void loadAutoSettings(selectedSkill.id);
     } else {
+      skillMessageLoadRequests.current.cancel();
+      skillAutoSettingsLoadRequests.current.cancel();
       setDraft(blankSkill);
       setMessages([]);
       setAutoSettings(defaultAutoSettings());
@@ -433,9 +517,14 @@ function App(): JSX.Element {
 
   async function restoreSession(): Promise<void> {
     if (isSettingsWindowMode || isProfileWindowMode || isProfileEditWindowMode) {
-      const token = urlParams.get("token");
+      const token = await window.chaq.auth.consumeWindowBootstrap();
       if (token) {
         sessionStorage.setItem("chaq.sessionToken", token);
+      }
+      if (!token && !sessionStorage.getItem("chaq.sessionToken")) {
+        setLoginError("窗口授权已失效，请关闭后从主窗口重新打开。");
+        setBooting(false);
+        return;
       }
       try {
         const [user, settings] = await Promise.all([api.me(), api.settings()]);
@@ -449,20 +538,36 @@ function App(): JSX.Element {
     }
 
     await window.chaq.window.setMode("login");
-    let remembered = loadRememberedAccounts();
+    const loaded = loadRememberedAccounts();
+    let remembered = loaded.accounts;
+    let migrationError = "";
+    for (const legacy of loaded.legacySessions) {
+      try {
+        await window.chaq.auth.saveRememberedSession({
+          accountId: legacy.accountId,
+          sessionToken: legacy.sessionToken,
+          expiresAt: legacy.expiresAt
+        });
+      } catch (error) {
+        migrationError = messageOf(error);
+      }
+    }
+    saveRememberedAccounts(remembered);
     const legacyToken = localStorage.getItem("chaq.sessionToken");
-    if (legacyToken && !remembered.some((account) => account.sessionToken === legacyToken)) {
+    if (legacyToken) {
+      sessionStorage.setItem("chaq.sessionToken", legacyToken);
       try {
         const [user, settings] = await Promise.all([api.me(), api.settings()]);
-        remembered = upsertRememberedAccount(remembered, {
+        const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        await window.chaq.auth.saveRememberedSession({
+          accountId: user.id,
           sessionToken: legacyToken,
-          expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
-          user,
-          settings
+          expiresAt
         });
+        remembered = upsertRememberedAccount(remembered, { expiresAt, user, settings });
         saveRememberedAccounts(remembered);
-      } catch {
-        localStorage.removeItem("chaq.sessionToken");
+      } catch (error) {
+        migrationError = messageOf(error);
       }
     }
     localStorage.removeItem("chaq.sessionToken");
@@ -470,6 +575,7 @@ function App(): JSX.Element {
     setRememberedAccounts(remembered);
     setSelectedRememberedId(remembered[0]?.user.id ?? null);
     setShowAccountForm(remembered.length === 0);
+    if (migrationError) setLoginError(`旧登录状态未能安全迁移，请重新登录。${migrationError}`);
     setBooting(false);
   }
 
@@ -481,9 +587,16 @@ function App(): JSX.Element {
     setLoginError("");
     setBusy(true);
     try {
-      sessionStorage.setItem("chaq.sessionToken", selectedRemembered.sessionToken);
+      const credential = await window.chaq.auth.getRememberedSession(selectedRemembered.user.id);
+      if (!credential) throw new ApiError("登录状态已过期。", 401);
+      sessionStorage.setItem("chaq.sessionToken", credential.sessionToken);
       const [user, settings] = await Promise.all([api.me(), api.settings()]);
-      const updated = upsertRememberedAccount(rememberedAccounts, { ...selectedRemembered, user, settings });
+      const updated = upsertRememberedAccount(rememberedAccounts, {
+        ...selectedRemembered,
+        expiresAt: credential.expiresAt,
+        user,
+        settings
+      });
       setRememberedAccounts(updated);
       saveRememberedAccounts(updated);
       setAuth({ user, settings });
@@ -491,14 +604,19 @@ function App(): JSX.Element {
       await window.chaq.window.setOpacity(settings.windowOpacity);
       await refreshAll(user.id);
     } catch (error) {
-      localStorage.removeItem("chaq.sessionToken");
       sessionStorage.removeItem("chaq.sessionToken");
-      const next = rememberedAccounts.filter((account) => account.user.id !== selectedRemembered.user.id);
-      setRememberedAccounts(next);
-      saveRememberedAccounts(next);
-      setSelectedRememberedId(next[0]?.user.id ?? null);
-      setShowAccountForm(true);
-      setLoginError(`登录状态已失效，请重新输入账号密码。${messageOf(error)}`);
+      const invalidCredential = error instanceof ApiError && (error.status === 401 || error.status === 403);
+      if (invalidCredential) {
+        await window.chaq.auth.deleteRememberedSession(selectedRemembered.user.id).catch(() => undefined);
+        const next = rememberedAccounts.filter((account) => account.user.id !== selectedRemembered.user.id);
+        setRememberedAccounts(next);
+        saveRememberedAccounts(next);
+        setSelectedRememberedId(next[0]?.user.id ?? null);
+        setShowAccountForm(true);
+        setLoginError(`登录状态已失效，请重新输入账号密码。${messageOf(error)}`);
+      } else {
+        setLoginError(`暂时无法恢复登录，请检查网络后重试。${messageOf(error)}`);
+      }
     } finally {
       setBooting(false);
       setBusy(false);
@@ -526,20 +644,15 @@ function App(): JSX.Element {
     try {
       const result = await api.login({ username: loginForm.username, password: loginForm.password });
       sessionStorage.setItem("chaq.sessionToken", result.sessionToken);
-      if (rememberMe) {
-        const next = upsertRememberedAccount(rememberedAccounts, {
-          sessionToken: result.sessionToken,
-          expiresAt: result.expiresAt,
-          user: result.user,
-          settings: result.settings
-        });
-        setRememberedAccounts(next);
-        setSelectedRememberedId(result.user.id);
-        saveRememberedAccounts(next);
-      }
       setAuth({ user: result.user, settings: result.settings });
       await window.chaq.window.setMode("main");
       await window.chaq.window.setOpacity(result.settings.windowOpacity);
+      const persistence = rememberMe
+        ? rememberAccount({ expiresAt: result.expiresAt, user: result.user, settings: result.settings }, result.sessionToken)
+        : forgetRememberedAccount(result.user.id);
+      void persistence.then((warning) => {
+        if (warning) setNotice(warning);
+      });
       await refreshAll(result.user.id);
     } catch (error) {
       setLoginError(messageOf(error));
@@ -579,20 +692,15 @@ function App(): JSX.Element {
     try {
       const result = await api.register(registerForm);
       sessionStorage.setItem("chaq.sessionToken", result.sessionToken);
-      if (rememberMe) {
-        const next = upsertRememberedAccount(rememberedAccounts, {
-          sessionToken: result.sessionToken,
-          expiresAt: result.expiresAt,
-          user: result.user,
-          settings: result.settings
-        });
-        setRememberedAccounts(next);
-        setSelectedRememberedId(result.user.id);
-        saveRememberedAccounts(next);
-      }
       setAuth({ user: result.user, settings: result.settings });
       await window.chaq.window.setMode("main");
       await window.chaq.window.setOpacity(result.settings.windowOpacity);
+      const persistence = rememberMe
+        ? rememberAccount({ expiresAt: result.expiresAt, user: result.user, settings: result.settings }, result.sessionToken)
+        : forgetRememberedAccount(result.user.id);
+      void persistence.then((warning) => {
+        if (warning) setNotice(warning);
+      });
       await refreshAll(result.user.id);
     } catch (error) {
       setLoginError(messageOf(error));
@@ -608,11 +716,12 @@ function App(): JSX.Element {
   }
 
   async function applyLoggedOutState(): Promise<void> {
-    const sessionToken = sessionStorage.getItem("chaq.sessionToken") || localStorage.getItem("chaq.sessionToken");
+    const accountId = auth?.user.id;
     localStorage.removeItem("chaq.sessionToken");
     sessionStorage.removeItem("chaq.sessionToken");
+    if (accountId) await window.chaq.auth.deleteRememberedSession(accountId).catch(() => undefined);
     setRememberedAccounts((current) => {
-      const next = current.filter((account) => account.sessionToken !== sessionToken);
+      const next = accountId ? current.filter((account) => account.user.id !== accountId) : current;
       saveRememberedAccounts(next);
       setSelectedRememberedId(next[0]?.user.id ?? null);
       setShowAccountForm(next.length === 0);
@@ -620,7 +729,7 @@ function App(): JSX.Element {
     });
     setAuth(null);
     setSkills([]);
-    setSelectedSkillId(null);
+    changeSelectedSkillId(null);
     setLoginFieldErrors({});
     setSkillEditorErrors({});
     setLoginError("");
@@ -630,6 +739,35 @@ function App(): JSX.Element {
       return;
     }
     await window.chaq.window.setMode("login");
+  }
+
+  async function rememberAccount(account: RememberedAccount, sessionToken: string): Promise<string | null> {
+    try {
+      await window.chaq.auth.saveRememberedSession({
+        accountId: account.user.id,
+        sessionToken,
+        expiresAt: account.expiresAt
+      });
+      const next = upsertRememberedAccount(rememberedAccounts, account);
+      setRememberedAccounts(next);
+      setSelectedRememberedId(account.user.id);
+      saveRememberedAccounts(next);
+      return null;
+    } catch (error) {
+      return `已登录，但无法安全记住账号；本次将使用临时会话：${messageOf(error)}`;
+    }
+  }
+
+  async function forgetRememberedAccount(accountId: string): Promise<string | null> {
+    try {
+      await window.chaq.auth.deleteRememberedSession(accountId);
+      const next = rememberedAccounts.filter((account) => account.user.id !== accountId);
+      setRememberedAccounts(next);
+      saveRememberedAccounts(next);
+      return null;
+    } catch (error) {
+      return `已登录，但无法更新本机的记住账号设置：${messageOf(error)}`;
+    }
   }
 
   async function refreshAll(userId = auth?.user.id): Promise<void> {
@@ -698,21 +836,47 @@ function App(): JSX.Element {
   }
 
   async function loadMessages(skillId: string): Promise<void> {
-    setSkillChatAtBottom(true);
-    setMessages(await window.chaq.messages.list(skillId));
+    const resourceId = `skill:${skillId}:messages`;
+    const request = skillMessageLoadRequests.current.begin(resourceId);
+    try {
+      const next = await skillMessageLoadRequests.current.guard(request, window.chaq.messages.list(skillId));
+      if (!skillMessageLoadRequests.current.isCurrent(request, resourceId) || selectedSkillIdRef.current !== skillId) return;
+      setSkillChatAtBottom(true);
+      setMessages(next);
+    } catch (error) {
+      if (!isSupersededRequest(error) && skillMessageLoadRequests.current.isCurrent(request, resourceId)) {
+        setNotice(`聊天记录加载失败：${messageOf(error)}`);
+      }
+    }
   }
 
   async function loadAutoSettings(skillId: string): Promise<void> {
-    setAutoSettings(await window.chaq.skills.getAutoSettings(skillId));
+    const resourceId = `skill:${skillId}:auto-settings`;
+    const request = skillAutoSettingsLoadRequests.current.begin(resourceId);
+    try {
+      const loaded = await skillAutoSettingsLoadRequests.current.guard(request, window.chaq.skills.getAutoSettings(skillId));
+      // Earlier builds exposed this switch before a scheduler existed. Fail closed
+      // so a stale local setting never implies that messages are actually running.
+      const next = loaded.enabled
+        ? await skillAutoSettingsLoadRequests.current.guard(request, window.chaq.skills.saveAutoSettings({ ...loaded, enabled: false }))
+        : loaded;
+      if (skillAutoSettingsLoadRequests.current.isCurrent(request, resourceId) && selectedSkillIdRef.current === skillId) {
+        setAutoSettings(next);
+      }
+    } catch (error) {
+      if (!isSupersededRequest(error) && skillAutoSettingsLoadRequests.current.isCurrent(request, resourceId)) {
+        setNotice(`主动消息设置加载失败：${messageOf(error)}`);
+      }
+    }
   }
 
   function openSkillEditor(tab: SkillEditorTab, skill?: SkillSummary | null): void {
     if (skill) {
-      setSelectedSkillId(skill.id);
+      changeSelectedSkillId(skill.id);
       setDraft(skillToDraft(skill));
       void loadAutoSettings(skill.id);
     } else if (tab === "profile") {
-      setSelectedSkillId(null);
+      changeSelectedSkillId(null);
       setDraft({ ...blankSkill, name: `Skill ${skills.length + 1}` });
       setAutoSettings(defaultAutoSettings());
       setNewSkillKind("friend");
@@ -755,7 +919,7 @@ function App(): JSX.Element {
         : await createSyncedSkill(draft, sourceKind);
       await window.chaq.skills.cache([saved]);
       await refreshLocal();
-      setSelectedSkillId(saved.id);
+      changeSelectedSkillId(saved.id);
       setNotice("Skill 已保存");
       setView("skill-editor");
     } catch (error) {
@@ -773,9 +937,14 @@ function App(): JSX.Element {
 
   async function saveAutoSettings(next: Partial<SkillAutoMessageSettings>): Promise<void> {
     if (!selectedSkill) return;
+    if (next.enabled) {
+      setNotice("自动发消息调度器尚未接入，本版本不会在后台产生模型调用或 token 消耗。");
+      return;
+    }
     const saved = await window.chaq.skills.saveAutoSettings({
       ...autoSettings,
       ...next,
+      enabled: false,
       skillId: selectedSkill.id
     });
     setAutoSettings(saved);
@@ -798,8 +967,16 @@ function App(): JSX.Element {
   }
 
   async function rechargeWallet(): Promise<void> {
-    if (auth?.user.username !== "chen_zy") {
-      setRechargeError("当前测试阶段只允许 chen_zy 账号充值。");
+    if (!rechargeConfig) {
+      setRechargeError("充值配置尚未加载，请刷新钱包后重试。");
+      return;
+    }
+    if (!rechargeConfig.enabled) {
+      setRechargeError("服务器当前未开放充值。");
+      return;
+    }
+    if (!rechargeConfig.allowed) {
+      setRechargeError("当前账号暂未获得充值权限。");
       return;
     }
     const amount = Number(rechargeForm.amount);
@@ -811,6 +988,11 @@ function App(): JSX.Element {
     }
     if (!Number.isInteger(tokenAmount)) {
       setRechargeError("换算后的 token 必须是整数。");
+      return;
+    }
+    const amountInMillions = tokenAmount / 1_000_000;
+    if (amountInMillions < rechargeConfig.minMToken || amountInMillions > rechargeConfig.maxMToken) {
+      setRechargeError(`充值数量需在 ${rechargeConfig.minMToken}M 至 ${rechargeConfig.maxMToken}M Token 之间。`);
       return;
     }
     setRechargeError("");
@@ -848,42 +1030,48 @@ function App(): JSX.Element {
 
   async function copySkillShareCode(): Promise<void> {
     if (!selectedSkill) return;
-    await navigator.clipboard.writeText(`chaq://skill/${selectedSkill.id}`);
-    setNotice("Skill 分享代码已复制");
-  }
-
-  async function chooseStoragePath(key: "localChatDataPath" | "fileStoragePath"): Promise<void> {
-    const folder = await window.chaq.files.openFolder();
-    if (!folder) return;
-    await saveSettings({ [key]: folder });
+    await navigator.clipboard.writeText(`CHAQ-SKILL:${selectedSkill.id}`);
+    setNotice("Skill 云端标识已复制；跨设备分发请先发布到聊天广场。");
   }
 
   async function chooseNewSkillImportFile(): Promise<void> {
-    const file = await window.chaq.imports.openFile();
-    if (!file) return;
-    setNewSkillSourceFile(file.fileName);
-    setDraft((current) => ({
-      ...current,
-      knowledge: [current.knowledge, `导入材料：${file.fileName}`].filter(Boolean).join("\n")
-    }));
+    try {
+      const file = await window.chaq.imports.openFile();
+      if (!file) return;
+      setNewSkillSourceFile(file.fileName);
+      setDraft((current) => ({
+        ...current,
+        knowledge: [current.knowledge, `导入材料：${file.fileName}`].filter(Boolean).join("\n")
+      }));
+    } catch (error) {
+      setNotice(`无法导入文件：${messageOf(error)}`);
+    }
   }
 
   async function chooseNewSkillAvatar(): Promise<void> {
-    const image = await window.chaq.files.openImage();
-    if (!image) return;
-    setDraft((current) => ({ ...current, avatarUrl: image.dataUrl }));
-    setNotice(`${image.fileName} 已设置为头像，保存后会同步。`);
+    try {
+      const image = await window.chaq.files.openImage();
+      if (!image) return;
+      setDraft((current) => ({ ...current, avatarUrl: image.dataUrl }));
+      setNotice(`${image.fileName} 已设置为头像，保存后会同步。`);
+    } catch (error) {
+      setNotice(`无法读取头像：${messageOf(error)}`);
+    }
   }
 
   async function chooseProfileAvatar(): Promise<void> {
-    const image = await window.chaq.files.openImage();
-    if (!image) return;
-    setProfileForm((current) => ({ ...current, avatarUrl: image.dataUrl }));
-    setNotice(`${image.fileName} 已设置为头像，保存后会同步。`);
+    try {
+      const image = await window.chaq.files.openImage();
+      if (!image) return;
+      setProfileForm((current) => ({ ...current, avatarUrl: image.dataUrl }));
+      setNotice(`${image.fileName} 已设置为头像，保存后会同步。`);
+    } catch (error) {
+      setNotice(`无法读取头像：${messageOf(error)}`);
+    }
   }
 
   async function openSettingsWindow(): Promise<void> {
-    const token = sessionStorage.getItem("chaq.sessionToken") || localStorage.getItem("chaq.sessionToken");
+    const token = sessionStorage.getItem("chaq.sessionToken");
     try {
       await window.chaq.window.openSettings(token);
     } catch {
@@ -892,12 +1080,12 @@ function App(): JSX.Element {
   }
 
   async function openProfileWindow(anchor?: WindowAnchorRect): Promise<void> {
-    const token = sessionStorage.getItem("chaq.sessionToken") || localStorage.getItem("chaq.sessionToken");
+    const token = sessionStorage.getItem("chaq.sessionToken");
     await window.chaq.window.openProfile(token, anchor);
   }
 
   async function openProfileEditWindow(): Promise<void> {
-    const token = sessionStorage.getItem("chaq.sessionToken") || localStorage.getItem("chaq.sessionToken");
+    const token = sessionStorage.getItem("chaq.sessionToken");
     await window.chaq.window.openProfileEdit(token);
   }
 
@@ -915,7 +1103,7 @@ function App(): JSX.Element {
     await api.deleteSkill(selectedSkill.id);
     await window.chaq.skills.delete(selectedSkill.id);
     setChatDrawerOpen(false);
-    setSelectedSkillId(null);
+    changeSelectedSkillId(null);
     setMessages([]);
     await refreshLocal();
   }
@@ -941,86 +1129,103 @@ function App(): JSX.Element {
 
   async function sendMessage(event?: FormEvent): Promise<void> {
     event?.preventDefault();
-    if (!selectedSkill || !composer.trim() || busy) return;
+    if (!selectedSkill || !composer.trim() || busy || skillSending) return;
     if (composer.length > CHAT_COMPOSER_MAX_LENGTH) {
       setNotice(`Message is too long. Keep it under ${CHAT_COMPOSER_MAX_LENGTH} characters.`);
       return;
     }
-    setBusy(true);
+    const targetSkill = selectedSkill;
     const content = composer.trim();
+    const providerId = modelMode === "cloud" ? cloudProviderId : userModelId;
+    const model = modelMode === "cloud"
+      ? cloudModel
+      : userModels.find((item) => item.id === userModelId)?.defaultModel ?? "";
+    if (!providerId || !model) {
+      setNotice(modelMode === "cloud" ? "请先在后台启用云端模型。" : "请先配置自己的模型。");
+      return;
+    }
+    const attemptContext = `${targetSkill.id}:${providerId}:${model}`;
+    const retrying = skillModelAttempt.current.matches(attemptContext, content);
+    const requestKey = skillModelAttempt.current.begin(attemptContext, content);
+    const resourceId = `skill:${targetSkill.id}:provider:${providerId}:model:${model}`;
+    const request = skillModelRequests.current.begin(resourceId);
+    skillMessageLoadRequests.current.cancel();
+    let localMessageReady = retrying;
+    setSkillSending(true);
     setComposer("");
     try {
-      const userMessage = await window.chaq.messages.add({ skillId: selectedSkill.id, role: "user", content });
-      const nextMessages = [...messages, userMessage];
-      setMessages(nextMessages);
-      if (modelMode === "cloud") {
-        if (!cloudProviderId || !cloudModel) throw new Error("请先在后台启用云端模型。");
-        const response = await api.cloudChat({
-          providerId: cloudProviderId,
-          model: cloudModel,
-          skill: draft,
-          messages: nextMessages.map(({ role, content: text }) => ({ role, content: text }))
-        });
-        const assistant = await window.chaq.messages.add({
-          skillId: selectedSkill.id,
-          role: "assistant",
-          content: response.content,
-          modelLabel: response.modelLabel
-        });
-        setMessages([...nextMessages, assistant]);
-        setAuth((current) => current ? { ...current, user: { ...current.user, tokenBalance: response.balanceAfter } } : current);
-      } else {
-        if (!userModelId) throw new Error("请先配置自己的模型。");
-        const response = await window.chaq.models.userChat({
-          userId: auth?.user.id,
-          configId: userModelId,
-          skill: draft,
-          messages: nextMessages.map(({ role, content: text }) => ({ role, content: text }))
-        });
-        const assistant = await window.chaq.messages.add({
-          skillId: selectedSkill.id,
-          role: "assistant",
-          content: response.content,
-          modelLabel: response.modelLabel
-        });
-        setMessages([...nextMessages, assistant]);
+      let nextMessages = messages;
+      if (!retrying) {
+        const userMessage = await skillModelRequests.current.guard(request, window.chaq.messages.add({ skillId: targetSkill.id, role: "user", content }));
+        nextMessages = [...messages, userMessage];
+        localMessageReady = true;
+        if (skillModelRequests.current.isCurrent(request, resourceId) && selectedSkillIdRef.current === targetSkill.id) {
+          setMessages(nextMessages);
+        }
       }
-    } catch (error) {
-      const assistant = await window.chaq.messages.add({
-        skillId: selectedSkill.id,
+      const response = await skillModelRequests.current.guard(request, api.cloudChat({
+        requestKey,
+        providerId,
+        model,
+        skill: draft,
+        messages: nextMessages.map(({ role, content: text }) => ({ role, content: text }))
+      }, request.signal));
+      const assistant = await skillModelRequests.current.guard(request, window.chaq.messages.add({
+        skillId: targetSkill.id,
         role: "assistant",
-        content: `调用失败：${messageOf(error)}`,
-        modelLabel: "system"
-      });
-      setMessages((current) => [...current, assistant]);
+        content: response.content,
+        modelLabel: response.modelLabel
+      }));
+      skillModelAttempt.current.succeeded(requestKey);
+      if (!skillModelRequests.current.isCurrent(request, resourceId) || selectedSkillIdRef.current !== targetSkill.id) return;
+      setMessages([...nextMessages, assistant]);
+      setAuth((current) => current ? { ...current, user: { ...current.user, tokenBalance: response.balanceAfter } } : current);
+    } catch (error) {
+      if (isSupersededRequest(error)) return;
+      if (!skillModelRequests.current.isCurrent(request, resourceId) || selectedSkillIdRef.current !== targetSkill.id) return;
+      if (!localMessageReady) skillModelAttempt.current.clear();
+      setComposer((current) => current.trim() ? current : content);
+      setNotice(`模型调用失败：${messageOf(error)}。保持内容不变再次发送会安全重试。`);
     } finally {
-      setBusy(false);
+      if (skillModelRequests.current.isCurrent(request, resourceId)) setSkillSending(false);
     }
   }
 
   async function openImportFile(): Promise<void> {
-    const file = await window.chaq.imports.openFile();
-    if (!file) return;
-    setImportPreview(parseImport(file.fileName, file.content));
+    try {
+      const file = await window.chaq.imports.openFile();
+      if (!file) return;
+      distillModelAttempt.current.clear();
+      setImportPreview(parseImport(file.fileName, file.content));
+    } catch (error) {
+      setNotice(`无法导入文件：${messageOf(error)}`);
+    }
   }
 
   async function distillImport(): Promise<void> {
     if (!importPreview) return;
     const selected = importPreview.messages.filter((message) => message.selected);
+    const usesModel = Boolean(cloudProviderId && cloudModel);
+    const attemptContext = [
+      importPreview.sourceKind,
+      importPreview.fileName,
+      cloudProviderId,
+      cloudModel,
+      selected.map((message) => message.id).join(",")
+    ].join(":");
+    const requestKey = usesModel ? distillModelAttempt.current.begin(attemptContext, importPreferredName) : undefined;
     setBusy(true);
     try {
-      let nextDraft: SkillDraft;
-      try {
-        const response = await api.distill({
+      const nextDraft: SkillDraft = usesModel
+        ? (await api.distill({
+          requestKey,
           sourceKind: importPreview.sourceKind,
           messages: selected,
           preferredName: importPreferredName || undefined,
-          ...(modelMode === "cloud" && cloudProviderId && cloudModel ? { providerId: cloudProviderId, model: cloudModel } : {})
-        });
-        nextDraft = response.draft;
-      } catch {
-        nextDraft = heuristicDraftFromMessages(selected, importPreview.sourceKind, importPreferredName);
-      }
+          providerId: cloudProviderId,
+          model: cloudModel
+        })).draft
+        : heuristicDraftFromMessages(selected, importPreview.sourceKind, importPreferredName);
       await window.chaq.imports.save({
         sourceKind: importPreview.sourceKind,
         fileName: importPreview.fileName,
@@ -1030,11 +1235,14 @@ function App(): JSX.Element {
       });
       const created = await createSyncedSkill(nextDraft, importPreview.sourceKind);
       await refreshLocal();
-      setSelectedSkillId(created.id);
+    changeSelectedSkillId(created.id);
       setDraft(nextDraft);
       setSkillEditorTab("profile");
       setView("skill-editor");
       setNotice("已从导入内容生成 Skill");
+      if (requestKey) distillModelAttempt.current.succeeded(requestKey);
+    } catch (error) {
+      setNotice(`生成 Skill 失败：${messageOf(error)}。保持导入内容不变再次点击会安全重试。`);
     } finally {
       setBusy(false);
     }
@@ -1057,7 +1265,7 @@ function App(): JSX.Element {
     const response = await api.importMarketplaceSkill(id);
     const created = await createSyncedSkill(response.skill, "manual");
     await refreshLocal();
-    setSelectedSkillId(created.id);
+      changeSelectedSkillId(created.id);
     setDraft(response.skill);
     setSkillEditorTab("profile");
     setView("skill-editor");
@@ -1397,9 +1605,13 @@ function App(): JSX.Element {
   }
 
   async function chooseBackgroundImage(): Promise<void> {
-    const image = await window.chaq.files.openBackgroundImage();
-    if (!image) return;
-    await saveSettings({ backgroundUrl: image.dataUrl });
+    try {
+      const image = await window.chaq.files.openBackgroundImage();
+      if (!image) return;
+      await saveSettings({ backgroundUrl: image.dataUrl });
+    } catch (error) {
+      setNotice(`无法读取背景图：${messageOf(error)}`);
+    }
   }
 
   function openSettingsSection(section: SettingsCategory): void {
@@ -1409,7 +1621,9 @@ function App(): JSX.Element {
   function applySettings(settings: UserSettings): void {
     document.documentElement.lang = settings.language === "en" ? "en" : "zh-CN";
     document.documentElement.dataset.locale = settings.language;
-    document.documentElement.dataset.theme = settings.theme === "system" ? "dark" : settings.theme;
+    document.documentElement.dataset.theme = settings.theme === "system"
+      ? window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"
+      : settings.theme;
     document.documentElement.style.setProperty("--window-opacity", String(settings.backgroundOpacity));
     void window.chaq.window.setOpacity(settings.windowOpacity);
   }
@@ -1440,7 +1654,6 @@ function App(): JSX.Element {
             saveSettings={(next) => void saveSettings(next)}
             previewSettings={previewSettings}
             chooseBackgroundImage={() => void chooseBackgroundImage()}
-            chooseStoragePath={(key) => void chooseStoragePath(key)}
             user={auth?.user ?? null}
             onLogout={() => void logout()}
           />
@@ -1611,7 +1824,7 @@ function App(): JSX.Element {
           </div>
         </aside>}
 
-        <main className={`content view-${view}`} aria-busy={busy}>
+        <main className={`content view-${view}`} aria-busy={busy || skillSending}>
           {view === "agents" && (
             <AgentWorkspace user={auth.user} providers={agentProviders} skills={skills} onNotice={setNotice} />
           )}
@@ -1647,19 +1860,19 @@ function App(): JSX.Element {
                     aria-label="输入 Skill 消息"
                     disabled={!selectedSkill}
                   />
-                  {composer && <button className="composer-clear" type="button" title="清空输入" aria-label="清空输入" disabled={busy} onClick={() => updateSkillComposer("")}><X size={14} /></button>}
+                  {composer && <button className="composer-clear" type="button" title="清空输入" aria-label="清空输入" disabled={busy || skillSending} onClick={() => updateSkillComposer("")}><X size={14} /></button>}
                   <div className="composer-meta" aria-live="polite">
-                    <span>{busy ? "正在发送..." : "Enter 发送 · Shift+Enter 换行"}</span>
+                    <span>{skillSending ? "正在发送..." : "Enter 发送 · Shift+Enter 换行"}</span>
                     <span className={skillComposerNearLimit ? "warn" : ""}>{skillComposerLength}/{CHAT_COMPOSER_MAX_LENGTH}</span>
                   </div>
                 </div>
-                <button title="发送" aria-label="发送消息" disabled={!skillCanSend}>{busy ? <RefreshCw className="spin" size={18} /> : <Send size={18} />}</button>
+                <button title="发送" aria-label="发送消息" disabled={!skillCanSend}>{skillSending ? <RefreshCw className="spin" size={18} /> : <Send size={18} />}</button>
               </form>
               {selectedSkill && (
                 <aside className={chatDrawerOpen ? "chat-more-drawer open" : "chat-more-drawer"}>
                   <div className="drawer-group">
                     <label className="drawer-switch"><span><Pin size={16} />置顶</span><input type="checkbox" checked={pinnedSkillIds.includes(selectedSkill.id)} onChange={togglePinnedSkill} /></label>
-                    <label className="drawer-switch"><span><BellOff size={16} />消息免打扰</span><input type="checkbox" checked={autoSettings.doNotDisturb} onChange={(event) => void saveAutoSettings({ doNotDisturb: event.target.checked })} /></label>
+                    <label className="drawer-switch" title="主动消息调度器尚未接入"><span><BellOff size={16} />主动消息免打扰（未启用）</span><input type="checkbox" checked={false} disabled /></label>
                   </div>
                   <div className="drawer-group">
                     <button onClick={() => void clearCurrentMessages()}><Trash2 size={16} />删除聊天记录</button>
@@ -1987,12 +2200,10 @@ function App(): JSX.Element {
                       <h3>存储</h3>
                     </header>
                     <div className="settings-row storage-row">
-                      <div><strong><HardDrive size={16} />本地聊天数据存储位置</strong><span>{activeSettings.localChatDataPath || "E:\\Environment\\Chaq\\user-data"}</span></div>
-                      <button onClick={() => void chooseStoragePath("localChatDataPath")}><Folder size={16} />更改</button>
+                      <div><strong><HardDrive size={16} />本地应用数据</strong><span>默认使用项目或程序目录下的 .chaq-data/user-data；目录不可写时才回退到桌面 Chaq/user-data。</span></div>
                     </div>
                     <div className="settings-row storage-row">
-                      <div><strong><Folder size={16} />文件存储位置</strong><span>{activeSettings.fileStoragePath || "E:\\Environment\\Chaq\\files"}</span></div>
-                      <button onClick={() => void chooseStoragePath("fileStoragePath")}><Folder size={16} />更改</button>
+                      <div><strong><Folder size={16} />路径覆盖</strong><span>当前不支持在运行中迁移数据。如需固定到其他磁盘，请在启动前设置 CHAQ_ENV_ROOT。</span></div>
                     </div>
                   </section>}
 
@@ -2251,7 +2462,7 @@ function WalletPage(props: {
   onCancelRecharge: (id: string) => void;
 }): JSX.Element {
   const summary = props.summary;
-  const canRecharge = Boolean(props.rechargeConfig?.allowed);
+  const canRecharge = Boolean(props.rechargeConfig?.enabled && props.rechargeConfig.allowed);
   const factor = props.rechargeForm.unit === "m" ? 1_000_000 : props.rechargeForm.unit === "k" ? 1_000 : 1;
   const preview = Number(props.rechargeForm.amount) * factor;
   const account = props.rechargeConfig?.paymentAccount ?? summary?.rechargeOrders.find((order) => order.paymentAccount)?.paymentAccount;
@@ -2264,7 +2475,11 @@ function WalletPage(props: {
       <section className={canRecharge ? "wallet-recharge-card" : "wallet-recharge-card disabled"}>
         <div>
           <strong>银行转账充值</strong>
-          <p>{canRecharge ? `当前汇率 ${formatCny(props.rechargeConfig?.cnyPerMToken ?? 1)} / 1M Token。创建订单后按唯一附言转账，管理员确认到账后入账。` : `当前测试阶段只开放 ${props.rechargeConfig?.allowedUsername ?? "指定账号"} 充值。`}</p>
+          <p>{canRecharge
+            ? `当前汇率 ${formatCny(props.rechargeConfig?.cnyPerMToken ?? 1)} / 1M Token。创建订单后按唯一附言转账，管理员确认到账后入账。`
+            : props.rechargeConfig?.enabled
+              ? "当前账号暂未获得充值权限。"
+              : "服务器当前未开放充值。"}</p>
         </div>
         <div className="wallet-recharge-form">
           <input
@@ -2426,7 +2641,6 @@ function SettingsPanel(props: {
   saveSettings: (next: Partial<UserSettings>) => void;
   previewSettings: (next: Partial<UserSettings>) => void;
   chooseBackgroundImage: () => void;
-  chooseStoragePath: (key: "localChatDataPath" | "fileStoragePath") => void;
   user: LoginUser | null;
   onLogout: () => void;
 }): JSX.Element {
@@ -2442,8 +2656,8 @@ function SettingsPanel(props: {
     background: en ? "Background" : "背景",
     sound: en ? "Message sound" : "开启消息提示音",
     flash: en ? "Icon flash" : "图标闪烁",
-    chatPath: en ? "Local chat data path" : "本地聊天数据存储位置",
-    filePath: en ? "File storage path" : "文件存储位置",
+    chatPath: en ? "Local application data" : "本地应用数据",
+    filePath: en ? "Path override" : "路径覆盖",
     change: en ? "Change" : "更改",
     reset: en ? "Reset" : "恢复默认",
     dark: en ? "Dark" : "深色",
@@ -2512,12 +2726,10 @@ function SettingsPanel(props: {
         {props.settingsSection === "storage" && <SpotlightCard as="section" className="settings-section">
           <header><h3>{text.storage}</h3></header>
           <div className="settings-row storage-row">
-            <div><strong><HardDrive size={16} />{text.chatPath}</strong><span>{props.activeSettings.localChatDataPath || "E:\\Environment\\Chaq\\user-data"}</span></div>
-            <button onClick={() => props.chooseStoragePath("localChatDataPath")}><Folder size={16} />{text.change}</button>
+            <div><strong><HardDrive size={16} />{text.chatPath}</strong><span>{en ? "Uses .chaq-data/user-data beside the project or executable; falls back to Desktop/Chaq only when that directory is not writable." : "默认使用项目或程序目录下的 .chaq-data/user-data；目录不可写时才回退到桌面 Chaq/user-data。"}</span></div>
           </div>
           <div className="settings-row storage-row">
-            <div><strong><Folder size={16} />{text.filePath}</strong><span>{props.activeSettings.fileStoragePath || "E:\\Environment\\Chaq\\files"}</span></div>
-            <button onClick={() => props.chooseStoragePath("fileStoragePath")}><Folder size={16} />{text.change}</button>
+            <div><strong><Folder size={16} />{text.filePath}</strong><span>{en ? "Runtime migration is not supported. Set CHAQ_ENV_ROOT before launch to place the data root on another drive." : "当前不支持在运行中迁移数据。如需固定到其他磁盘，请在启动前设置 CHAQ_ENV_ROOT。"}</span></div>
           </div>
         </SpotlightCard>}
 
@@ -2709,8 +2921,9 @@ function SkillEditorPage(props: {
         {props.tab === "share" && (
           <div className="editor-section share-section">
             <button disabled={!props.skill} onClick={props.onPublish}><Store size={16} />分享到聊天广场</button>
-            <button disabled={!props.skill} onClick={props.onCopyShare}><Clipboard size={16} />复制 Skill 云端代码</button>
-            <div className="share-code">chaq://skill/{props.skill?.id ?? "保存后生成"}</div>
+            <button disabled={!props.skill} onClick={props.onCopyShare}><Clipboard size={16} />复制 Skill 云端标识</button>
+            <div className="share-code">CHAQ-SKILL:{props.skill?.id ?? "保存后生成"}</div>
+            <small className="form-field-hint">该标识不会自动打开应用；跨设备分发请先发布到聊天广场。</small>
           </div>
         )}
 
@@ -2745,10 +2958,11 @@ function SkillEditorPage(props: {
               </label>
             )}
 
-            <label className="switch-row"><input type="checkbox" checked={props.autoSettings.enabled} onChange={(event) => props.saveAutoSettings({ enabled: event.target.checked })} />开启自动发消息</label>
-            <label className="switch-row"><input type="checkbox" checked={props.autoSettings.doNotDisturb} onChange={(event) => props.saveAutoSettings({ doNotDisturb: event.target.checked })} />消息免打扰</label>
+            <small className="form-field-hint">自动发消息调度器尚未接入。相关控件已停用，本版本不会在后台产生模型调用或 token 消耗。</small>
+            <label className="switch-row"><input type="checkbox" checked={false} disabled />自动发消息（未启用）</label>
+            <label className="switch-row"><input type="checkbox" checked={false} disabled />主动消息免打扰</label>
             <label>自动模式
-              <select value={props.autoSettings.mode} onChange={(event) => props.saveAutoSettings({ mode: event.target.value as SkillAutoMessageSettings["mode"] })}>
+              <select value={props.autoSettings.mode} disabled onChange={(event) => props.saveAutoSettings({ mode: event.target.value as SkillAutoMessageSettings["mode"] })}>
                 <option value="fixed">固定</option>
                 <option value="random">随机</option>
               </select>
@@ -2756,18 +2970,18 @@ function SkillEditorPage(props: {
             {props.autoSettings.mode === "fixed" ? (
               <>
                 <label>周期
-                  <select value={props.autoSettings.fixedPeriod} onChange={(event) => props.saveAutoSettings({ fixedPeriod: event.target.value as SkillAutoMessageSettings["fixedPeriod"] })}>
+                  <select value={props.autoSettings.fixedPeriod} disabled onChange={(event) => props.saveAutoSettings({ fixedPeriod: event.target.value as SkillAutoMessageSettings["fixedPeriod"] })}>
                     <option value="day">每天</option>
                     <option value="week">每周</option>
                     <option value="month">每月</option>
                   </select>
                 </label>
-                <label>消息条数<input type="number" min={1} max={99} value={props.autoSettings.fixedCount} onChange={(event) => props.saveAutoSettings({ fixedCount: Number(event.target.value) })} /></label>
+                <label>消息条数<input type="number" min={1} max={99} value={props.autoSettings.fixedCount} disabled onChange={(event) => props.saveAutoSettings({ fixedCount: Number(event.target.value) })} /></label>
               </>
             ) : (
               <>
-                <label className="switch-row"><input type="checkbox" checked={props.autoSettings.randomUnlimited} onChange={(event) => props.saveAutoSettings({ randomUnlimited: event.target.checked })} />无限制 token</label>
-                <label>随机 token 上限<input type="number" min={0} value={props.autoSettings.randomTokenLimit ?? 0} disabled={props.autoSettings.randomUnlimited} onChange={(event) => props.saveAutoSettings({ randomTokenLimit: Number(event.target.value) })} /></label>
+                <label className="switch-row"><input type="checkbox" checked={props.autoSettings.randomUnlimited} disabled />无限制 token</label>
+                <label>随机 token 上限<input type="number" min={0} value={props.autoSettings.randomTokenLimit ?? 0} disabled onChange={(event) => props.saveAutoSettings({ randomTokenLimit: Number(event.target.value) })} /></label>
               </>
             )}
             <div className="token-mini">
@@ -3371,12 +3585,28 @@ function fallbackImage(event: React.SyntheticEvent<HTMLImageElement>): void {
   event.currentTarget.src = defaultAvatarUrl;
 }
 
-function loadRememberedAccounts(): RememberedAccount[] {
+function loadRememberedAccounts(): { accounts: RememberedAccount[]; legacySessions: LegacyRememberedSession[] } {
   try {
-    const parsed = JSON.parse(localStorage.getItem("chaq.rememberedAccounts") || "[]") as RememberedAccount[];
-    return parsed.filter((account) => account.sessionToken && account.user?.id);
+    const parsed = JSON.parse(localStorage.getItem("chaq.rememberedAccounts") || "[]") as Array<
+      Partial<RememberedAccount> & { sessionToken?: unknown }
+    >;
+    if (!Array.isArray(parsed)) return { accounts: [], legacySessions: [] };
+    const accounts: RememberedAccount[] = [];
+    const legacySessions: LegacyRememberedSession[] = [];
+    for (const account of parsed) {
+      if (!account.user?.id || !account.settings || typeof account.expiresAt !== "string") continue;
+      accounts.push({ expiresAt: account.expiresAt, user: account.user, settings: account.settings });
+      if (typeof account.sessionToken === "string" && account.sessionToken) {
+        legacySessions.push({
+          accountId: account.user.id,
+          sessionToken: account.sessionToken,
+          expiresAt: account.expiresAt
+        });
+      }
+    }
+    return { accounts: accounts.slice(0, 6), legacySessions: legacySessions.slice(0, 6) };
   } catch {
-    return [];
+    return { accounts: [], legacySessions: [] };
   }
 }
 
@@ -3390,7 +3620,12 @@ function loadPinnedSkillIds(): string[] {
 }
 
 function saveRememberedAccounts(accounts: RememberedAccount[]): void {
-  localStorage.setItem("chaq.rememberedAccounts", JSON.stringify(accounts.slice(0, 6)));
+  const metadata = accounts.slice(0, 6).map((account) => ({
+    expiresAt: account.expiresAt,
+    user: account.user,
+    settings: account.settings
+  }));
+  localStorage.setItem("chaq.rememberedAccounts", JSON.stringify(metadata));
 }
 
 function upsertRememberedAccount(accounts: RememberedAccount[], account: RememberedAccount): RememberedAccount[] {

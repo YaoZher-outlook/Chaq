@@ -1,7 +1,126 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { RechargeOrderStatus, TokenTransactionKind, UserRole } from "@prisma/client";
+import { hashSessionToken } from "../../common/password";
 import { UsersService } from "./users.service";
+
+test("admin token adjustments use atomic increments and ledger the committed balance", async () => {
+  let balance = 100;
+  const transactionRows: any[] = [];
+  const targetUser = () => ({
+    id: "target-1",
+    username: "target",
+    email: null,
+    passwordHash: "",
+    displayName: "Target",
+    avatarUrl: null,
+    role: UserRole.USER,
+    tokenBalance: balance,
+    createdAt: new Date(),
+    updatedAt: new Date()
+  });
+  const prisma = {
+    user: {
+      findUnique: async ({ where }: any) => where.id === "admin-1"
+        ? { ...targetUser(), id: "admin-1", username: "admin", role: UserRole.ADMIN }
+        : targetUser()
+    },
+    $transaction: async (callback: any) => callback({
+      user: {
+        updateMany: async ({ where, data }: any) => {
+          if (data.tokenBalance.decrement) {
+            if (balance < where.tokenBalance.gte) return { count: 0 };
+            balance -= data.tokenBalance.decrement;
+          } else {
+            if (balance > where.tokenBalance.lte) return { count: 0 };
+            balance += data.tokenBalance.increment;
+          }
+          return { count: 1 };
+        },
+        findUniqueOrThrow: async () => targetUser()
+      },
+      tokenTransaction: {
+        create: async ({ data }: any) => {
+          transactionRows.push(data);
+          return { id: `tx-${transactionRows.length}`, ...data };
+        }
+      }
+    })
+  };
+  const service = new UsersService(prisma as never, {} as never);
+
+  await service.adjustTokens("admin-1", "target-1", 25, TokenTransactionKind.ADMIN_ADJUSTMENT);
+  await service.adjustTokens("admin-1", "target-1", -40, TokenTransactionKind.ADMIN_ADJUSTMENT);
+
+  assert.equal(balance, 85);
+  assert.deepEqual(transactionRows.map((row) => [row.amount, row.balanceAfter]), [[25, 125], [-40, 85]]);
+});
+
+test("admin token adjustment rejects an atomic decrement that would overdraw", async () => {
+  const prisma = {
+    user: {
+      findUnique: async ({ where }: any) => ({
+        id: where.id,
+        username: where.id,
+        email: null,
+        passwordHash: "",
+        displayName: where.id,
+        avatarUrl: null,
+        role: where.id === "admin-1" ? UserRole.ADMIN : UserRole.USER,
+        tokenBalance: 10,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      })
+    },
+    $transaction: async (callback: any) => callback({
+      user: { updateMany: async () => ({ count: 0 }) },
+      tokenTransaction: { create: async () => assert.fail("ledger must not be written") }
+    })
+  };
+
+  await assert.rejects(
+    () => new UsersService(prisma as never, {} as never).adjustTokens(
+      "admin-1",
+      "target-1",
+      -11,
+      TokenTransactionKind.ADMIN_ADJUSTMENT
+    ),
+    /cannot become negative/
+  );
+});
+
+test("admin token adjustment rejects an atomic increment above the balance ceiling", async () => {
+  const prisma = {
+    user: {
+      findUnique: async ({ where }: any) => ({
+        id: where.id,
+        username: where.id,
+        email: null,
+        passwordHash: "",
+        displayName: where.id,
+        avatarUrl: null,
+        role: where.id === "admin-1" ? UserRole.ADMIN : UserRole.USER,
+        tokenBalance: 1_999_999_999,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      })
+    },
+    $transaction: async (callback: any) => callback({
+      user: { updateMany: async () => ({ count: 0 }) },
+      tokenTransaction: { create: async () => assert.fail("ledger must not be written") }
+    })
+  };
+
+  await assert.rejects(
+    () => new UsersService(prisma as never, {} as never).adjustTokens(
+      "admin-1",
+      "target-1",
+      2,
+      TokenTransactionKind.ADMIN_ADJUSTMENT
+    ),
+    /cannot exceed/
+  );
+});
 
 test("wallet summary separates model spending, service fees, and per-agent earnings", async () => {
   const prisma = {
@@ -46,7 +165,8 @@ test("wallet summary separates model spending, service fees, and per-agent earni
   assert.deepEqual(summary.agentEarnings, [{ agentId: "agent-1", agentName: "Mira", amount: 10, transactionCount: 2 }]);
 });
 
-test("recharge is limited to the chen_zy pilot account", async () => {
+test("a configured recharge pilot restricts access without exposing the username", async () => {
+  process.env.PAYMENT_PILOT_USERNAME = "pilot-user";
   const prisma = {
     user: {
       findUnique: async () => ({
@@ -65,11 +185,12 @@ test("recharge is limited to the chen_zy pilot account", async () => {
   };
   await assert.rejects(
     () => new UsersService(prisma as never, {} as never).createRechargeOrder("jiang_yy", { amount: 1, unit: "m" }),
-    /only available for chen_zy/
+    /not available for this account/
   );
 });
 
-test("chen_zy recharge creates a pending bank transfer order without crediting tokens", async () => {
+test("a configured pilot recharge creates a pending bank transfer order without crediting tokens", async () => {
+  process.env.PAYMENT_PILOT_USERNAME = "pilot_user";
   process.env.PAYMENT_ACCOUNT_NUMBER = "6214000011116181";
   process.env.PAYMENT_BANK_NAME = "Test Bank";
   process.env.PAYMENT_ACCOUNT_NAME = "Test Payee";
@@ -77,11 +198,11 @@ test("chen_zy recharge creates a pending bank transfer order without crediting t
   const prisma = {
     user: {
       findUnique: async () => ({
-        id: "chen_zy",
-        username: "chen_zy",
+        id: "pilot_user",
+        username: "pilot_user",
         email: "yaozher@outlook.com",
         passwordHash: "",
-        displayName: "chen_zy",
+        displayName: "pilot_user",
         avatarUrl: null,
         role: UserRole.USER,
         tokenBalance: 100_000_000,
@@ -106,11 +227,57 @@ test("chen_zy recharge creates a pending bank transfer order without crediting t
   };
   const rateLimit = { consume: async () => ({ allowed: true, limit: 6, remaining: 5, retryAfterSeconds: 0 }) };
 
-  const result = await new UsersService(prisma as never, rateLimit as never).createRechargeOrder("chen_zy", { amount: 2, unit: "m" });
+  const result = await new UsersService(prisma as never, rateLimit as never).createRechargeOrder("pilot_user", { amount: 2, unit: "m" });
   assert.equal(result.amountTokens, 2_000_000);
   assert.equal(result.payableCny, 4);
   assert.equal(result.status, "pending");
   assert.equal(result.paymentAccount.accountNumber, "6214000011116181");
+});
+
+test("blank recharge pilot allows every authenticated user and is not returned to clients", async () => {
+  process.env.PAYMENT_PILOT_USERNAME = "";
+  const prisma = {
+    user: {
+      findUnique: async () => ({
+        id: "user-1", username: "any-user", email: null, passwordHash: "", displayName: "Any User",
+        avatarUrl: null, role: UserRole.USER, tokenBalance: 0, createdAt: new Date(), updatedAt: new Date()
+      })
+    }
+  };
+
+  const config = await new UsersService(prisma as never, {} as never).rechargeConfig("user-1");
+  assert.equal(config.allowed, true);
+  assert.equal("allowedUsername" in config, false);
+});
+
+test("email binding code sends are limited by both target email and requesting user", async () => {
+  const buckets: string[] = [];
+  const rateLimit = {
+    consume: async (bucket: string) => {
+      buckets.push(bucket);
+      return { allowed: true, limit: 5, remaining: 4, retryAfterSeconds: 0 };
+    }
+  };
+  const service = new UsersService({} as never, rateLimit as never) as any;
+
+  await service.assertEmailCodeRateLimit("target@example.com", "bind_email", "user-1");
+  assert.deepEqual(buckets, ["email-code:bind_email", "email-code-actor:bind_email"]);
+});
+
+test("email binding verification code is consumed atomically", async () => {
+  const code = "654321";
+  const prisma = {
+    emailVerificationCode: {
+      findFirst: async () => ({ id: "code-1", codeHash: hashSessionToken(code) }),
+      updateMany: async () => ({ count: 0 })
+    }
+  };
+  const rateLimit = {
+    consume: async () => ({ allowed: true, limit: 8, remaining: 7, retryAfterSeconds: 0 })
+  };
+  const service = new UsersService(prisma as never, rateLimit as never) as any;
+
+  await assert.rejects(service.consumeCode("target@example.com", "bind_email", code), /验证码/);
 });
 
 test("admin confirmation credits a recharge order exactly once", async () => {
@@ -119,7 +286,7 @@ test("admin confirmation credits a recharge order exactly once", async () => {
   const order = {
     id: "order-1",
     orderNo: "CHQ20260624ABCD",
-    userId: "chen_zy",
+    userId: "pilot_user",
     status: RechargeOrderStatus.SUBMITTED,
     amountTokens: 2_000_000,
     requestedAmount: 2,

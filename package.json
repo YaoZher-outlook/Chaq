@@ -2,32 +2,54 @@
   "name": "chaq",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "npm@11.18.0",
   "description": "Agent-first desktop app for autonomous digital people with memory, relationships, goals, tools, and social behavior.",
   "workspaces": [
     "apps/*",
     "packages/*"
   ],
   "scripts": {
+    "setup": "node scripts/install-dependencies.js",
     "env:prepare": "node scripts/prepare-env.js",
+    "env:validate:production": "node scripts/validate-production-env.js",
     "dev:server": "npm run build -w @chaq/shared && npm run dev -w @chaq/server",
     "dev:desktop": "npm run dev -w @chaq/desktop",
     "infra:local": "node scripts/start-local-infra.js",
     "build": "npm run build -w @chaq/shared && npm run build -w @chaq/server && npm run build -w @chaq/desktop",
     "typecheck": "npm run typecheck -w @chaq/shared && npm run typecheck -w @chaq/server && npm run typecheck -w @chaq/desktop",
+    "lint": "node scripts/lint-project.js",
     "test": "node scripts/run-tests.js",
+    "test:coverage": "node scripts/run-tests.js --coverage",
     "test:e2e:agent": "node scripts/e2e-agent.js",
     "test:e2e:billing": "node scripts/e2e-agent-contact-billing.js",
+    "test:smoke:api": "node scripts/smoke-production-api.js",
     "admin:create": "node scripts/create-admin-user.js",
+    "public:check": "node scripts/check-public-api.js",
     "electron:install": "node scripts/install-electron.js",
     "prisma:generate": "npm run prisma:generate -w @chaq/server",
     "prisma:migrate": "npm run prisma:migrate -w @chaq/server",
-    "prisma:seed": "npm run prisma:seed -w @chaq/server"
+    "prisma:seed": "npm run prisma:seed -w @chaq/server",
+    "audit": "npm audit --audit-level=low",
+    "audit:prod": "npm audit --omit=dev --audit-level=low",
+    "ci:check": "npm run prisma:generate && npm run lint && npm run typecheck && npm test && npm run test:coverage && npm run build && npm run audit"
   },
   "devDependencies": {
     "concurrently": "^10.0.3",
-    "typescript": "^5.6.3"
+    "typescript": "^5.9.3"
   },
   "engines": {
-    "node": ">=20.11"
+    "node": ">=22.12"
+  },
+  "overrides": {
+    "@nestjs/common": "11.1.28",
+    "@nestjs/core": "11.1.28",
+    "@nestjs/platform-express": "11.1.28",
+    "file-type": "21.3.4",
+    "tsx": {
+      "esbuild": "0.28.1"
+    },
+    "vite": {
+      "esbuild": "0.28.1"
+    }
   }
 }

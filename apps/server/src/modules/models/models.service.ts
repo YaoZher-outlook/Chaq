@@ -1,9 +1,18 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
-import { BadRequestException, ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
-import { ModelCallLog, ModelProviderConfig, ModelProviderScope, Prisma, ProviderKind, TokenTransactionKind } from "@prisma/client";
-import { HumanMessage, SystemMessage } from "@langchain/core/messages";
-import { ChatOpenAI } from "@langchain/openai";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
+import { BadRequestException, ConflictException, Inject, Injectable, NotFoundException } from "@nestjs/common";
+import {
+  ModelCallLog,
+  ModelCallPurpose,
+  ModelCallReservation,
+  ModelCallReservationStatus,
+  ModelProviderConfig,
+  ModelProviderScope,
+  Prisma,
+  ProviderKind,
+  TokenTransactionKind
+} from "@prisma/client";
 import type { CloudChatRequest, CloudChatResponse, DistillRequest, DistillResponse, ModelProviderPublic, SkillDraft } from "@chaq/shared";
+import { assertOutboundUrl, readResponseJsonLimited, safeFetch } from "../../common/outbound-http";
 import { PrismaService } from "../../common/prisma.service";
 import { embedText } from "../../common/vector-search";
 import { UsersService } from "../users/users.service";
@@ -39,6 +48,24 @@ type ProviderCallResult = {
   promptTokens: number;
   completionTokens: number;
 };
+
+type ProviderCallBudget = {
+  promptTokenLimit: number;
+  completionTokenLimit: number;
+};
+
+type ReservationClaim =
+  | { state: "acquired"; reservation: ModelCallReservation }
+  | { state: "pending"; reservation: ModelCallReservation }
+  | { state: "settled"; reservation: ModelCallReservation };
+
+type StoredCompletionResponse = ProviderCallResult & {
+  modelLabel: string;
+};
+
+type StoredEmbeddingResponse = EmbeddingResult;
+
+const maxProviderResponseBytes = 2 * 1024 * 1024;
 
 export type AgentCompletionResult = ProviderCallResult & {
   chargedTokens: number;
@@ -81,6 +108,7 @@ export class ModelsService {
 
   async upsertProvider(userId: string, input: ProviderInput): Promise<ModelProviderPublic> {
     await this.users.assertAdmin(userId);
+    const baseUrl = this.platformProviderBaseUrl(input.baseUrl);
     const trimmedApiKey = input.apiKey?.trim() ?? "";
     const existing = input.id
       ? await this.prisma.modelProviderConfig.findFirst({ where: { id: input.id, scope: ModelProviderScope.PLATFORM } })
@@ -94,7 +122,7 @@ export class ModelsService {
       ownerId: null,
       kind: this.toPrismaProviderKind(input.kind),
       name: input.name,
-      baseUrl: input.baseUrl.replace(/\/$/, ""),
+      baseUrl,
       apiKeyCiphertext: trimmedApiKey ? this.sealApiKey(trimmedApiKey) : existing?.apiKeyCiphertext ?? "",
       models: this.withEmbeddingMetadata(input.models, input.embeddingModel, input.embeddingTokenPrice),
       enabled: input.enabled,
@@ -145,6 +173,7 @@ export class ModelsService {
     if (input.kind.toLowerCase() === "ollama") {
       throw new BadRequestException("Private model providers must use a cloud API reachable by the server.");
     }
+    const baseUrl = await this.privateProviderBaseUrl(input.baseUrl);
     const existing = input.id
       ? await this.prisma.modelProviderConfig.findFirst({
         where: { id: input.id, scope: ModelProviderScope.USER_PRIVATE, ownerId: userId }
@@ -168,7 +197,7 @@ export class ModelsService {
       ownerId: userId,
       kind: this.toPrismaProviderKind(input.kind),
       name: input.name,
-      baseUrl: input.baseUrl.replace(/\/$/, ""),
+      baseUrl,
       apiKeyCiphertext: apiKey ? this.sealApiKey(apiKey) : existing?.apiKeyCiphertext ?? "",
       models: [model],
       enabled: true,
@@ -195,6 +224,7 @@ export class ModelsService {
     if (input.kind.toLowerCase() === "ollama") {
       throw new BadRequestException("Private model providers must use a cloud API reachable by the server.");
     }
+    const baseUrl = await this.privateProviderBaseUrl(input.baseUrl);
     const existing = input.id
       ? await this.prisma.modelProviderConfig.findFirst({
         where: { id: input.id, scope: ModelProviderScope.USER_PRIVATE, ownerId: userId }
@@ -211,7 +241,7 @@ export class ModelsService {
       ownerId: userId,
       kind: this.toPrismaProviderKind(input.kind),
       name: input.name,
-      baseUrl: input.baseUrl.replace(/\/$/, ""),
+      baseUrl,
       apiKeyCiphertext: apiKey ? this.sealApiKey(apiKey) : "",
       models: [{
         id: input.defaultModel,
@@ -234,68 +264,67 @@ export class ModelsService {
     return { ok: true, message: "Cloud connection verified. Credentials remain private to your account." };
   }
 
-  async assertAgentProviderAccess(userId: string, providerId: string | null | undefined, visibility: string): Promise<void> {
+  async assertAgentProviderAccess(
+    userId: string,
+    providerId: string | null | undefined,
+    visibility: string,
+    model?: string | null
+  ): Promise<void> {
     if (!providerId) return;
     const provider = await this.getEnabledProvider(providerId, userId, true);
     if (visibility.toLowerCase() !== "private" && provider.scope !== ModelProviderScope.PLATFORM) {
       throw new BadRequestException("Public and unlisted agents can only use platform model providers.");
     }
+    if (model) this.assertConfiguredChatModel(provider, model);
   }
 
-  async cloudChat(userId: string, input: CloudChatRequest): Promise<CloudChatResponse> {
-    const provider = await this.getEnabledProvider(input.providerId!, userId, false);
+  async cloudChat(userId: string, input: CloudChatRequest & { requestKey?: string }): Promise<CloudChatResponse> {
+    const provider = await this.getEnabledProvider(input.providerId!, userId, true);
+    const model = this.assertConfiguredChatModel(provider, input.model);
     const messages = this.buildSkillMessages(input.skill, input.messages);
     const estimatedPrompt = this.estimateTokens(messages.map((message) => message.content).join("\n"));
-    const estimatedCompletion = Math.max(64, Math.ceil(estimatedPrompt * 0.4));
-    const estimatedCharge = this.calculateCharge(provider, estimatedPrompt, estimatedCompletion);
-    const user = await this.users.ensureUser(userId);
-    if (user.tokenBalance < estimatedCharge) {
-      throw new ForbiddenException("Token balance is insufficient for the estimated cloud model call.");
+    const budget = this.providerCallBudget(provider, model, messages, 1200);
+    const reservedTokens = this.calculateCharge(provider, budget.promptTokenLimit, budget.completionTokenLimit);
+    const requestKey = this.requestKey("cloud-chat", userId, input.requestKey);
+    const claim = await this.reserveModelCall({
+      requestKey,
+      requestHash: this.requestHash({ userId, providerId: provider.id, model, messages }),
+      purpose: ModelCallPurpose.CLOUD_CHAT,
+      userId,
+      providerId: provider.id,
+      model,
+      reservedTokens,
+      ...budget
+    });
+    if (claim.state === "pending") {
+      throw new ConflictException("This cloud model request is already in progress; it was not sent again.");
+    }
+    if (claim.state === "settled") {
+      return this.replayCompletionReservation(claim.reservation, provider.name, userId);
     }
 
     const started = Date.now();
+    let result: ProviderCallResult;
     try {
-      const result = await this.callProvider(provider, input.model, messages);
-      const chargedTokens = this.calculateCharge(provider, result.promptTokens, result.completionTokens);
-      const balanceAfter = await this.users.chargeForModelUsage(userId, chargedTokens, `Cloud chat via ${provider.name}`, {
-        providerId: provider.id,
-        model: input.model
-      });
-      await this.prisma.modelCallLog.create({
-        data: {
-          userId,
-          providerId: provider.id,
-          model: input.model,
-          promptTokens: result.promptTokens,
-          completionTokens: result.completionTokens,
-          chargedTokens,
-          success: true
-        }
-      });
-      return {
-        content: result.content,
-        promptTokens: result.promptTokens,
-        completionTokens: result.completionTokens,
-        chargedTokens,
-        balanceAfter,
-        modelLabel: `${provider.name} / ${input.model}`
-      };
+      result = await this.callProvider(provider, model, messages, 0.7, budget.completionTokenLimit);
     } catch (error) {
-      await this.prisma.modelCallLog.create({
-        data: {
-          userId,
-          providerId: provider.id,
-          model: input.model,
-          promptTokens: estimatedPrompt,
-          completionTokens: 0,
-          chargedTokens: 0,
-          success: false,
-          error: error instanceof Error ? error.message : String(error)
-        }
-      });
+      await this.failModelCall(claim.reservation, error, estimatedPrompt);
       const elapsed = Date.now() - started;
       throw new BadRequestException(`Cloud model call failed after ${elapsed}ms: ${error instanceof Error ? error.message : String(error)}`);
     }
+    const chargedTokens = this.calculateCharge(provider, result.promptTokens, result.completionTokens);
+    const response: StoredCompletionResponse = {
+      ...result,
+      modelLabel: `${provider.name} / ${model}`
+    };
+    const settled = await this.settleModelCall(claim.reservation, {
+      result,
+      modelCharge: chargedTokens,
+      serviceFee: 0,
+      response: response as unknown as Prisma.InputJsonValue,
+      modelNote: `Cloud chat via ${provider.name}`
+    });
+    return { ...response, chargedTokens: settled.reservation.chargedTokens, balanceAfter: settled.balanceAfter };
   }
 
   async agentCompletion(userId: string, input: {
@@ -306,6 +335,7 @@ export class ModelsService {
     temperature?: number;
     agentId: string;
     runId: string;
+    maxCompletionTokens?: number;
   }): Promise<AgentCompletionResult> {
     const billingAgent = await this.prisma.agent.findUnique({
       where: { id: input.agentId },
@@ -321,59 +351,67 @@ export class ModelsService {
       return this.replayAgentCompletion(replay, replay.provider?.name, await this.currentBalance(userId));
     }
     const provider = await this.getEnabledProvider(input.providerId, userId, true);
+    const model = this.assertConfiguredChatModel(provider, input.model);
     const messages = [
       { role: "system", content: input.system },
       { role: "user", content: input.prompt }
     ];
     const estimatedPrompt = this.estimateTokens(`${input.system}\n${input.prompt}`);
-    const estimatedCompletion = Math.max(256, Math.ceil(estimatedPrompt * 0.6));
-    const estimatedCharge = this.calculateCharge(provider, estimatedPrompt, estimatedCompletion) + serviceFee;
-    const user = await this.users.ensureUser(userId);
-    if (user.tokenBalance < estimatedCharge) {
-      throw new ForbiddenException("Token balance is insufficient for the estimated agent run.");
+    const desiredCompletionTokens = Math.min(
+      1600,
+      Math.max(1, Math.floor(input.maxCompletionTokens ?? 1600))
+    );
+    const budget = this.providerCallBudget(provider, model, messages, desiredCompletionTokens);
+    const reservedTokens = this.calculateCharge(provider, budget.promptTokenLimit, budget.completionTokenLimit) + serviceFee;
+    const claim = await this.reserveModelCall({
+      requestKey: `agent-run:${input.runId}:completion`,
+      requestHash: this.requestHash({ userId, ...input, model }),
+      purpose: ModelCallPurpose.AGENT_COMPLETION,
+      userId,
+      providerId: provider.id,
+      model,
+      reservedTokens,
+      serviceFee,
+      beneficiaryUserId: serviceFee > 0 ? billingAgent.ownerId : null,
+      ...budget
+    });
+    if (claim.state === "pending") {
+      throw new ConflictException("This agent run already has a pending model call; the provider was not called again.");
+    }
+    if (claim.state === "settled") {
+      return this.replayCompletionReservation(claim.reservation, provider.name, userId);
     }
 
+    let result: ProviderCallResult;
     try {
-      const result = this.isLangChainCompatible(provider.kind)
-        ? await this.callLangChainCompatible(provider, input.model, messages, input.temperature ?? 0.7)
-        : await this.callProvider(provider, input.model, messages, input.temperature ?? 0.7);
-      const modelCharge = this.calculateCharge(provider, result.promptTokens, result.completionTokens);
-      const persisted = await this.persistAgentCompletion(
-        userId,
-        input,
-        provider,
-        result,
-        modelCharge,
-        serviceFee,
-        billingAgent.ownerId
-      );
-      if (persisted.replayed) {
-        return this.replayAgentCompletion(persisted.log, provider.name, persisted.balanceAfter);
-      }
-      return {
-        ...result,
-        chargedTokens: modelCharge + serviceFee,
-        balanceAfter: persisted.balanceAfter,
-        modelLabel: `${provider.name} / ${input.model}`
-      };
+      result = await this.callProvider(provider, model, messages, input.temperature ?? 0.7, budget.completionTokenLimit);
     } catch (error) {
-      await this.prisma.modelCallLog.create({
-        data: {
-          userId,
-          providerId: provider.id,
-          model: input.model,
-          promptTokens: estimatedPrompt,
-          completionTokens: 0,
-          chargedTokens: 0,
-          success: false,
-          error: error instanceof Error ? error.message : String(error)
-        }
-      });
+      await this.failModelCall(claim.reservation, error, estimatedPrompt);
       throw error;
     }
+    const modelCharge = this.calculateCharge(provider, result.promptTokens, result.completionTokens);
+    const response: StoredCompletionResponse = {
+      ...result,
+      modelLabel: `${provider.name} / ${model}`
+    };
+    const settled = await this.settleModelCall(claim.reservation, {
+      result,
+      modelCharge,
+      serviceFee,
+      beneficiaryUserId: serviceFee > 0 ? billingAgent.ownerId : undefined,
+      agentRunId: input.runId,
+      agentId: input.agentId,
+      response: response as unknown as Prisma.InputJsonValue,
+      modelNote: `Agent run via ${provider.name}`
+    });
+    return {
+      ...response,
+      chargedTokens: settled.reservation.chargedTokens,
+      balanceAfter: settled.balanceAfter
+    };
   }
 
-  async agentEmbedding(agentId: string, text: string, payerUserId?: string): Promise<EmbeddingResult> {
+  async agentEmbedding(agentId: string, text: string, payerUserId?: string, stableRequestKey?: string): Promise<EmbeddingResult> {
     const agent = await this.prisma.agent.findUnique({
       where: { id: agentId },
       select: { id: true, ownerId: true, modelProviderId: true }
@@ -382,116 +420,364 @@ export class ModelsService {
     const provider = await this.getEnabledProvider(agent.modelProviderId, agent.ownerId, true).catch(() => null);
     const model = this.providerEmbeddingModel(provider);
     if (!provider || !model) return this.fallbackEmbedding(text);
+    const userId = payerUserId || agent.ownerId;
     const promptTokens = this.estimateTokens(text);
+    const promptTokenLimit = Math.min(
+      Math.max(1, provider.contextWindow),
+      Math.max(promptTokens, Buffer.byteLength(text, "utf8") + 16)
+    );
+    const reservedTokens = this.calculateEmbeddingCharge(provider, promptTokenLimit);
+    const claim = await this.reserveModelCall({
+      requestKey: this.requestKey("embedding", userId, stableRequestKey),
+      requestHash: this.requestHash({ agentId, userId, providerId: provider.id, model, text }),
+      purpose: ModelCallPurpose.EMBEDDING,
+      userId,
+      providerId: provider.id,
+      model,
+      reservedTokens,
+      promptTokenLimit,
+      completionTokenLimit: 0
+    });
+    if (claim.state === "pending") {
+      throw new ConflictException("This embedding request is already in progress; it was not sent again.");
+    }
+    if (claim.state === "settled") {
+      return this.reservationResponse<StoredEmbeddingResponse>(claim.reservation);
+    }
 
+    let vector: number[];
     try {
-      const vector = await this.callEmbeddingProvider(provider, model, text);
-      const chargedTokens = this.calculateEmbeddingCharge(provider, promptTokens);
-      if (chargedTokens > 0) {
-        await this.users.chargeForModelUsage(
-          payerUserId || agent.ownerId,
-          chargedTokens,
-          `Agent embedding via ${provider.name}`,
-          { providerId: provider.id, model, agentId },
-          TokenTransactionKind.AGENT_MODEL_USAGE
-        );
-      }
-      await this.prisma.modelCallLog.create({
-        data: {
-          userId: payerUserId || agent.ownerId,
-          providerId: provider.id,
-          model,
-          promptTokens,
-          completionTokens: 0,
-          chargedTokens,
-          success: true,
-          responseContent: null
-        }
-      });
-      return { vector, model, providerId: provider.id, fallback: false, promptTokens, chargedTokens };
+      vector = await this.callEmbeddingProvider(provider, model, text);
     } catch (error) {
-      await this.prisma.modelCallLog.create({
-        data: {
-          userId: payerUserId || agent.ownerId,
-          providerId: provider.id,
-          model,
-          promptTokens,
-          completionTokens: 0,
-          chargedTokens: 0,
-          success: false,
-          error: error instanceof Error ? error.message : String(error)
-        }
-      }).catch(() => undefined);
+      await this.failModelCall(claim.reservation, error, promptTokens);
       return this.fallbackEmbedding(text);
     }
+    const chargedTokens = Math.min(this.calculateEmbeddingCharge(provider, promptTokens), reservedTokens);
+    const response: StoredEmbeddingResponse = {
+      vector,
+      model,
+      providerId: provider.id,
+      fallback: false,
+      promptTokens,
+      chargedTokens
+    };
+    await this.settleModelCall(claim.reservation, {
+      result: { content: "", promptTokens, completionTokens: 0 },
+      modelCharge: chargedTokens,
+      serviceFee: 0,
+      agentId,
+      response: response as unknown as Prisma.InputJsonValue,
+      modelNote: `Agent embedding via ${provider.name}`
+    });
+    return response;
   }
 
-  private async persistAgentCompletion(
-    userId: string,
-    input: { providerId: string; model: string; agentId: string; runId: string },
-    provider: ModelProviderConfig,
-    result: ProviderCallResult,
-    modelCharge: number,
-    serviceFee: number,
-    beneficiaryUserId: string
-  ): Promise<{ log: ModelCallLog; balanceAfter: number; replayed: boolean }> {
+  private async reserveModelCall(input: {
+    requestKey: string;
+    requestHash: string;
+    purpose: ModelCallPurpose;
+    userId: string;
+    providerId: string;
+    model: string;
+    reservedTokens: number;
+    promptTokenLimit: number;
+    completionTokenLimit: number;
+    serviceFee?: number;
+    beneficiaryUserId?: string | null;
+  }): Promise<ReservationClaim> {
     try {
       return await this.prisma.$transaction(async (tx) => {
-        const existing = await tx.modelCallLog.findUnique({ where: { agentRunId: input.runId } });
+        let existing = await tx.modelCallReservation.findUnique({ where: { requestKey: input.requestKey } });
         if (existing) {
-          return { log: existing, balanceAfter: await this.currentBalance(userId, tx), replayed: true };
+          this.assertReservationMatches(existing, input.requestHash);
+          if (existing.status === ModelCallReservationStatus.SETTLED) return { state: "settled", reservation: existing };
+          if (existing.status === ModelCallReservationStatus.PENDING) {
+            const staleBefore = new Date(Date.now() - this.pendingReservationStaleMs());
+            if (existing.updatedAt > staleBefore) return { state: "pending", reservation: existing };
+            const expired = await tx.modelCallReservation.updateMany({
+              where: {
+                id: existing.id,
+                attempt: existing.attempt,
+                status: ModelCallReservationStatus.PENDING,
+                updatedAt: { lte: staleBefore }
+              },
+              data: {
+                status: ModelCallReservationStatus.FAILED,
+                chargedTokens: 0,
+                error: "Recovered a stale model-call reservation after its execution lease expired.",
+                settledAt: new Date()
+              }
+            });
+            if (!expired.count) {
+              const current = await tx.modelCallReservation.findUniqueOrThrow({ where: { id: existing.id } });
+              return this.classifyReservation(current);
+            }
+            await this.users.releaseTokenReservationInTransaction(tx, existing.userId, existing.reservedTokens);
+            existing = await tx.modelCallReservation.findUniqueOrThrow({ where: { id: existing.id } });
+          }
+          const claimed = await tx.modelCallReservation.updateMany({
+            where: {
+              id: existing.id,
+              attempt: existing.attempt,
+              status: ModelCallReservationStatus.FAILED
+            },
+            data: {
+              status: ModelCallReservationStatus.PENDING,
+              attempt: { increment: 1 },
+              reservedTokens: input.reservedTokens,
+              chargedTokens: 0,
+              promptTokenLimit: input.promptTokenLimit,
+              completionTokenLimit: input.completionTokenLimit,
+              promptTokens: 0,
+              completionTokens: 0,
+              serviceFee: input.serviceFee ?? 0,
+              beneficiaryUserId: input.beneficiaryUserId ?? null,
+              response: Prisma.DbNull,
+              error: null,
+              settledAt: null
+            }
+          });
+          if (!claimed.count) {
+            const current = await tx.modelCallReservation.findUniqueOrThrow({ where: { id: existing.id } });
+            return this.classifyReservation(current);
+          }
+          await this.users.reserveTokensInTransaction(tx, input.userId, input.reservedTokens);
+          const reservation = await tx.modelCallReservation.findUniqueOrThrow({ where: { id: existing.id } });
+          return { state: "acquired", reservation };
         }
-        const metadata = { providerId: provider.id, model: input.model, agentId: input.agentId, runId: input.runId };
-        let balanceAfter = await this.users.chargeForModelUsageInTransaction(
-          tx,
-          userId,
-          modelCharge,
-          `Agent run via ${provider.name}`,
-          metadata,
-          TokenTransactionKind.AGENT_MODEL_USAGE
-        );
-        if (serviceFee > 0 && beneficiaryUserId !== userId) {
-          balanceAfter = await this.users.chargeForModelUsageInTransaction(
-            tx,
-            userId,
-            serviceFee,
-            `Service fee for agent ${input.agentId}`,
-            metadata,
-            TokenTransactionKind.AGENT_SERVICE_FEE
-          );
-          await this.users.creditTokensInTransaction(
-            tx,
-            beneficiaryUserId,
-            serviceFee,
-            `Service earning from agent ${input.agentId}`,
-            { ...metadata, payerUserId: userId },
-            TokenTransactionKind.AGENT_SERVICE_EARNING
-          );
-        }
-        const log = await tx.modelCallLog.create({
+        await this.users.reserveTokensInTransaction(tx, input.userId, input.reservedTokens);
+        const reservation = await tx.modelCallReservation.create({
           data: {
-            agentRunId: input.runId,
-            userId,
-            providerId: provider.id,
+            requestKey: input.requestKey,
+            requestHash: input.requestHash,
+            purpose: input.purpose,
+            userId: input.userId,
+            providerId: input.providerId,
             model: input.model,
-            promptTokens: result.promptTokens,
-            completionTokens: result.completionTokens,
-            chargedTokens: modelCharge + serviceFee,
-            serviceFee,
-            beneficiaryUserId: serviceFee > 0 ? beneficiaryUserId : null,
-            success: true,
-            responseContent: result.content
+            reservedTokens: input.reservedTokens,
+            promptTokenLimit: input.promptTokenLimit,
+            completionTokenLimit: input.completionTokenLimit,
+            serviceFee: input.serviceFee ?? 0,
+            beneficiaryUserId: input.beneficiaryUserId ?? null
           }
         });
-        return { log, balanceAfter, replayed: false };
+        return { state: "acquired", reservation };
       });
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-        const existing = await this.prisma.modelCallLog.findUnique({ where: { agentRunId: input.runId } });
-        if (existing) return { log: existing, balanceAfter: await this.currentBalance(userId), replayed: true };
+        const existing = await this.prisma.modelCallReservation.findUnique({ where: { requestKey: input.requestKey } });
+        if (existing) {
+          this.assertReservationMatches(existing, input.requestHash);
+          return this.classifyReservation(existing);
+        }
       }
       throw error;
     }
+  }
+
+  private async settleModelCall(claim: Pick<ModelCallReservation, "id" | "attempt">, input: {
+    result: ProviderCallResult;
+    modelCharge: number;
+    serviceFee: number;
+    beneficiaryUserId?: string;
+    agentRunId?: string;
+    agentId?: string;
+    response: Prisma.InputJsonValue;
+    modelNote: string;
+  }): Promise<{ reservation: ModelCallReservation; balanceAfter: number }> {
+    this.assertProviderUsage(input.result);
+    if (!Number.isInteger(input.modelCharge) || input.modelCharge < 0) {
+      throw new BadRequestException("Model charge must be a non-negative integer.");
+    }
+    return this.prisma.$transaction(async (tx) => {
+      const reservation = await tx.modelCallReservation.findUniqueOrThrow({ where: { id: claim.id } });
+      if (reservation.attempt !== claim.attempt) {
+        throw new ConflictException("A newer attempt owns this model-call reservation.");
+      }
+      if (reservation.status === ModelCallReservationStatus.SETTLED) {
+        return { reservation, balanceAfter: await this.currentBalance(reservation.userId, tx) };
+      }
+      if (reservation.status !== ModelCallReservationStatus.PENDING) {
+        throw new ConflictException("Model call reservation is no longer pending and cannot be settled.");
+      }
+      if (input.serviceFee !== reservation.serviceFee) {
+        throw new BadRequestException("Model call service fee changed after it was reserved.");
+      }
+      if ((input.beneficiaryUserId ?? null) !== (reservation.beneficiaryUserId ?? null)) {
+        throw new BadRequestException("Model call beneficiary changed after it was reserved.");
+      }
+      const maximumModelCharge = Math.max(0, reservation.reservedTokens - input.serviceFee);
+      // The provider may ignore max_tokens or report malformed usage. Never
+      // charge more than the amount quoted and held before the external call.
+      const modelCharge = Math.min(input.modelCharge, maximumModelCharge);
+      const chargedTokens = modelCharge + input.serviceFee;
+      const metadata = {
+        reservationId: reservation.id,
+        requestKey: reservation.requestKey,
+        attempt: reservation.attempt,
+        providerId: reservation.providerId,
+        model: reservation.model,
+        ...(modelCharge !== input.modelCharge ? { providerReportedModelCharge: input.modelCharge, chargeCapped: true } : {}),
+        ...(input.agentId ? { agentId: input.agentId } : {}),
+        ...(input.agentRunId ? { runId: input.agentRunId } : {})
+      } as Prisma.InputJsonValue;
+      const changed = await tx.modelCallReservation.updateMany({
+        where: {
+          id: reservation.id,
+          attempt: claim.attempt,
+          status: ModelCallReservationStatus.PENDING
+        },
+        data: {
+          status: ModelCallReservationStatus.SETTLED,
+          chargedTokens,
+          promptTokens: input.result.promptTokens,
+          completionTokens: input.result.completionTokens,
+          response: input.response,
+          error: null,
+          settledAt: new Date()
+        }
+      });
+      if (!changed.count) {
+        const current = await tx.modelCallReservation.findUniqueOrThrow({ where: { id: reservation.id } });
+        if (current.status === ModelCallReservationStatus.SETTLED) {
+          return { reservation: current, balanceAfter: await this.currentBalance(current.userId, tx) };
+        }
+        throw new ConflictException("Model call reservation changed while it was being settled.");
+      }
+      const charges: Array<{
+        amount: number;
+        kind: TokenTransactionKind;
+        note: string;
+        metadata: Prisma.InputJsonValue;
+      }> = [{
+        amount: modelCharge,
+        kind: reservation.purpose === ModelCallPurpose.CLOUD_CHAT || reservation.purpose === ModelCallPurpose.DISTILLATION
+          ? TokenTransactionKind.CLOUD_MODEL_USAGE
+          : TokenTransactionKind.AGENT_MODEL_USAGE,
+        note: input.modelNote,
+        metadata
+      }];
+      if (input.serviceFee > 0) {
+        charges.push({
+          amount: input.serviceFee,
+          kind: TokenTransactionKind.AGENT_SERVICE_FEE,
+          note: `Service fee for agent ${input.agentId ?? "unknown"}`,
+          metadata
+        });
+      }
+      const balanceAfter = await this.users.settleTokenReservationInTransaction(
+        tx,
+        reservation.userId,
+        reservation.reservedTokens,
+        charges
+      );
+      if (input.serviceFee > 0 && reservation.beneficiaryUserId && reservation.beneficiaryUserId !== reservation.userId) {
+          await this.users.creditTokensInTransaction(
+            tx,
+            reservation.beneficiaryUserId,
+            input.serviceFee,
+            `Service earning from agent ${input.agentId ?? "unknown"}`,
+            { ...(metadata as Record<string, unknown>), payerUserId: reservation.userId } as Prisma.InputJsonValue,
+            TokenTransactionKind.AGENT_SERVICE_EARNING
+          );
+      }
+      await tx.modelCallLog.create({
+        data: {
+          agentRunId: input.agentRunId,
+          userId: reservation.userId,
+          providerId: reservation.providerId,
+          model: reservation.model,
+          promptTokens: input.result.promptTokens,
+          completionTokens: input.result.completionTokens,
+          chargedTokens,
+          serviceFee: input.serviceFee,
+          beneficiaryUserId: input.serviceFee > 0 ? reservation.beneficiaryUserId : null,
+          success: true,
+          responseContent: input.result.content || null
+        }
+      });
+      const settled = await tx.modelCallReservation.findUniqueOrThrow({ where: { id: reservation.id } });
+      return { reservation: settled, balanceAfter };
+    });
+  }
+
+  private async failModelCall(
+    claim: Pick<ModelCallReservation, "id" | "attempt">,
+    error: unknown,
+    promptTokens: number
+  ): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    await this.prisma.$transaction(async (tx) => {
+      const reservation = await tx.modelCallReservation.findUnique({ where: { id: claim.id } });
+      if (
+        !reservation
+        || reservation.attempt !== claim.attempt
+        || reservation.status !== ModelCallReservationStatus.PENDING
+      ) return;
+      const changed = await tx.modelCallReservation.updateMany({
+        where: {
+          id: reservation.id,
+          attempt: claim.attempt,
+          status: ModelCallReservationStatus.PENDING
+        },
+        data: {
+          status: ModelCallReservationStatus.FAILED,
+          chargedTokens: 0,
+          promptTokens,
+          completionTokens: 0,
+          error: message.slice(0, 4000),
+          settledAt: new Date()
+        }
+      });
+      if (!changed.count) return;
+      await this.users.releaseTokenReservationInTransaction(tx, reservation.userId, reservation.reservedTokens);
+      await tx.modelCallLog.create({
+        data: {
+          userId: reservation.userId,
+          providerId: reservation.providerId,
+          model: reservation.model,
+          promptTokens,
+          completionTokens: 0,
+          chargedTokens: 0,
+          serviceFee: 0,
+          success: false,
+          error: message.slice(0, 4000)
+        }
+      });
+    });
+  }
+
+  private classifyReservation(reservation: ModelCallReservation): ReservationClaim {
+    if (reservation.status === ModelCallReservationStatus.SETTLED) return { state: "settled", reservation };
+    if (reservation.status === ModelCallReservationStatus.PENDING) return { state: "pending", reservation };
+    throw new ConflictException("The previous model attempt failed while another retry was claiming it.");
+  }
+
+  private assertReservationMatches(reservation: ModelCallReservation, requestHash: string): void {
+    if (reservation.requestHash !== requestHash) {
+      throw new BadRequestException("The model request key was already used for different input.");
+    }
+  }
+
+  private reservationResponse<T>(reservation: ModelCallReservation): T {
+    if (!reservation.response || typeof reservation.response !== "object" || Array.isArray(reservation.response)) {
+      throw new ConflictException("The settled model request has no replayable response.");
+    }
+    return reservation.response as unknown as T;
+  }
+
+  private async replayCompletionReservation(
+    reservation: ModelCallReservation,
+    providerName: string,
+    userId: string
+  ): Promise<AgentCompletionResult> {
+    const response = this.reservationResponse<StoredCompletionResponse>(reservation);
+    return {
+      ...response,
+      chargedTokens: reservation.chargedTokens,
+      balanceAfter: await this.currentBalance(userId),
+      modelLabel: response.modelLabel || `${providerName} / ${reservation.model}`
+    };
   }
 
   private replayAgentCompletion(log: ModelCallLog, providerName: string | undefined, balanceAfter: number): AgentCompletionResult {
@@ -510,7 +796,7 @@ export class ModelsService {
     return user.tokenBalance;
   }
 
-  async distill(userId: string, input: DistillRequest): Promise<DistillResponse> {
+  async distill(userId: string, input: DistillRequest & { requestKey?: string }): Promise<DistillResponse> {
     return this.distillWithCleanPrompt(userId, input);
   }
 
@@ -526,12 +812,13 @@ export class ModelsService {
     return this.parseDraftOrFallbackClean(content, input);
   }
 
-  private async distillWithCleanPrompt(userId: string, input: DistillRequest): Promise<DistillResponse> {
+  private async distillWithCleanPrompt(userId: string, input: DistillRequest & { requestKey?: string }): Promise<DistillResponse> {
     if (!input.providerId || !input.model) {
       return { draft: this.heuristicDraftClean(input) };
     }
 
-    const provider = await this.getEnabledProvider(input.providerId, userId, false);
+    const provider = await this.getEnabledProvider(input.providerId, userId, true);
+    const model = this.assertConfiguredChatModel(provider, input.model);
     const selected = input.messages.filter((message) => message.selected);
     const transcript = selected
       .slice(0, 400)
@@ -552,41 +839,61 @@ export class ModelsService {
       transcript
     ].filter(Boolean).join("\n\n");
 
-    const estimatedPrompt = this.estimateTokens(system + prompt);
-    const estimatedCompletion = 900;
-    const user = await this.users.ensureUser(userId);
-    const estimatedCharge = this.calculateCharge(provider, estimatedPrompt, estimatedCompletion);
-    if (user.tokenBalance < estimatedCharge) {
-      throw new ForbiddenException("Token balance is insufficient for the estimated distillation call.");
-    }
-
-    const result = await this.callProvider(provider, input.model, [
+    const messages = [
       { role: "system", content: system },
       { role: "user", content: prompt }
-    ]);
-    const chargedTokens = this.calculateCharge(provider, result.promptTokens, result.completionTokens);
-    const balanceAfter = await this.users.chargeForModelUsage(userId, chargedTokens, `Distillation via ${provider.name}`, {
+    ];
+    const estimatedPrompt = this.estimateTokens(system + prompt);
+    const budget = this.providerCallBudget(provider, model, messages, 1200);
+    const reservedTokens = this.calculateCharge(provider, budget.promptTokenLimit, budget.completionTokenLimit);
+    const claim = await this.reserveModelCall({
+      requestKey: this.requestKey("distillation", userId, input.requestKey),
+      requestHash: this.requestHash({ userId, providerId: provider.id, model, sourceKind: input.sourceKind, messages }),
+      purpose: ModelCallPurpose.DISTILLATION,
+      userId,
       providerId: provider.id,
-      model: input.model,
-      sourceKind: input.sourceKind
+      model,
+      reservedTokens,
+      ...budget
     });
-    await this.prisma.modelCallLog.create({
-      data: {
-        userId,
-        providerId: provider.id,
-        model: input.model,
-        promptTokens: result.promptTokens,
-        completionTokens: result.completionTokens,
-        chargedTokens,
-        success: true
-      }
+    if (claim.state === "pending") {
+      throw new ConflictException("This distillation request is already in progress; it was not sent again.");
+    }
+    if (claim.state === "settled") {
+      const replay = this.reservationResponse<StoredCompletionResponse>(claim.reservation);
+      return {
+        draft: this.parseDraftOrFallbackClean(replay.content, input),
+        promptTokens: replay.promptTokens,
+        completionTokens: replay.completionTokens,
+        balanceAfter: await this.currentBalance(userId)
+      };
+    }
+
+    let result: ProviderCallResult;
+    try {
+      result = await this.callProvider(provider, model, messages, 0.7, budget.completionTokenLimit);
+    } catch (error) {
+      await this.failModelCall(claim.reservation, error, estimatedPrompt);
+      throw error;
+    }
+    const chargedTokens = this.calculateCharge(provider, result.promptTokens, result.completionTokens);
+    const response: StoredCompletionResponse = {
+      ...result,
+      modelLabel: `${provider.name} / ${model}`
+    };
+    const settled = await this.settleModelCall(claim.reservation, {
+      result,
+      modelCharge: chargedTokens,
+      serviceFee: 0,
+      response: response as unknown as Prisma.InputJsonValue,
+      modelNote: `Distillation via ${provider.name}`
     });
 
     return {
       draft: this.parseDraftOrFallbackClean(result.content, input),
       promptTokens: result.promptTokens,
       completionTokens: result.completionTokens,
-      balanceAfter
+      balanceAfter: settled.balanceAfter
     };
   }
 
@@ -678,58 +985,93 @@ export class ModelsService {
     return provider;
   }
 
+  private assertConfiguredChatModel(provider: ModelProviderConfig, requestedModel: string): string {
+    const requested = requestedModel.trim();
+    const models = Array.isArray(provider.models) ? provider.models as Array<Record<string, unknown>> : [];
+    const configured = models.find((model) => typeof model.id === "string" && model.id === requested);
+    if (!configured) {
+      throw new BadRequestException(`Model ${requested || "(empty)"} is not enabled for provider ${provider.name}.`);
+    }
+    return requested;
+  }
+
+  private async privateProviderBaseUrl(value: string): Promise<string> {
+    try {
+      const url = await assertOutboundUrl(value.trim(), { allowHttp: false });
+      if (url.username || url.password) {
+        throw new Error("Provider base URL cannot contain embedded credentials.");
+      }
+      if (url.search || url.hash) {
+        throw new Error("Provider base URL cannot contain a query string or fragment.");
+      }
+      return url.toString().replace(/\/$/, "");
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private platformProviderBaseUrl(value: string): string {
+    try {
+      const url = new URL(value.trim());
+      if (url.protocol !== "https:" && url.protocol !== "http:") {
+        throw new Error("Provider base URL must use HTTP or HTTPS.");
+      }
+      if (url.username || url.password) {
+        throw new Error("Provider base URL cannot contain embedded credentials.");
+      }
+      if (url.search || url.hash) {
+        throw new Error("Provider base URL cannot contain a query string or fragment.");
+      }
+      return url.toString().replace(/\/$/, "");
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private async providerFetch(provider: ModelProviderConfig, value: string, init: RequestInit): Promise<Response> {
+    if (provider.scope === ModelProviderScope.USER_PRIVATE) {
+      return safeFetch(value, init, { allowHttp: false });
+    }
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new BadRequestException("Provider URL is invalid.");
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      throw new BadRequestException("Provider URL must use HTTP or HTTPS.");
+    }
+    const response = await globalThis.fetch(url, { ...init, redirect: "manual" });
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new Error("Provider redirects are not allowed.");
+    }
+    return response;
+  }
+
   private async callProvider(
     provider: ModelProviderConfig,
     model: string,
     messages: Array<{ role: string; content: string }>,
-    temperature = 0.7
+    temperature = 0.7,
+    maxCompletionTokens = 1200
   ): Promise<ProviderCallResult> {
+    model = this.assertConfiguredChatModel(provider, model);
     const apiKey = this.unsealApiKey(provider.apiKeyCiphertext);
     if (provider.kind !== ProviderKind.OLLAMA && (!apiKey || apiKey === "replace-me")) {
       throw new BadRequestException("Provider API key is not configured.");
     }
 
     if (provider.kind === ProviderKind.ANTHROPIC) {
-      return this.callAnthropic(provider, apiKey, model, messages);
+      return this.callAnthropic(provider, apiKey, model, messages, maxCompletionTokens);
     }
     if (provider.kind === ProviderKind.GOOGLE) {
-      return this.callGoogle(provider, apiKey, model, messages);
+      return this.callGoogle(provider, apiKey, model, messages, maxCompletionTokens);
     }
     if (provider.kind === ProviderKind.OLLAMA) {
-      return this.callOpenAICompatible(provider, "", model, messages, temperature);
+      return this.callOpenAICompatible(provider, "", model, messages, temperature, maxCompletionTokens);
     }
-    return this.callOpenAICompatible(provider, apiKey, model, messages, temperature);
-  }
-
-  private isLangChainCompatible(kind: ProviderKind): boolean {
-    return kind !== ProviderKind.ANTHROPIC && kind !== ProviderKind.GOOGLE && kind !== ProviderKind.OLLAMA;
-  }
-
-  private async callLangChainCompatible(
-    provider: ModelProviderConfig,
-    modelName: string,
-    messages: Array<{ role: string; content: string }>,
-    temperature: number
-  ): Promise<ProviderCallResult> {
-    const apiKey = this.unsealApiKey(provider.apiKeyCiphertext);
-    const chat = new ChatOpenAI({
-      apiKey,
-      model: modelName,
-      temperature,
-      timeout: this.modelRequestTimeoutMs(),
-      configuration: { baseURL: provider.baseUrl.replace(/\/$/, "") }
-    });
-    const response = await chat.invoke(messages.map((message) =>
-      message.role === "system" ? new SystemMessage(message.content) : new HumanMessage(message.content)
-    ));
-    const content = typeof response.content === "string"
-      ? response.content
-      : response.content.map((part) => typeof part === "string" ? part : "text" in part ? String(part.text) : "").join("");
-    return {
-      content,
-      promptTokens: Number(response.usage_metadata?.input_tokens ?? this.estimateTokens(JSON.stringify(messages))),
-      completionTokens: Number(response.usage_metadata?.output_tokens ?? this.estimateTokens(content))
-    };
+    return this.callOpenAICompatible(provider, apiKey, model, messages, temperature, maxCompletionTokens);
   }
 
   private async callOpenAICompatible(
@@ -737,9 +1079,10 @@ export class ModelsService {
     apiKey: string,
     model: string,
     messages: Array<{ role: string; content: string }>,
-    temperature = 0.7
+    temperature = 0.7,
+    maxCompletionTokens = 1200
   ): Promise<ProviderCallResult> {
-    const response = await fetch(`${provider.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    const response = await this.providerFetch(provider, `${provider.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       signal: AbortSignal.timeout(this.modelRequestTimeoutMs()),
       headers: {
@@ -749,18 +1092,19 @@ export class ModelsService {
       body: JSON.stringify({
         model,
         messages,
-        temperature
+        temperature,
+        max_tokens: maxCompletionTokens
       })
     });
-    const data = await response.json() as any;
+    const data = await readResponseJsonLimited<any>(response, maxProviderResponseBytes);
     if (!response.ok) {
       throw new Error(data?.error?.message ?? `HTTP ${response.status}`);
     }
     const content = data?.choices?.[0]?.message?.content ?? "";
     return {
       content,
-      promptTokens: Number(data?.usage?.prompt_tokens ?? this.estimateTokens(JSON.stringify(messages))),
-      completionTokens: Number(data?.usage?.completion_tokens ?? this.estimateTokens(content))
+      promptTokens: this.providerUsageTokens(data?.usage?.prompt_tokens, this.estimateTokens(JSON.stringify(messages))),
+      completionTokens: this.providerUsageTokens(data?.usage?.completion_tokens, this.estimateTokens(content))
     };
   }
 
@@ -768,7 +1112,8 @@ export class ModelsService {
     provider: ModelProviderConfig,
     apiKey: string,
     model: string,
-    messages: Array<{ role: string; content: string }>
+    messages: Array<{ role: string; content: string }>,
+    maxCompletionTokens = 1200
   ): Promise<ProviderCallResult> {
     const system = messages.find((message) => message.role === "system")?.content;
     const conversation = messages
@@ -777,7 +1122,7 @@ export class ModelsService {
         role: message.role === "assistant" ? "assistant" : "user",
         content: message.content
       }));
-    const response = await fetch(`${provider.baseUrl.replace(/\/$/, "")}/messages`, {
+    const response = await this.providerFetch(provider, `${provider.baseUrl.replace(/\/$/, "")}/messages`, {
       method: "POST",
       signal: AbortSignal.timeout(this.modelRequestTimeoutMs()),
       headers: {
@@ -789,18 +1134,18 @@ export class ModelsService {
         model,
         system,
         messages: conversation,
-        max_tokens: 1200
+        max_tokens: maxCompletionTokens
       })
     });
-    const data = await response.json() as any;
+    const data = await readResponseJsonLimited<any>(response, maxProviderResponseBytes);
     if (!response.ok) {
       throw new Error(data?.error?.message ?? `HTTP ${response.status}`);
     }
     const content = data?.content?.map((part: any) => part.text ?? "").join("") ?? "";
     return {
       content,
-      promptTokens: Number(data?.usage?.input_tokens ?? this.estimateTokens(JSON.stringify(messages))),
-      completionTokens: Number(data?.usage?.output_tokens ?? this.estimateTokens(content))
+      promptTokens: this.providerUsageTokens(data?.usage?.input_tokens, this.estimateTokens(JSON.stringify(messages))),
+      completionTokens: this.providerUsageTokens(data?.usage?.output_tokens, this.estimateTokens(content))
     };
   }
 
@@ -808,7 +1153,8 @@ export class ModelsService {
     provider: ModelProviderConfig,
     apiKey: string,
     model: string,
-    messages: Array<{ role: string; content: string }>
+    messages: Array<{ role: string; content: string }>,
+    maxCompletionTokens = 1200
   ): Promise<ProviderCallResult> {
     const contents = messages
       .filter((message) => message.role !== "system")
@@ -817,44 +1163,51 @@ export class ModelsService {
         parts: [{ text: message.content }]
       }));
     const systemInstruction = messages.find((message) => message.role === "system")?.content;
-    const response = await fetch(`${provider.baseUrl.replace(/\/$/, "")}/models/${model}:generateContent?key=${apiKey}`, {
+    const response = await this.providerFetch(provider, `${provider.baseUrl.replace(/\/$/, "")}/models/${encodeURIComponent(model)}:generateContent`, {
       method: "POST",
       signal: AbortSignal.timeout(this.modelRequestTimeoutMs()),
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "x-goog-api-key": apiKey
+      },
       body: JSON.stringify({
         contents,
-        systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined
+        systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined,
+        generationConfig: { maxOutputTokens: maxCompletionTokens }
       })
     });
-    const data = await response.json() as any;
+    const data = await readResponseJsonLimited<any>(response, maxProviderResponseBytes);
     if (!response.ok) {
       throw new Error(data?.error?.message ?? `HTTP ${response.status}`);
     }
     const content = data?.candidates?.[0]?.content?.parts?.map((part: any) => part.text ?? "").join("") ?? "";
     return {
       content,
-      promptTokens: Number(data?.usageMetadata?.promptTokenCount ?? this.estimateTokens(JSON.stringify(messages))),
-      completionTokens: Number(data?.usageMetadata?.candidatesTokenCount ?? this.estimateTokens(content))
+      promptTokens: this.providerUsageTokens(data?.usageMetadata?.promptTokenCount, this.estimateTokens(JSON.stringify(messages))),
+      completionTokens: this.providerUsageTokens(data?.usageMetadata?.candidatesTokenCount, this.estimateTokens(content))
     };
   }
 
   private async callEmbeddingProvider(provider: ModelProviderConfig, model: string, text: string): Promise<number[]> {
     const apiKey = this.unsealApiKey(provider.apiKeyCiphertext);
     if (provider.kind === ProviderKind.GOOGLE) {
-      const response = await fetch(`${provider.baseUrl.replace(/\/$/, "")}/models/${model}:embedContent?key=${apiKey}`, {
+      const response = await this.providerFetch(provider, `${provider.baseUrl.replace(/\/$/, "")}/models/${encodeURIComponent(model)}:embedContent`, {
         method: "POST",
         signal: AbortSignal.timeout(this.modelRequestTimeoutMs()),
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          "x-goog-api-key": apiKey
+        },
         body: JSON.stringify({ content: { parts: [{ text }] } })
       });
-      const data = await response.json() as any;
+      const data = await readResponseJsonLimited<any>(response, maxProviderResponseBytes);
       if (!response.ok) throw new Error(data?.error?.message ?? `HTTP ${response.status}`);
       return this.normalizeEmbedding(data?.embedding?.values);
     }
     if (provider.kind === ProviderKind.ANTHROPIC) {
       throw new Error("Anthropic provider does not expose an embedding endpoint in Chaq yet.");
     }
-    const response = await fetch(`${provider.baseUrl.replace(/\/$/, "")}/embeddings`, {
+    const response = await this.providerFetch(provider, `${provider.baseUrl.replace(/\/$/, "")}/embeddings`, {
       method: "POST",
       signal: AbortSignal.timeout(this.modelRequestTimeoutMs()),
       headers: {
@@ -863,7 +1216,7 @@ export class ModelsService {
       },
       body: JSON.stringify({ model, input: text })
     });
-    const data = await response.json() as any;
+    const data = await readResponseJsonLimited<any>(response, maxProviderResponseBytes);
     if (!response.ok) throw new Error(data?.error?.message ?? `HTTP ${response.status}`);
     return this.normalizeEmbedding(data?.data?.[0]?.embedding);
   }
@@ -917,8 +1270,47 @@ export class ModelsService {
     return 0;
   }
 
+  private providerCallBudget(
+    provider: ModelProviderConfig,
+    model: string,
+    messages: Array<{ role: string; content: string }>,
+    desiredCompletionTokens: number
+  ): ProviderCallBudget {
+    const configuredModels = Array.isArray(provider.models) ? provider.models as Array<Record<string, unknown>> : [];
+    const configured = configuredModels.find((item) => item.id === model);
+    const configuredWindow = Number(configured?.contextWindow ?? provider.contextWindow);
+    const contextWindow = Math.max(2, Number.isFinite(configuredWindow) ? Math.floor(configuredWindow) : 128_000);
+    // For text-only requests, UTF-8 byte length is a conservative token upper
+    // bound across the supported tokenizers. Include framing overhead as well.
+    const serialized = JSON.stringify(messages);
+    const byteUpperBound = Buffer.byteLength(serialized, "utf8") + messages.length * 16 + 64;
+    const promptTokenLimit = Math.min(contextWindow - 1, Math.max(1, byteUpperBound));
+    const completionTokenLimit = Math.max(
+      1,
+      Math.min(Math.floor(desiredCompletionTokens), contextWindow - promptTokenLimit)
+    );
+    return { promptTokenLimit, completionTokenLimit };
+  }
+
+  private requestKey(purpose: string, userId: string, supplied?: string): string {
+    const value = supplied?.trim();
+    if (value && value.length > 160) {
+      throw new BadRequestException("Model request key cannot exceed 160 characters.");
+    }
+    const scoped = value
+      ? createHash("sha256").update(`${userId}\0${value}`).digest("hex")
+      : randomUUID();
+    return `${purpose}:${scoped}`;
+  }
+
+  private requestHash(value: unknown): string {
+    return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  }
+
   private calculateCharge(provider: ModelProviderConfig, promptTokens: number, completionTokens: number): number {
-    return Math.max(1, Math.ceil(promptTokens * provider.promptTokenPrice + completionTokens * provider.completionTokenPrice));
+    const rawCharge = promptTokens * provider.promptTokenPrice
+      + completionTokens * provider.completionTokenPrice;
+    return rawCharge > 0 ? Math.max(1, Math.ceil(rawCharge)) : 0;
   }
 
   private calculateEmbeddingCharge(provider: ModelProviderConfig, promptTokens: number): number {
@@ -929,6 +1321,29 @@ export class ModelsService {
   private modelRequestTimeoutMs(): number {
     const configured = Number(process.env.MODEL_REQUEST_TIMEOUT_MS ?? 60_000);
     return Math.min(300_000, Math.max(5_000, Number.isFinite(configured) ? configured : 60_000));
+  }
+
+  private pendingReservationStaleMs(): number {
+    return this.modelRequestTimeoutMs() * 2 + 30_000;
+  }
+
+  private providerUsageTokens(value: unknown, fallback: number): number {
+    const parsed = Number(value);
+    const selected = Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+    return Math.min(2_147_483_647, Math.max(0, Math.ceil(selected)));
+  }
+
+  private assertProviderUsage(result: ProviderCallResult): void {
+    if (
+      !Number.isSafeInteger(result.promptTokens)
+      || result.promptTokens < 0
+      || result.promptTokens > 2_147_483_647
+      || !Number.isSafeInteger(result.completionTokens)
+      || result.completionTokens < 0
+      || result.completionTokens > 2_147_483_647
+    ) {
+      throw new BadRequestException("Provider token usage is invalid.");
+    }
   }
 
   private estimateTokens(text: string): number {

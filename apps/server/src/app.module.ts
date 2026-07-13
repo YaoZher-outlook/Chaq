@@ -1,7 +1,6 @@
 import { Module } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
-import { PrismaService } from "./common/prisma.service";
-import { RateLimitService } from "./common/rate-limit.service";
+import { CoreModule } from "./common/core.module";
 import { RealtimeModule } from "./common/realtime.module";
 import { AuthModule } from "./modules/auth/auth.module";
 import { UsersModule } from "./modules/users/users.module";
@@ -16,8 +15,9 @@ import { HealthModule } from "./modules/health/health.module";
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      envFilePath: [process.env.CHAQ_ENV_FILE || "E:\\Environment\\Chaq\\server.env", ".env"]
+      envFilePath: [process.env.CHAQ_ENV_FILE || "apps/server/.env", ".env"]
     }),
+    CoreModule,
     RealtimeModule,
     AuthModule,
     UsersModule,
@@ -27,8 +27,6 @@ import { HealthModule } from "./modules/health/health.module";
     AgentsModule,
     ConversationsModule,
     HealthModule
-  ],
-  providers: [PrismaService, RateLimitService],
-  exports: [PrismaService, RateLimitService]
+  ]
 })
 export class AppModule {}

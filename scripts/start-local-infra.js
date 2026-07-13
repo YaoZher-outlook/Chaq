@@ -3,6 +3,7 @@ const net = require("node:net");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const {
+  chaqEnvironmentRoot,
   postgresData,
   postgresLog,
   serverEnv
@@ -122,7 +123,7 @@ function postgresExe(pgBin, name) {
 }
 
 async function startPostgres(env) {
-  const pgBin = env.CHAQ_PG_BIN || "E:\\Environment\\pgsql\\bin";
+  const pgBin = env.CHAQ_PG_BIN || path.join(chaqEnvironmentRoot, "postgresql", "bin");
   const pgData = env.CHAQ_PG_DATA_DIR || postgresData;
   const pgUser = env.CHAQ_PG_USER || "chaq";
   const pgPassword = env.CHAQ_PG_PASSWORD || "chaq";

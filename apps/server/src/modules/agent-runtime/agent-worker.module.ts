@@ -1,6 +1,6 @@
 import { Module } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
-import { PrismaService } from "../../common/prisma.service";
+import { CoreModule } from "../../common/core.module";
 import { AgentsModule } from "../agents/agents.module";
 import { AgentRuntimeModule } from "./agent-runtime.module";
 import { AgentWorkerService } from "./agent-worker.service";
@@ -9,11 +9,12 @@ import { AgentWorkerService } from "./agent-worker.service";
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      envFilePath: [process.env.CHAQ_ENV_FILE || "E:\\Environment\\Chaq\\server.env", ".env"]
+      envFilePath: [process.env.CHAQ_ENV_FILE || "apps/server/.env", ".env"]
     }),
+    CoreModule,
     AgentsModule,
     AgentRuntimeModule
   ],
-  providers: [PrismaService, AgentWorkerService]
+  providers: [AgentWorkerService]
 })
 export class AgentWorkerModule {}

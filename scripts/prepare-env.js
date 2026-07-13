@@ -1,5 +1,6 @@
 const fs = require("node:fs");
 const { randomBytes } = require("node:crypto");
+const path = require("node:path");
 const {
   chaqEnvironmentRoot,
   electronCache,
@@ -20,10 +21,11 @@ const requiredEnv = {
   SERVER_HOST: "127.0.0.1",
   CLIENT_ORIGIN: "http://localhost:27337",
   DEMO_ADMIN_USER_ID: "admin-local",
+  CHAQ_ALLOW_DEMO_SEED: "0",
   AGENT_WORKER_CONCURRENCY: "4",
   MODEL_REQUEST_TIMEOUT_MS: "60000",
   CHAQ_LOG_DIR: projectLogs,
-  CHAQ_PG_BIN: "E:\\Environment\\pgsql\\bin",
+  CHAQ_PG_BIN: path.join(chaqEnvironmentRoot, "postgresql", "bin"),
   CHAQ_PG_DATA_DIR: postgresData,
   CHAQ_PG_USER: "chaq",
   CHAQ_PG_PASSWORD: "chaq",
@@ -51,7 +53,6 @@ function writeServerEnv() {
   const seen = new Set();
   const existingSecrets = new Map();
   const nextLines = [];
-  const generatedSecrets = new Map();
 
   for (const line of existingLines) {
     const trimmed = line.trim();
@@ -92,7 +93,6 @@ function writeServerEnv() {
   for (const [key, createSecret] of Object.entries(secretEnv)) {
     if (seen.has(key)) continue;
     const value = createSecret();
-    generatedSecrets.set(key, value);
     existingSecrets.set(key, value);
     nextLines.push(`${key}=${value}`);
   }
@@ -106,7 +106,6 @@ function writeServerEnv() {
     console.warn(`[WARN] ${error instanceof Error ? error.message : String(error)}`);
   }
   writeWorkspaceServerEnv(existingSecrets);
-  writeSecretBackup(existingSecrets, generatedSecrets);
 }
 
 function writeWorkspaceServerEnv(secrets) {
@@ -133,29 +132,6 @@ function writeWorkspaceServerEnv(secrets) {
     if (!seen.has(key)) nextLines.push(`${key}=${formatEnvValue(String(value))}`);
   }
   fs.writeFileSync(workspaceServerEnv, `${nextLines.filter((line, index, lines) => line.trim() || index < lines.length - 1).join("\r\n")}\r\n`, "utf8");
-}
-
-function writeSecretBackup(allSecrets, generatedSecrets) {
-  const desktop = process.env.USERPROFILE
-    ? require("node:path").join(process.env.USERPROFILE, "Desktop")
-    : null;
-  if (!desktop || !fs.existsSync(desktop)) return;
-  const lines = [
-    "Chaq server secrets",
-    `Generated at: ${new Date().toISOString()}`,
-    `Server env: ${serverEnv}`,
-    "",
-    ...[...allSecrets.entries()].map(([key, value]) => `${key}=${value}`),
-    "",
-    `Newly generated this run: ${[...generatedSecrets.keys()].join(", ")}`
-  ];
-  const backupPath = require("node:path").join(desktop, "Chaq-server-secrets.txt");
-  try {
-    fs.writeFileSync(backupPath, `${lines.join("\r\n")}\r\n`, "utf8");
-  } catch (error) {
-    console.warn(`[WARN] Could not write ${backupPath}.`);
-    console.warn(`[WARN] ${error instanceof Error ? error.message : String(error)}`);
-  }
 }
 
 writeServerEnv();

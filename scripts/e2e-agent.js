@@ -1,6 +1,6 @@
 const http = require("node:http");
 
-const baseUrl = (process.env.CHAQ_E2E_SERVER_URL || "http://127.0.0.1:24537/api").replace(/\/$/, "");
+let baseUrl = "";
 const username = process.env.CHAQ_E2E_USERNAME || "admin";
 const password = process.env.CHAQ_E2E_PASSWORD || "123456";
 const providerId = process.env.CHAQ_E2E_PROVIDER_ID || null;
@@ -8,8 +8,38 @@ const model = process.env.CHAQ_E2E_MODEL || null;
 const timeoutMs = Math.max(10_000, Number(process.env.CHAQ_E2E_TIMEOUT_MS || 90_000));
 const useMockModel = process.env.CHAQ_E2E_MOCK_MODEL === "1";
 
-if ((process.env.NODE_ENV || "").toLowerCase() === "production") {
-  throw new Error("Refusing to run the development Agent E2E test with NODE_ENV=production.");
+function isLoopbackHostname(hostname) {
+  const normalized = String(hostname || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.$/, "");
+  if (normalized === "localhost" || normalized === "::1" || normalized === "0:0:0:0:0:0:0:1") return true;
+  const octets = normalized.split(".");
+  return octets.length === 4
+    && octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)
+    && Number(octets[0]) === 127;
+}
+
+function resolveE2EBaseUrl(env = process.env) {
+  if (String(env.NODE_ENV || "").trim().toLowerCase() === "production") {
+    throw new Error("Refusing to run the development Agent E2E test with NODE_ENV=production.");
+  }
+
+  const rawUrl = String(env.CHAQ_E2E_SERVER_URL || "http://127.0.0.1:24537/api").trim();
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error("CHAQ_E2E_SERVER_URL must be a valid HTTP(S) URL.");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error("CHAQ_E2E_SERVER_URL must be an HTTP(S) URL without credentials, a query, or a fragment.");
+  }
+  if (!isLoopbackHostname(parsed.hostname) && String(env.CHAQ_ALLOW_REMOTE_E2E || "").trim() !== "1") {
+    throw new Error("Refusing to run Agent E2E against a non-loopback URL. Set CHAQ_ALLOW_REMOTE_E2E=1 explicitly for a disposable remote environment.");
+  }
+  return parsed.toString().replace(/\/$/, "");
 }
 
 async function request(path, init = {}, sessionToken) {
@@ -97,6 +127,7 @@ function providerPayload(provider, overrides = {}) {
 }
 
 async function main() {
+  baseUrl = resolveE2EBaseUrl(process.env);
   const login = await request("/auth/login", {
     method: "POST",
     body: JSON.stringify({ username, password })
@@ -208,7 +239,11 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}
+
+module.exports = { isLoopbackHostname, resolveE2EBaseUrl };

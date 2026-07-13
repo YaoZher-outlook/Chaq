@@ -16,7 +16,7 @@ set "npm_config_electron_config_cache="
 
 where node >nul 2>nul
 if errorlevel 1 (
-  echo [ERROR] Node.js was not found in PATH. Please install Node.js 20.11 or newer.
+  echo [ERROR] Node.js was not found in PATH. Please install Node.js 22.12 or newer.
   pause
   exit /b 1
 )
@@ -47,7 +47,7 @@ set "NODE_ENV=development"
 
 if not exist "node_modules" (
   echo [Chaq] node_modules not found. Installing dependencies...
-  call npm.cmd install
+  node scripts\install-dependencies.js --server-only
   if errorlevel 1 goto :fail
 )
 
@@ -61,6 +61,15 @@ if errorlevel 1 goto :fail
 echo [Chaq] Applying database migrations...
 call npm.cmd exec -w @chaq/server -- prisma migrate deploy
 if errorlevel 1 goto :fail
+
+echo [Chaq] Initializing idempotent local demo data...
+set "CHAQ_ALLOW_DEMO_SEED=1"
+call npm.cmd run prisma:seed
+if errorlevel 1 (
+  set "CHAQ_ALLOW_DEMO_SEED=0"
+  goto :fail
+)
+set "CHAQ_ALLOW_DEMO_SEED=0"
 
 echo [Chaq] Dev server will run in this window. Close it to stop API and worker.
 call npm.cmd run dev:server

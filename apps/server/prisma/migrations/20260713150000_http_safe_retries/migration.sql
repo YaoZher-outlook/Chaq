@@ -1,0 +1,2 @@
+ALTER TABLE "AgentHttpToolAttempt"
+  ADD COLUMN "attempt" INTEGER NOT NULL DEFAULT 1;

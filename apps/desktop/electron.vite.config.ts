@@ -34,6 +34,16 @@ export default defineConfig({
         "@chaq/shared": resolve(__dirname, "../../packages/shared/src/index.ts")
       }
     },
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks: {
+            "react-vendor": ["react", "react-dom", "react/jsx-runtime"],
+            icons: ["lucide-react"]
+          }
+        }
+      }
+    },
     plugins: [react()]
   }
 });

@@ -4,6 +4,16 @@ const net = require("node:net");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const { serverEnv, projectLogs } = require("./env-paths");
+const {
+  assessManagedProcess,
+  getProcessIdentity,
+  inspectLinuxProcess,
+  inspectWindowsProcesses,
+  isExpectedProjectProcess,
+  parsePidRecord,
+  productionEntry,
+  stopManagedProcessRecord
+} = require("./production-process-identity");
 
 const root = path.resolve(__dirname, "..");
 const publicBind = process.argv.includes("--public");
@@ -19,6 +29,10 @@ const defaultClientOrigin = "https://chaq.yaozher.com";
 const pidDir = path.join(projectLogs, "pids");
 const apiPidFile = path.join(pidDir, `api-${port}.pid`);
 const workerPidFile = path.join(pidDir, `worker-${port}.pid`);
+const productionEntries = {
+  api: path.join(root, "apps", "server", "dist", "src", "main.js"),
+  worker: path.join(root, "apps", "server", "dist", "src", "worker.js")
+};
 
 function parseEnv(text) {
   const entries = {};
@@ -186,18 +200,39 @@ function processExists(pid) {
   }
 }
 
-function readPid(file) {
+function readPidRecord(file) {
   try {
-    const pid = Number(fs.readFileSync(file, "utf8").trim());
-    return Number.isInteger(pid) ? pid : null;
+    return parsePidRecord(fs.readFileSync(file, "utf8"));
   } catch {
     return null;
   }
 }
 
-function writePid(file, pid) {
+function readPid(file) {
+  return readPidRecord(file)?.pid ?? null;
+}
+
+function createPidRecord(pid, role, identity, projectRoot = root) {
+  if (identity?.pid !== pid || !identity.startIdentity) {
+    throw new Error(`Could not establish a safe process identity for ${role} pid=${pid}.`);
+  }
+  return {
+    version: 1,
+    pid,
+    role,
+    projectRoot,
+    entry: productionEntry(projectRoot, role),
+    executable: identity.executable || process.execPath,
+    startIdentity: identity.startIdentity,
+    recordedAt: new Date().toISOString()
+  };
+}
+
+function writePid(file, pid, role) {
+  const identity = getProcessIdentity(pid);
+  const record = createPidRecord(pid, role, identity);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${pid}\r\n`, "utf8");
+  fs.writeFileSync(file, `${JSON.stringify(record)}\r\n`, "utf8");
 }
 
 function removePid(file) {
@@ -222,44 +257,43 @@ function findListeningPid(targetPort) {
   return null;
 }
 
-function normalizeProcessText(value) {
-  return String(value || "").toLowerCase().replace(/\//g, "\\");
+function findProjectNodeProcesses(role) {
+  const identities = process.platform === "win32"
+    ? inspectWindowsProcesses(null)
+    : process.platform === "linux"
+      ? fs.readdirSync("/proc", { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name))
+        .map((entry) => inspectLinuxProcess(Number(entry.name)))
+        .filter(Boolean)
+      : [];
+  return identities.filter((identity) => isExpectedProjectProcess(identity, {
+    projectRoot: root,
+    role,
+    executablePath: process.execPath
+  }));
 }
 
 function findProjectNodePids(scriptName) {
-  if (process.platform !== "win32") return [];
-  const ps = [
-    "$ErrorActionPreference='Stop'",
-    "Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\"",
-    "| Select-Object ProcessId,CommandLine",
-    "| ConvertTo-Json -Compress"
-  ].join(" ");
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", ps], {
-    stdio: "pipe",
-    encoding: "utf8",
-    windowsHide: true
+  return findProjectNodeProcesses(scriptName === "worker.js" ? "worker" : "api").map((identity) => identity.pid);
+}
+
+function managedPidFileRunning(file, role) {
+  const record = readPidRecord(file);
+  if (!record) return false;
+  const identity = getProcessIdentity(record.pid);
+  const assessment = assessManagedProcess(record, identity, {
+    projectRoot: root,
+    role,
+    executablePath: process.execPath
   });
-  if (result.status !== 0 || !result.stdout.trim()) return [];
-  try {
-    const parsed = JSON.parse(result.stdout);
-    const rows = Array.isArray(parsed) ? parsed : [parsed];
-    const project = normalizeProcessText(root);
-    const script = normalizeProcessText(path.join("apps", "server", "dist", "src", scriptName));
-    return rows
-      .filter((row) => {
-        const commandLine = normalizeProcessText(row.CommandLine);
-        return commandLine.includes(project) && commandLine.includes(script);
-      })
-      .map((row) => Number(row.ProcessId))
-      .filter((pid) => Number.isInteger(pid) && pid > 0);
-  } catch {
-    return [];
-  }
+  if (assessment.safe) return true;
+  console.log(`[WARN] Ignoring stale ${role} pid file for pid=${record.pid}: ${assessment.reason}.`);
+  removePid(file);
+  return false;
 }
 
 function productionWorkerRunning() {
-  const pid = readPid(workerPidFile);
-  return (pid && processExists(pid)) || findProjectNodePids("worker.js").length > 0;
+  return managedPidFileRunning(workerPidFile, "worker") || findProjectNodePids("worker.js").length > 0;
 }
 
 function ensureProductionWorker(env) {
@@ -267,16 +301,16 @@ function ensureProductionWorker(env) {
     console.log("[Chaq] Production Agent worker is already running.");
     return;
   }
-  const workerEntry = path.join(root, "apps", "server", "dist", "src", "worker.js");
+  const workerEntry = productionEntries.worker;
   if (!fs.existsSync(workerEntry)) {
     run(command("npm"), ["run", "build", "-w", "@chaq/shared"], env);
     run(command("npm"), ["run", "build", "-w", "@chaq/server"], env);
   }
-  const workerPid = startProcess("Chaq production Agent worker", ["apps/server/dist/src/worker.js"], "worker-prod.log", env);
-  writePid(workerPidFile, workerPid);
+  const workerPid = startProcess("Chaq production Agent worker", [workerEntry], "worker-prod.log", env);
+  writePid(workerPidFile, workerPid, "worker");
 }
 
-function stopPid(pid, label) {
+function terminateVerifiedPid(pid, label) {
   if (!processExists(pid)) {
     console.log(`[Chaq] ${label} pid=${pid} is not running.`);
     return;
@@ -288,6 +322,40 @@ function stopPid(pid, label) {
   if (result.status !== 0 && processExists(pid)) {
     throw new Error(`Could not stop ${label} pid=${pid}: ${(result.stderr || result.stdout || "").trim()}`);
   }
+}
+
+function stopManagedPidFile(file, role, label) {
+  return stopManagedProcessRecord(readPidRecord(file), {
+    projectRoot: root,
+    role,
+    label,
+    executablePath: process.execPath
+  }, {
+    inspect: (pid) => getProcessIdentity(pid),
+    terminate: (pid, processLabel) => terminateVerifiedPid(pid, processLabel),
+    clear: () => removePid(file),
+    log: (message) => console.log(message)
+  });
+}
+
+function stopDiscoveredProcess(discoveredIdentity, role, label) {
+  const currentIdentity = getProcessIdentity(discoveredIdentity.pid);
+  const commandMatches = isExpectedProjectProcess(currentIdentity, {
+    projectRoot: root,
+    role,
+    executablePath: process.execPath
+  });
+  const sameStart = Boolean(
+    discoveredIdentity.startIdentity
+    && currentIdentity?.startIdentity
+    && discoveredIdentity.startIdentity === currentIdentity.startIdentity
+  );
+  if (!commandMatches || !sameStart) {
+    console.log(`[WARN] Refusing to stop discovered pid=${discoveredIdentity.pid}: process identity changed or is unavailable.`);
+    return false;
+  }
+  terminateVerifiedPid(discoveredIdentity.pid, label);
+  return true;
 }
 
 function canConnect(hostname, targetPort) {
@@ -367,7 +435,7 @@ function startProcess(label, args, logName, env) {
   return child.pid;
 }
 
-function startForegroundProcess(label, args, logName, env) {
+function startForegroundProcess(label, args, logName, env, role) {
   fs.mkdirSync(projectLogs, { recursive: true });
   const logPath = path.join(projectLogs, logName);
   const log = fs.createWriteStream(logPath, { flags: "a" });
@@ -394,13 +462,14 @@ function startForegroundProcess(label, args, logName, env) {
     log.end();
   });
 
-  return { child, label };
+  return { child, label, role };
 }
 
 function stopForegroundChildren(children) {
   for (const item of children) {
     if (!item.child.killed && item.child.exitCode == null) {
-      stopPid(item.child.pid, item.label);
+      const file = item.role === "api" ? apiPidFile : workerPidFile;
+      stopManagedPidFile(file, item.role, item.label);
     }
   }
   removePid(apiPidFile);
@@ -469,33 +538,50 @@ async function printStatus() {
 
 async function stopProduction() {
   const status = await readReady();
-  const apiPid = readPid(apiPidFile);
-  const workerPid = readPid(workerPidFile);
+  const apiRecord = readPidRecord(apiPidFile);
+  const workerRecord = readPidRecord(workerPidFile);
   const listenerPid = findListeningPid(port);
-  const scannedApiPids = findProjectNodePids("main.js");
-  const scannedWorkerPids = findProjectNodePids("worker.js");
+  const scannedApiProcesses = findProjectNodeProcesses("api");
+  const scannedWorkerProcesses = findProjectNodeProcesses("worker");
   if (listenerPid && status.ready && status.data?.mode !== "production") {
     throw new Error(`Port ${port} is used by a ${status.data?.mode || "non-production"} Chaq API. Refusing to stop it as production.`);
   }
-  const seen = new Set();
-  const pids = [
-    { pid: workerPid, label: "production Agent worker", file: workerPidFile },
-    { pid: apiPid, label: "production API", file: apiPidFile },
-    !apiPid && listenerPid && status.ready ? { pid: listenerPid, label: "production API listener", file: null } : null,
-    ...scannedWorkerPids.map((pid) => ({ pid, label: "production Agent worker", file: null })),
-    ...scannedApiPids.map((pid) => ({ pid, label: "production API", file: null }))
-  ].filter((item) => {
-    if (!item?.pid || seen.has(item.pid)) return false;
-    seen.add(item.pid);
-    return true;
-  });
-  if (!pids.length) {
+  const pidFilePids = new Set([apiRecord?.pid, workerRecord?.pid].filter(Boolean));
+  const seen = new Set(pidFilePids);
+  let candidates = 0;
+
+  if (workerRecord) {
+    candidates += 1;
+    stopManagedPidFile(workerPidFile, "worker", "production Agent worker");
+  } else {
+    removePid(workerPidFile);
+  }
+  if (apiRecord) {
+    candidates += 1;
+    stopManagedPidFile(apiPidFile, "api", "production API");
+  } else {
+    removePid(apiPidFile);
+  }
+
+  const discovered = [
+    ...scannedWorkerProcesses.map((identity) => ({ identity, role: "worker", label: "production Agent worker" })),
+    ...scannedApiProcesses.map((identity) => ({ identity, role: "api", label: "production API" }))
+  ];
+  if (listenerPid && status.ready && !seen.has(listenerPid)) {
+    const listenerIdentity = getProcessIdentity(listenerPid);
+    if (listenerIdentity) discovered.push({ identity: listenerIdentity, role: "api", label: "production API listener" });
+    else console.log(`[WARN] Refusing to stop listener pid=${listenerPid}: process command line is unavailable.`);
+  }
+  for (const item of discovered) {
+    if (seen.has(item.identity.pid)) continue;
+    seen.add(item.identity.pid);
+    candidates += 1;
+    stopDiscoveredProcess(item.identity, item.role, item.label);
+  }
+
+  if (!candidates) {
     console.log(`[Chaq] No production pid files found for port ${port}.`);
     if (!status.ready) return;
-  }
-  for (const item of pids) {
-    stopPid(item.pid, item.label);
-    if (item.file) removePid(item.file);
   }
   for (let index = 0; index < 20; index += 1) {
     if (!(await canConnect("127.0.0.1", port))) {
@@ -532,8 +618,8 @@ async function main() {
   const fileEnv = fs.existsSync(envFile) ? parseEnv(fs.readFileSync(envFile, "utf8")) : {};
   const publicApiUrl = resolvePublicApiUrl(fileEnv);
   const env = {
-    ...process.env,
     ...fileEnv,
+    ...process.env,
     NODE_ENV: "production",
     CHAQ_SERVER_BIND: host,
     CHAQ_PROD_SERVER_PORT: String(port),
@@ -543,6 +629,7 @@ async function main() {
     PUBLIC_API_URL: publicApiUrl,
     CHAQ_LOG_DIR: projectLogs
   };
+  run(process.execPath, ["scripts/validate-production-env.js"], env);
 
   console.log(`[Chaq] Starting production API server and Agent worker (${host}:${port}).`);
   console.log(`[Chaq] Public API URL: ${publicApiUrl}`);
@@ -553,7 +640,7 @@ async function main() {
   }
 
   if (!fs.existsSync(path.join(root, "node_modules"))) {
-    run(command("npm"), ["install"], env);
+    run(process.execPath, ["scripts/install-dependencies.js", "--server-only"], env);
   }
 
   run(command("npm"), ["run", "infra:local"], env);
@@ -567,11 +654,11 @@ async function main() {
 
   if (foreground) {
     const children = [
-      startForegroundProcess("Chaq production API", ["apps/server/dist/src/main.js"], "api-prod.log", env),
-      startForegroundProcess("Chaq production Agent worker", ["apps/server/dist/src/worker.js"], "worker-prod.log", env)
+      startForegroundProcess("Chaq production API", [productionEntries.api], "api-prod.log", env, "api"),
+      startForegroundProcess("Chaq production Agent worker", [productionEntries.worker], "worker-prod.log", env, "worker")
     ];
-    writePid(apiPidFile, children[0].child.pid);
-    writePid(workerPidFile, children[1].child.pid);
+    writePid(apiPidFile, children[0].child.pid, "api");
+    writePid(workerPidFile, children[1].child.pid, "worker");
     await waitForReady();
     console.log(`[Chaq] Production API is ready on http://127.0.0.1:${port}/api.`);
     if (publicBind) {
@@ -582,10 +669,10 @@ async function main() {
     return;
   }
 
-  const apiPid = startProcess("Chaq production API", ["apps/server/dist/src/main.js"], "api-prod.log", env);
-  const workerPid = startProcess("Chaq production Agent worker", ["apps/server/dist/src/worker.js"], "worker-prod.log", env);
-  writePid(apiPidFile, apiPid);
-  writePid(workerPidFile, workerPid);
+  const apiPid = startProcess("Chaq production API", [productionEntries.api], "api-prod.log", env);
+  writePid(apiPidFile, apiPid, "api");
+  const workerPid = startProcess("Chaq production Agent worker", [productionEntries.worker], "worker-prod.log", env);
+  writePid(workerPidFile, workerPid, "worker");
   await waitForReady();
   console.log(`[Chaq] Production API is ready on http://127.0.0.1:${port}/api.`);
   if (publicBind) {
@@ -593,7 +680,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.log(`[ERROR] ${error instanceof Error ? error.message : String(error)}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.log(`[ERROR] ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  });
+}

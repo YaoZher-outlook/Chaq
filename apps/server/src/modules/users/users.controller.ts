@@ -20,7 +20,7 @@ const emailCodeSchema = z.object({
 });
 
 const adjustTokensSchema = z.object({
-  amount: z.number().int(),
+  amount: z.number().int().min(-500_000_000).max(500_000_000).refine((value) => value !== 0, "amount must not be zero"),
   kind: z.enum(["RECHARGE", "REFUND", "ADMIN_ADJUSTMENT"]).default("ADMIN_ADJUSTMENT"),
   note: z.string().max(300).optional()
 });

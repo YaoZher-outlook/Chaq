@@ -1,0 +1,101 @@
+name: Chaq CI
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chaq-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Type, test, and build
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.20.0
+          cache: npm
+      - run: npm install --global npm@11.18.0
+      - run: npm ci
+      - run: npm run prisma:generate
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test:coverage
+      - run: npm run build
+      - name: Package desktop (unsigned directory)
+        env:
+          ELECTRON_BUILDER_CACHE: ${{ github.workspace }}\.chaq-data\electron-builder-cache
+        run: npm run package -w @chaq/desktop
+      - name: Production dependency audit
+        run: npm audit --audit-level=low
+
+  container-smoke:
+    name: Production container smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      POSTGRES_USER: chaq
+      POSTGRES_PASSWORD: ci-postgres-password-with-32-characters
+      POSTGRES_DB: chaq
+      CLIENT_ORIGIN: https://ci.chaq.invalid
+      PUBLIC_API_URL: https://ci.chaq.invalid/api
+      MODEL_SECRET_KEY: ci-model-secret-0123456789-abcdefghijklmnopqrstuvwxyz
+      SESSION_HASH_SECRET: ci-session-secret-9876543210-zyxwvutsrqponmlkjihg
+      CHAQ_ADMIN_USERNAME: ci-admin
+      CHAQ_ADMIN_PASSWORD: ci-admin-password-24680
+      CHAQ_SMOKE_USERNAME: ci-admin
+      CHAQ_SMOKE_PASSWORD: ci-admin-password-24680
+      CHAQ_SMOKE_API_URL: http://127.0.0.1:24537/api
+      SMTP_HOST: smtp.chaq.invalid
+      SMTP_PORT: "465"
+      SMTP_USER: ci-user
+      SMTP_PASS: ci-smtp-password
+      SMTP_FROM: ci@chaq.invalid
+      SMTP_SECURE: "1"
+      SMTP_STARTTLS: "0"
+      PUBLIC_API_PORT: "24537"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.20.0
+      - name: Validate Compose configuration
+        run: docker compose -f docker-compose.production.yml config --quiet
+      - name: Start production stack
+        run: docker compose -f docker-compose.production.yml up -d --build
+      - name: Wait for API and worker
+        shell: bash
+        run: |
+          ready=0
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:24537/api/health/ready >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          docker compose -f docker-compose.production.yml ps
+          test "$ready" = "1"
+          test "$(docker inspect --format='{{.State.Health.Status}}' chaq-production-worker-1)" = "healthy"
+      - name: Verify authenticated API flow
+        shell: bash
+        run: |
+          docker compose -f docker-compose.production.yml exec -T \
+            -e CHAQ_ADMIN_USERNAME="$CHAQ_ADMIN_USERNAME" \
+            -e CHAQ_ADMIN_PASSWORD="$CHAQ_ADMIN_PASSWORD" \
+            api node scripts/create-admin-user.js
+          node scripts/smoke-production-api.js
+      - name: Show container logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.production.yml logs --no-color
+      - name: Stop production stack
+        if: always()
+        run: docker compose -f docker-compose.production.yml down -v

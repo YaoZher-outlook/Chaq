@@ -5,14 +5,19 @@ import { normalizeEmail, isValidPassword, sendVerificationEmail } from "../../co
 import { PrismaService } from "../../common/prisma.service";
 import { RateLimitService } from "../../common/rate-limit.service";
 import { hashPassword, hashSessionToken, verifyPassword } from "../../common/password";
+import { SESSION_REVOCATION_BUS, type SessionRevocationBus } from "../../common/session-revocation";
 
 const defaultSessionDays = 14;
+// Keep the expensive password verification path for unknown accounts too, so
+// login response time does not become an account-existence oracle.
+const dummyPasswordHash = hashPassword("invalid-auth-password", "chaq-auth-dummy-salt");
 
 @Injectable()
 export class AuthService {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
-    @Inject(RateLimitService) private readonly rateLimit: RateLimitService
+    @Inject(RateLimitService) private readonly rateLimit: RateLimitService,
+    @Inject(SESSION_REVOCATION_BUS) private readonly sessionRevocations: SessionRevocationBus
   ) {}
 
   async login(username: string, password: string) {
@@ -27,7 +32,8 @@ export class AuthService {
       },
       include: { settings: true }
     });
-    if (!user || !verifyPassword(password, user.passwordHash)) {
+    const passwordValid = verifyPassword(password, user?.passwordHash ?? dummyPasswordHash);
+    if (!user || !passwordValid) {
       throw new UnauthorizedException("用户名或密码错误。");
     }
 
@@ -51,8 +57,10 @@ export class AuthService {
 
   async requestRegisterCode(emailInput: string): Promise<{ ok: true }> {
     const email = normalizeEmail(emailInput);
-    await this.assertEmailAvailable(email);
     await this.assertEmailCodeRateLimit(email, "register");
+    // Keep the response indistinguishable for already registered addresses.
+    // Registration itself still enforces the unique email constraint.
+    if (await this.emailExists(email)) return { ok: true };
     const code = this.createCode();
     await (this.prisma as any).emailVerificationCode.create({
       data: {
@@ -68,9 +76,11 @@ export class AuthService {
 
   async register(input: { email: string; password: string; confirmPassword: string; code: string }) {
     const email = normalizeEmail(input.email);
-    await this.assertEmailAvailable(email);
     this.assertPassword(input.password, input.confirmPassword);
     await this.consumeCode(email, "register", input.code);
+    // Validate the one-time credential before checking account existence so
+    // this endpoint cannot be used as a registered-email oracle.
+    await this.assertEmailAvailable(email);
 
     const userId = await this.createUniqueUserId();
     const user = await (this.prisma.user as any).create({
@@ -92,25 +102,39 @@ export class AuthService {
     if (!sessionToken) {
       return { ok: true };
     }
+    const tokenHash = hashSessionToken(sessionToken);
     await this.prisma.authSession.updateMany({
-      where: { tokenHash: hashSessionToken(sessionToken) },
+      where: { tokenHash },
       data: { status: AuthSessionStatus.REVOKED }
     });
+    // Publish even when the row was already revoked. This lets a repeated
+    // logout close a connection that missed an earlier cross-instance event.
+    this.sessionRevocations.publish({ tokenHash });
     return { ok: true };
   }
 
   async userForSession(sessionToken: string | undefined) {
+    return (await this.authenticateSession(sessionToken))?.user ?? null;
+  }
+
+  async authenticateSession(sessionToken: string | undefined) {
     if (!sessionToken) {
       return null;
     }
+    const tokenHash = hashSessionToken(sessionToken);
     const session = await this.prisma.authSession.findUnique({
-      where: { tokenHash: hashSessionToken(sessionToken) },
+      where: { tokenHash },
       include: { user: { include: { settings: true } } }
     });
     if (!session || session.status !== AuthSessionStatus.ACTIVE || session.expiresAt.getTime() <= Date.now()) {
       return null;
     }
-    return session.user;
+    return {
+      sessionId: session.id,
+      tokenHash,
+      expiresAt: session.expiresAt,
+      user: session.user
+    };
   }
 
   async ensureSettings(userId: string) {
@@ -163,6 +187,12 @@ export class AuthService {
   }
 
   private async assertEmailAvailable(email: string): Promise<void> {
+    if (await this.emailExists(email)) {
+      throw new ConflictException("该邮箱已经被注册。");
+    }
+  }
+
+  private async emailExists(email: string): Promise<boolean> {
     const existing = await (this.prisma.user as any).findFirst({
       where: {
         OR: [
@@ -172,9 +202,7 @@ export class AuthService {
       },
       select: { id: true }
     });
-    if (existing) {
-      throw new ConflictException("该邮箱已经被注册。");
-    }
+    return Boolean(existing);
   }
 
   private assertPassword(password: string, confirmPassword: string): void {
@@ -197,13 +225,17 @@ export class AuthService {
       },
       orderBy: { createdAt: "desc" }
     });
-    if (!record || record.codeHash !== hashSessionToken(code.trim())) {
+    const codeHash = hashSessionToken(code.trim());
+    if (!record || record.codeHash !== codeHash) {
       throw new BadRequestException("邮箱验证码错误或已过期。");
     }
-    await (this.prisma as any).emailVerificationCode.update({
-      where: { id: record.id },
+    const consumed = await (this.prisma as any).emailVerificationCode.updateMany({
+      where: { id: record.id, codeHash, consumedAt: null, expiresAt: { gt: new Date() } },
       data: { consumedAt: new Date() }
     });
+    if (consumed.count !== 1) {
+      throw new BadRequestException("邮箱验证码错误或已过期。");
+    }
   }
 
   private createCode(): string {
@@ -211,14 +243,14 @@ export class AuthService {
   }
 
   private async assertEmailCodeRateLimit(email: string, purpose: string): Promise<void> {
-    const result = await this.rateLimit.consume(`email-code:${purpose}`, email, 3, 10 * 60);
+    const result = await this.rateLimit.consume(`email-code:${purpose}`, email, 3, 10 * 60, { failureMode: "local" });
     if (!result.allowed) {
       throw new BadRequestException(`验证码请求过于频繁，请 ${result.retryAfterSeconds} 秒后再试。`);
     }
   }
 
   private async assertEmailCodeVerifyRateLimit(email: string, purpose: string): Promise<void> {
-    const result = await this.rateLimit.consume(`email-code-verify:${purpose}`, email, 8, 10 * 60);
+    const result = await this.rateLimit.consume(`email-code-verify:${purpose}`, email, 8, 10 * 60, { failureMode: "local" });
     if (!result.allowed) {
       throw new BadRequestException(`验证码尝试过于频繁，请 ${result.retryAfterSeconds} 秒后再试。`);
     }

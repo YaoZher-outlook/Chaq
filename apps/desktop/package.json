@@ -11,28 +11,29 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "package": "electron-builder --dir -c.win.signAndEditExecutable=false",
-    "dist": "electron-builder"
+    "prepackage": "node ../../scripts/ensure-electron-runtime.js",
+    "package": "node ../../scripts/run-electron-builder.js --dir -c.win.signAndEditExecutable=false",
+    "predist": "node ../../scripts/ensure-electron-runtime.js",
+    "dist": "node ../../scripts/run-electron-builder.js"
   },
   "dependencies": {
-    "lucide-react": "^0.468.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "sql.js": "^1.12.0",
-    "zod": "^3.25.32"
+    "sql.js": "^1.12.0"
   },
   "devDependencies": {
     "@chaq/shared": "file:../../packages/shared",
-    "@types/node": "^22.7.4",
+    "@types/node": "^22.20.0",
     "@types/react": "^18.3.11",
     "@types/react-dom": "^18.3.1",
     "@types/sql.js": "^1.4.9",
-    "@vitejs/plugin-react": "^4.3.2",
-    "electron": "32.3.3",
-    "electron-builder": "^25.1.8",
-    "electron-vite": "^2.3.0",
-    "typescript": "^5.6.3",
-    "vite": "^5.4.8"
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "43.1.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.6"
   },
   "build": {
     "appId": "app.chaq.desktop",
@@ -45,7 +46,19 @@
       "out/**/*",
       "package.json",
       "!node_modules/@chaq/shared/src{,/**/*}",
-      "!node_modules/@chaq/shared/tsconfig.json"
+      "!node_modules/@chaq/shared/tsconfig.json",
+      "!node_modules/sql.js/.devcontainer{,/**/*}",
+      "!node_modules/sql.js/*.md",
+      "!node_modules/sql.js/*.svg",
+      "!node_modules/sql.js/.eslintrc.js",
+      "!node_modules/sql.js/.jsdoc.config.json",
+      "!node_modules/sql.js/.nojekyll",
+      "!node_modules/sql.js/AUTHORS",
+      "!node_modules/sql.js/eslint.config.cjs",
+      "!node_modules/sql.js/dist/sql-asm*.js",
+      "!node_modules/sql.js/dist/sql-wasm-browser*",
+      "!node_modules/sql.js/dist/sql-wasm-debug*",
+      "!node_modules/sql.js/dist/worker.*"
     ],
     "asarUnpack": []
   }

@@ -2,6 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { PrismaClient } from "@prisma/client";
 import { demoPasswordHash } from "../src/modules/auth/auth.service";
+const { assertDemoSeedAllowed } = require("../../../scripts/demo-seed-policy") as {
+  assertDemoSeedAllowed: (env?: NodeJS.ProcessEnv) => void;
+};
 
 const envPath = join(__dirname, "..", ".env");
 if (existsSync(envPath)) {
@@ -12,9 +15,7 @@ if (existsSync(envPath)) {
   }
 }
 
-if ((process.env.NODE_ENV ?? "").toLowerCase() === "production") {
-  throw new Error("Refusing to seed demo data while NODE_ENV=production. Run migrations only in production.");
-}
+assertDemoSeedAllowed(process.env);
 
 const prisma = new PrismaClient();
 
@@ -26,8 +27,8 @@ const defaultSettings = {
   windowOpacity: 1,
   notificationSound: true,
   iconFlash: true,
-  localChatDataPath: "E:\\Environment\\Chaq\\user-data",
-  fileStoragePath: "E:\\Environment\\Chaq\\files"
+  localChatDataPath: ".chaq-data/user-data",
+  fileStoragePath: ".chaq-data/files"
 };
 
 const demoUsers = [

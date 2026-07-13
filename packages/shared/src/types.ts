@@ -213,7 +213,6 @@ export interface RechargeOrder {
 export interface RechargeConfig {
   enabled: boolean;
   allowed: boolean;
-  allowedUsername: string;
   cnyPerMToken: number;
   minMToken: number;
   maxMToken: number;
@@ -247,6 +246,7 @@ export interface WalletSummary {
 }
 
 export interface CloudChatRequest {
+  requestKey?: string;
   providerId: Id;
   model: string;
   skill: SkillDraft;
@@ -263,6 +263,7 @@ export interface CloudChatResponse {
 }
 
 export interface DistillRequest {
+  requestKey?: string;
   providerId?: Id;
   model?: string;
   sourceKind: SkillSourceKind;

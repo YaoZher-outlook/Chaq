@@ -3,6 +3,9 @@
 .agents
 .electron-cache
 .npm-cache
+.chaq-data
+.logs
+coverage
 node_modules
 apps/desktop/out
 apps/desktop/release

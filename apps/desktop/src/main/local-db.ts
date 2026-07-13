@@ -1,6 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import initSqlJs, { Database } from "sql.js";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync
+} from "node:fs";
+import { dirname } from "node:path";
+import initSqlJs, { Database, type SqlJsStatic } from "sql.js";
 import type {
   ChatMessage,
   SkillAutoMessageSettings,
@@ -10,11 +21,14 @@ import type {
   SkillVersionSnapshot,
   UserModelConfigPublic
 } from "@chaq/shared";
-import type { SecretModelConfig } from "./model-adapters";
 
 type CryptoCodec = {
   encrypt(value: string): string;
   decrypt(value: string): string;
+};
+
+type SecretModelConfig = UserModelConfigPublic & {
+  apiKey: string;
 };
 
 type SkillRow = {
@@ -69,19 +83,67 @@ type SkillAutoSettingsRow = {
   updated_at: string;
 };
 
+export type LocalDatabaseOptions = {
+  /** Coalesces several synchronous sql.js mutations into one durable file replacement. */
+  persistDelayMs?: number;
+};
+
+type DatabaseCandidate = {
+  bytes: Buffer;
+};
+
+const DEFAULT_PERSIST_DELAY_MS = 250;
+const LOCAL_SCHEMA_VERSION = 1;
+
 export class LocalDatabase {
+  private readonly persistDelayMs: number;
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  private dirty = false;
+  private closed = false;
+
   private constructor(
     private readonly dbPath: string,
     private readonly codec: CryptoCodec,
-    private readonly db: Database
+    private readonly db: Database,
+    options: LocalDatabaseOptions,
+    needsInitialPersist: boolean
   ) {
-    this.init();
+    this.persistDelayMs = normalizePersistDelay(options.persistDelayMs);
+    this.init(needsInitialPersist);
   }
 
-  static async create(dbPath: string, codec: CryptoCodec): Promise<LocalDatabase> {
+  static async create(
+    dbPath: string,
+    codec: CryptoCodec,
+    options: LocalDatabaseOptions = {}
+  ): Promise<LocalDatabase> {
+    mkdirSync(dirname(dbPath), { recursive: true });
     const SQL = await initSqlJs();
-    const db = existsSync(dbPath) ? new SQL.Database(readFileSync(dbPath)) : new SQL.Database();
-    return new LocalDatabase(dbPath, codec, db);
+    const recovered = recoverDatabaseFile(SQL, dbPath);
+    const db = recovered.bytes ? new SQL.Database(recovered.bytes) : new SQL.Database();
+    return new LocalDatabase(dbPath, codec, db, options, !recovered.bytes);
+  }
+
+  /** Immediately writes all pending mutations. Safe to call repeatedly. */
+  flush(): void {
+    this.cancelPersistTimer();
+    if (this.closed || !this.dirty) {
+      return;
+    }
+
+    const bytes = Buffer.from(this.db.export());
+    persistDatabaseFile(this.dbPath, bytes);
+    this.dirty = false;
+  }
+
+  /** Flushes pending data and releases the sql.js database. Safe to call repeatedly. */
+  close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.flush();
+    this.db.close();
+    this.closed = true;
   }
 
   listSkills(): SkillSummary[] {
@@ -393,7 +455,9 @@ export class LocalDatabase {
     };
   }
 
-  private init(): void {
+  private init(needsInitialPersist: boolean): void {
+    const schemaVersionBefore = this.readPragmaNumber("schema_version");
+    const userVersionBefore = this.readPragmaNumber("user_version");
     this.db.run("pragma foreign_keys = on");
     this.db.exec(`
       create table if not exists skills (
@@ -480,18 +544,32 @@ export class LocalDatabase {
       create index if not exists idx_messages_skill on messages(skill_id, created_at);
       create index if not exists idx_versions_skill on skill_versions(skill_id, version);
     `);
-    try {
-      this.run("alter table user_model_configs add column user_id text not null default 'local'");
-    } catch {
-      // Existing local databases already have this column.
+    this.addColumnIfMissing(
+      "alter table user_model_configs add column user_id text not null default 'local'",
+      "user_id"
+    );
+    this.addColumnIfMissing(
+      "alter table user_model_configs add column embedding_model text",
+      "embedding_model"
+    );
+    this.db.run("create index if not exists idx_user_model_configs_user on user_model_configs(user_id, updated_at)");
+    if (userVersionBefore < LOCAL_SCHEMA_VERSION) {
+      this.db.run(`pragma user_version = ${LOCAL_SCHEMA_VERSION}`);
     }
-    try {
-      this.run("alter table user_model_configs add column embedding_model text");
-    } catch {
-      // Existing local databases already have this column.
+
+    const schemaChanged = this.readPragmaNumber("schema_version") !== schemaVersionBefore;
+    if (needsInitialPersist || schemaChanged || userVersionBefore < LOCAL_SCHEMA_VERSION) {
+      this.dirty = true;
+      this.flush();
     }
-    this.run("create index if not exists idx_user_model_configs_user on user_model_configs(user_id, updated_at)");
-    this.persist();
+  }
+
+  private addColumnIfMissing(statement: string, column: string): void {
+    try {
+      this.db.run(statement);
+    } catch (error) {
+      if (!isDuplicateColumnError(error, column)) throw error;
+    }
   }
 
   private insertVersion(
@@ -584,7 +662,7 @@ export class LocalDatabase {
   private run(sql: string, params: unknown[] = [], persist = true): void {
     this.db.run(sql, params as any[]);
     if (persist) {
-      this.persist();
+      this.schedulePersist();
     }
   }
 
@@ -593,15 +671,236 @@ export class LocalDatabase {
     try {
       action();
       this.db.run("commit");
-      this.persist();
+      this.schedulePersist();
     } catch (error) {
       this.db.run("rollback");
       throw error;
     }
   }
 
-  private persist(): void {
-    writeFileSync(this.dbPath, Buffer.from(this.db.export()));
+  private readPragmaNumber(name: "schema_version" | "user_version"): number {
+    const result = this.db.exec(`pragma ${name}`);
+    const value = result[0]?.values[0]?.[0];
+    return typeof value === "number" ? value : Number(value ?? 0);
+  }
+
+  private schedulePersist(): void {
+    if (this.closed) {
+      throw new Error("Local database is closed.");
+    }
+    this.dirty = true;
+    if (this.persistTimer) {
+      return;
+    }
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      try {
+        this.flush();
+      } catch (error) {
+        // Keep dirty=true so an explicit flush (including shutdown) can retry.
+        console.error("Failed to persist the local Chaq database.", error);
+      }
+    }, this.persistDelayMs);
+    this.persistTimer.unref?.();
+  }
+
+  private cancelPersistTimer(): void {
+    if (!this.persistTimer) {
+      return;
+    }
+    clearTimeout(this.persistTimer);
+    this.persistTimer = null;
+  }
+}
+
+function normalizePersistDelay(value: number | undefined): number {
+  if (value === undefined) {
+    return DEFAULT_PERSIST_DELAY_MS;
+  }
+  if (!Number.isFinite(value)) {
+    throw new Error("persistDelayMs must be a finite number.");
+  }
+  return Math.max(0, Math.trunc(value));
+}
+
+function databasePaths(dbPath: string) {
+  return {
+    primary: dbPath,
+    temporary: `${dbPath}.tmp`,
+    backup: `${dbPath}.bak`,
+    backupTemporary: `${dbPath}.bak.tmp`
+  };
+}
+
+function recoverDatabaseFile(SQL: SqlJsStatic, dbPath: string): { bytes: Buffer | null } {
+  const paths = databasePaths(dbPath);
+  const primary = readValidDatabaseCandidate(SQL, paths.primary);
+  const temporary = readValidDatabaseCandidate(SQL, paths.temporary);
+
+  // A valid .tmp is a completely written, fsynced generation whose final rename
+  // was interrupted. It is therefore the write-ahead source of truth.
+  if (temporary) {
+    promoteTemporaryDatabaseFile(paths.primary, Boolean(primary));
+    safeUnlink(paths.backupTemporary);
+    return { bytes: temporary.bytes };
+  }
+
+  if (primary) {
+    safeUnlink(paths.temporary);
+    safeUnlink(paths.backupTemporary);
+    return { bytes: primary.bytes };
+  }
+
+  const backup = readValidDatabaseCandidate(SQL, paths.backupTemporary)
+    ?? readValidDatabaseCandidate(SQL, paths.backup);
+  if (backup) {
+    persistDatabaseFile(paths.primary, backup.bytes, false);
+    safeUnlink(paths.backupTemporary);
+    return { bytes: backup.bytes };
+  }
+
+  const artifactsExist = [paths.primary, paths.temporary, paths.backup, paths.backupTemporary].some(existsSync);
+  if (artifactsExist) {
+    throw new Error(
+      `The local database and its recovery files are unreadable: ${dbPath}. `
+      + "Keep these files for manual recovery before starting Chaq again."
+    );
+  }
+  return { bytes: null };
+}
+
+function readValidDatabaseCandidate(SQL: SqlJsStatic, path: string): DatabaseCandidate | null {
+  if (!existsSync(path)) {
+    return null;
+  }
+
+  try {
+    const bytes = readFileSync(path);
+    if (!hasSqliteHeader(bytes)) {
+      return null;
+    }
+    const candidate = new SQL.Database(bytes);
+    try {
+      const check = candidate.exec("pragma quick_check");
+      if (check[0]?.values[0]?.[0] !== "ok") {
+        return null;
+      }
+    } finally {
+      candidate.close();
+    }
+    return { bytes };
+  } catch {
+    return null;
+  }
+}
+
+function hasSqliteHeader(bytes: Uint8Array): boolean {
+  const signature = "SQLite format 3\0";
+  if (bytes.byteLength < signature.length) {
+    return false;
+  }
+  for (let index = 0; index < signature.length; index += 1) {
+    if (bytes[index] !== signature.charCodeAt(index)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function persistDatabaseFile(dbPath: string, bytes: Buffer, backupExisting = true): void {
+  const paths = databasePaths(dbPath);
+  mkdirSync(dirname(dbPath), { recursive: true });
+  writeAndSync(paths.temporary, bytes);
+
+  promoteTemporaryDatabaseFile(dbPath, backupExisting, false);
+}
+
+function promoteTemporaryDatabaseFile(
+  dbPath: string,
+  backupExisting: boolean,
+  syncTemporary = true
+): void {
+  const paths = databasePaths(dbPath);
+  if (syncTemporary) {
+    syncFile(paths.temporary);
+  }
+
+  if (backupExisting && existsSync(paths.primary)) {
+    writeAndSync(paths.backupTemporary, readFileSync(paths.primary));
+    replaceFile(paths.backupTemporary, paths.backup);
+  }
+
+  replaceFile(paths.temporary, paths.primary);
+  syncDirectory(dirname(dbPath));
+}
+
+function syncFile(path: string): void {
+  const descriptor = openSync(path, "r+");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function writeAndSync(path: string, bytes: Uint8Array): void {
+  const descriptor = openSync(path, "w", 0o600);
+  try {
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const written = writeSync(descriptor, bytes, offset, bytes.byteLength - offset);
+      if (written === 0) {
+        throw new Error(`Could not finish writing ${path}.`);
+      }
+      offset += written;
+    }
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function replaceFile(source: string, target: string): void {
+  try {
+    renameSync(source, target);
+    return;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (!existsSync(target) || !["EEXIST", "EPERM", "EACCES"].includes(code ?? "")) {
+      throw error;
+    }
+  }
+
+  // Windows can reject replacing an existing destination. The previous primary is
+  // already durable in .bak, so removing it still leaves a recoverable crash state.
+  unlinkSync(target);
+  renameSync(source, target);
+}
+
+function syncDirectory(path: string): void {
+  let descriptor: number | null = null;
+  try {
+    descriptor = openSync(path, "r");
+    fsyncSync(descriptor);
+  } catch (error) {
+    // Windows does not consistently allow fsync on directory handles.
+    if (process.platform !== "win32") {
+      throw error;
+    }
+  } finally {
+    if (descriptor !== null) {
+      closeSync(descriptor);
+    }
+  }
+}
+
+function safeUnlink(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
   }
 }
 
@@ -611,6 +910,12 @@ function safeJson<T>(value: string, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+export function isDuplicateColumnError(error: unknown, column: string): boolean {
+  if (!(error instanceof Error)) return false;
+  const escaped = column.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^duplicate column name:\\s*${escaped}$`, "i").test(error.message.trim());
 }
 
 function defaultAutoSettings(skillId: string): SkillAutoMessageSettings {
