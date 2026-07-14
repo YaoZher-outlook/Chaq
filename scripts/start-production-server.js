@@ -3,7 +3,7 @@ const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
-const { serverEnv, projectLogs } = require("./env-paths");
+const { previewEnv, serverEnv, projectLogs } = require("./env-paths");
 const {
   assessManagedProcess,
   getProcessIdentity,
@@ -16,13 +16,14 @@ const {
 } = require("./production-process-identity");
 
 const root = path.resolve(__dirname, "..");
+const localPreview = process.argv.includes("--local-preview") || process.argv.includes("--preview");
 const publicBind = process.argv.includes("--public");
 const skipBuild = process.argv.includes("--skip-build");
 const statusOnly = process.argv.includes("--status");
 const stopOnly = process.argv.includes("--stop");
 const restart = process.argv.includes("--restart");
 const foreground = process.argv.includes("--foreground");
-const host = publicBind ? "0.0.0.0" : "127.0.0.1";
+const host = localPreview ? "127.0.0.1" : publicBind ? "0.0.0.0" : "127.0.0.1";
 const port = Number(process.env.CHAQ_PROD_SERVER_PORT || process.env.SERVER_PORT || 24538);
 const defaultPublicApiUrl = "https://chaq.yaozher.com/api";
 const defaultClientOrigin = "https://chaq.yaozher.com";
@@ -162,20 +163,33 @@ function ensurePrismaClient(env) {
 
 function ensureEnvironmentFile() {
   fs.mkdirSync(projectLogs, { recursive: true });
-  if (fs.existsSync(serverEnv) && process.env.FORCE_ENV_PREPARE !== "1") {
-    console.log(`[Chaq] Using existing server env: ${serverEnv}`);
+  if (localPreview) {
+    const { writePreviewEnvironment } = require("./prepare-preview-env");
+    const result = writePreviewEnvironment(previewEnv);
+    console.log(`[Chaq] Using local preview env: ${result.filePath}`);
     return;
   }
-  try {
-    require("./prepare-env");
-  } catch (error) {
-    if (fs.existsSync(serverEnv)) {
-      console.log(`[WARN] Could not rewrite server env, using existing file: ${serverEnv}`);
-      console.log(`[WARN] ${error instanceof Error ? error.message : String(error)}`);
-      return;
-    }
-    throw error;
+  const envFile = process.env.CHAQ_ENV_FILE || serverEnv;
+  if (fs.existsSync(envFile)) {
+    console.log(`[Chaq] Using existing production env: ${envFile}`);
+    return;
   }
+  throw new Error(
+    `Production environment file not found: ${envFile}. `
+    + "Set CHAQ_ENV_FILE to a completed production environment file. "
+    + "For a self-contained local preview, run tools\\start-client.bat."
+  );
+}
+
+function ensurePreviewAccount(env) {
+  if (!localPreview) return;
+  run(process.execPath, ["scripts/create-admin-user.js"], {
+    ...env,
+    CHAQ_ADMIN_USERNAME: env.CHAQ_PREVIEW_USERNAME,
+    CHAQ_ADMIN_PASSWORD: env.CHAQ_PREVIEW_PASSWORD,
+    CHAQ_ADMIN_DISPLAY_NAME: env.CHAQ_PREVIEW_DISPLAY_NAME,
+    CHAQ_ADMIN_TOKEN_BALANCE: env.CHAQ_PREVIEW_TOKEN_BALANCE
+  });
 }
 
 function processExists(pid) {
