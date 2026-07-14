@@ -5,11 +5,23 @@ chcp 65001 >nul
 set "ROOT=%~dp0.."
 cd /d "%ROOT%"
 
+if not exist ".chaq-data\tmp" mkdir ".chaq-data\tmp"
+set "TEMP=%ROOT%\.chaq-data\tmp"
+set "TMP=%ROOT%\.chaq-data\tmp"
+set "npm_config_cache=%ROOT%\.chaq-data\npm-cache"
+set "electron_config_cache=%ROOT%\.chaq-data\electron-cache"
+set "ELECTRON_BUILDER_CACHE=%ROOT%\.chaq-data\electron-builder-cache"
+
 rem The preview is deliberately self-contained. Ignore machine-level Chaq paths
 rem so data, caches and generated configuration stay under this repository.
 set "CHAQ_ENV_ROOT="
 set "CHAQ_ENV_FILE="
 set "DOCKER_CONFIG="
+set "CHAQ_PROJECT_ROOT="
+set "CHAQ_RUNTIME_CACHE="
+set "CHAQ_DEVTOOLS_PORT="
+set "ELECTRON_RENDERER_URL="
+set "ELECTRON_RUN_AS_NODE="
 
 set "EXE=apps\desktop\release-preview\win-unpacked\Chaq.exe"
 set "VITE_SERVER_URL=http://127.0.0.1:24538/api"
@@ -28,19 +40,29 @@ if errorlevel 1 (
   goto :fail
 )
 
+node scripts\check-node-version.js
+if errorlevel 1 goto :fail
+
 where npm.cmd >nul 2>nul
 if errorlevel 1 (
   echo [ERROR] npm.cmd was not found in PATH.
   goto :fail
 )
 
-if not exist "node_modules\electron\package.json" goto :install
-if not exist "node_modules\@prisma\client\package.json" goto :install
+node scripts\stop-preview-client.js
+if errorlevel 1 goto :client_close_fail
+
+node scripts\dependency-state.js --check
+if errorlevel 1 goto :install
 goto :dependencies_ready
 
 :install
   echo [Chaq] Installing project dependencies into project-relative caches...
+  node scripts\start-production-server.js --local-preview --stop
+  if errorlevel 1 goto :server_fail
   node scripts\install-dependencies.js
+  if errorlevel 1 goto :fail
+  node scripts\dependency-state.js --check
   if errorlevel 1 goto :fail
 
 :dependencies_ready
@@ -67,8 +89,14 @@ if not exist "%EXE%" (
 
 :launch
 echo [Chaq] Launching preview client...
-start "Chaq Preview" "%EXE%"
 node scripts\prepare-preview-env.js --show-login
+if errorlevel 1 goto :client_fail
+set "NODE_ENV=production"
+set "CHAQ_ENV_ROOT=%ROOT%\.chaq-data\desktop-preview"
+start "Chaq Preview" "%EXE%"
+if errorlevel 1 goto :client_fail
+node scripts\stop-preview-client.js --wait-running
+if errorlevel 1 goto :client_fail
 echo.
 echo [Chaq] Preview is ready. The API and Agent worker continue in the background.
 echo [Chaq] Use tools\stop-preview.bat when you want to stop the preview server.
@@ -77,11 +105,17 @@ exit /b 0
 
 :server_fail
 echo [ERROR] Local preview server startup failed.
-echo [ERROR] Check .logs\api-prod.log, .logs\worker-prod.log and .chaq-data\logs\postgres.log.
+echo [ERROR] Check .logs\api-preview.log, .logs\worker-preview.log and .chaq-data\logs\postgres.log.
+node scripts\start-production-server.js --local-preview --stop
 goto :fail
 
 :client_fail
-echo [ERROR] Preview client build failed. Close any running preview client and retry.
+echo [ERROR] Preview client preparation or build failed. Check the message above and retry.
+node scripts\start-production-server.js --local-preview --stop
+goto :fail
+
+:client_close_fail
+echo [ERROR] Could not safely close the existing preview client. Save your work, close it manually, and retry.
 goto :fail
 
 :fail

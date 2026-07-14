@@ -195,13 +195,25 @@ function stopManagedProcessRecord(record, options, dependencies) {
   const identity = record ? dependencies.inspect(record.pid) : null;
   const assessment = assessManagedProcess(record, identity, options);
   if (!assessment.safe) {
+    const inspectionUnavailable = assessment.reason === "process command line is unavailable"
+      || assessment.reason === "process does not exist or cannot be inspected";
+    const knownAbsent = Boolean(
+      !identity
+      && record
+      && typeof dependencies.exists === "function"
+      && dependencies.exists(record.pid) === false
+    );
+    if (record && inspectionUnavailable && !knownAbsent) {
+      dependencies.log(`[WARN] Refusing to stop pid=${record.pid}: ${assessment.reason}. Preserving the pid record.`);
+      return { stopped: false, preserved: true, reason: assessment.reason };
+    }
     if (record) dependencies.log(`[WARN] Refusing to stop pid=${record.pid}: ${assessment.reason}. Clearing stale pid record.`);
     dependencies.clear();
-    return { stopped: false, reason: assessment.reason };
+    return { stopped: false, preserved: false, reason: assessment.reason };
   }
   dependencies.terminate(record.pid, options.label);
   dependencies.clear();
-  return { stopped: true, reason: assessment.reason };
+  return { stopped: true, preserved: false, reason: assessment.reason };
 }
 
 module.exports = {

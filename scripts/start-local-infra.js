@@ -340,11 +340,13 @@ async function startPostgres(env) {
 
 async function startRedis(env) {
   const redisPort = Number(env.CHAQ_REDIS_PORT || new URL(env.REDIS_URL).port || 46379);
-  if (await redisPing(redisPort)) {
+  const localPreview = env.CHAQ_RUNTIME_PROFILE === "local-preview";
+  const alreadyRedis = await redisPing(redisPort);
+  if (alreadyRedis && !localPreview) {
     console.log(`[Chaq] Docker Redis answered PING on 127.0.0.1:${redisPort}`);
     return;
   }
-  if (await canConnect(redisPort)) {
+  if (!alreadyRedis && await canConnect(redisPort)) {
     throw new Error(
       `Port 127.0.0.1:${redisPort} is occupied, but the listener did not answer Redis PING. `
       + "Stop the conflicting process or change CHAQ_REDIS_PORT before starting Chaq."
@@ -354,6 +356,12 @@ async function startRedis(env) {
   console.log(`[Chaq] Starting Redis with Docker Compose on 127.0.0.1:${redisPort}`);
   fs.mkdirSync(dockerConfig, { recursive: true });
   const dockerEnvironment = { DOCKER_CONFIG: process.env.DOCKER_CONFIG || dockerConfig };
+  const composeFile = path.join(projectRoot, "docker-compose.yml");
+  const composeArgs = [
+    "compose",
+    "--project-name", "chaq-preview",
+    "--file", composeFile
+  ];
   try {
     run("docker", ["info"], { capture: true, env: dockerEnvironment });
   } catch (error) {
@@ -362,10 +370,133 @@ async function startRedis(env) {
       + `Details: ${error instanceof Error ? error.message : String(error)}`
     );
   }
-  run("docker", ["compose", "up", "-d", "redis"], {
+  if (localPreview) stopExposedLegacyPostgres(dockerEnvironment, composeFile);
+  if (localPreview && alreadyRedis) {
+    migrateLegacyRedisContainer(composeArgs, dockerEnvironment, composeFile);
+  }
+  run("docker", [...composeArgs, "up", "-d", "redis"], {
     env: dockerEnvironment
   });
   await waitForRedis(redisPort);
+  if (localPreview) verifyRedisDockerBinding(composeArgs, dockerEnvironment, redisPort);
+}
+
+function dockerPortsExposeAllInterfaces(metadata) {
+  const ports = metadata?.NetworkSettings?.Ports || {};
+  return Object.values(ports).some((mappings) => Array.isArray(mappings) && mappings.some((mapping) => {
+    const host = String(mapping?.HostIp || "").toLowerCase();
+    return host === "0.0.0.0" || host === "::";
+  }));
+}
+
+function stopExposedLegacyPostgres(dockerEnvironment, composeFile) {
+  const output = run("docker", [
+    "ps",
+    "--filter", "label=com.docker.compose.project=chaq",
+    "--filter", "label=com.docker.compose.service=postgres",
+    "--format", "{{.ID}}"
+  ], { capture: true, env: dockerEnvironment });
+  const containerIds = output.split(/\s+/).filter(Boolean);
+  for (const containerId of containerIds) {
+    const metadata = inspectDockerContainer(containerId, dockerEnvironment);
+    if (!containerBelongsToCompose(metadata, "chaq", "postgres", composeFile)) continue;
+    if (!dockerPortsExposeAllInterfaces(metadata)) continue;
+    console.warn(
+      `[WARN] Stopping obsolete legacy PostgreSQL container ${containerId} because it exposes a project database on all interfaces. `
+      + "Its named data volume is preserved; local preview uses the project-relative PostgreSQL instance on 127.0.0.1:45432."
+    );
+    run("docker", ["stop", containerId], { env: dockerEnvironment });
+  }
+}
+
+function containerBelongsToCompose(metadata, expectedProject, expectedService, expectedFile) {
+  const labels = metadata?.Config?.Labels || {};
+  const configuredFiles = String(labels["com.docker.compose.project.config_files"] || "")
+    .split(",")
+    .map((file) => file.trim())
+    .filter(Boolean);
+  const normalize = (file) => process.platform === "win32"
+    ? path.resolve(file).toLowerCase()
+    : path.resolve(file);
+  return labels["com.docker.compose.project"] === expectedProject
+    && labels["com.docker.compose.service"] === expectedService
+    && configuredFiles.some((file) => normalize(file) === normalize(expectedFile));
+}
+
+function inspectDockerContainer(containerId, dockerEnvironment) {
+  const output = run("docker", ["inspect", containerId], { capture: true, env: dockerEnvironment });
+  try {
+    const parsed = JSON.parse(output);
+    return Array.isArray(parsed) ? parsed[0] : null;
+  } catch (error) {
+    throw new Error(`Could not parse Docker metadata for container ${containerId}: ${error.message}`);
+  }
+}
+
+function migrateLegacyRedisContainer(composeArgs, dockerEnvironment, composeFile) {
+  const previewId = run("docker", [...composeArgs, "ps", "-q", "redis"], {
+    capture: true,
+    env: dockerEnvironment
+  }).trim();
+  if (previewId) return;
+
+  const legacyArgs = [
+    "compose",
+    "--project-name", "chaq",
+    "--file", composeFile
+  ];
+  const legacyId = run("docker", [...legacyArgs, "ps", "-q", "redis"], {
+    capture: true,
+    env: dockerEnvironment
+  }).trim();
+  if (!legacyId) {
+    throw new Error(
+      "Redis is already listening on the preview port, but it is not managed by the isolated chaq-preview Compose project. "
+      + "Stop the conflicting Redis service before retrying."
+    );
+  }
+  const metadata = inspectDockerContainer(legacyId, dockerEnvironment);
+  if (!containerBelongsToCompose(metadata, "chaq", "redis", composeFile)) {
+    throw new Error("The Redis listener belongs to a different Docker Compose configuration; refusing to replace it.");
+  }
+  console.log("[Chaq] Migrating the legacy Chaq Redis container into the isolated chaq-preview Compose project.");
+  run("docker", [...legacyArgs, "stop", "redis"], { env: dockerEnvironment });
+  run("docker", [...legacyArgs, "rm", "--force", "redis"], { env: dockerEnvironment });
+}
+
+function redisDockerBindingIsLoopback(value, expectedPort) {
+  let ports;
+  try {
+    ports = typeof value === "string" ? JSON.parse(value) : value;
+  } catch {
+    return false;
+  }
+  const mappings = ports?.["6379/tcp"];
+  return Array.isArray(mappings)
+    && mappings.length > 0
+    && mappings.every((mapping) => {
+      const host = String(mapping?.HostIp || "").toLowerCase();
+      return ["127.0.0.1", "::1"].includes(host) && Number(mapping?.HostPort) === Number(expectedPort);
+    });
+}
+
+function verifyRedisDockerBinding(composeArgs, dockerEnvironment, redisPort) {
+  const containerId = run("docker", [...composeArgs, "ps", "-q", "redis"], {
+    capture: true,
+    env: dockerEnvironment
+  }).trim();
+  if (!containerId) throw new Error("Docker Compose did not report a Redis container after startup.");
+  const ports = run("docker", ["inspect", "--format", "{{json .NetworkSettings.Ports}}", containerId], {
+    capture: true,
+    env: dockerEnvironment
+  });
+  if (!redisDockerBindingIsLoopback(ports, redisPort)) {
+    throw new Error(
+      `Redis Docker port ${redisPort} is not bound exclusively to loopback. `
+      + "Refusing to continue local preview with an externally reachable Redis service."
+    );
+  }
+  console.log(`[Chaq] Verified Docker Redis is bound only to 127.0.0.1:${redisPort}.`);
 }
 
 async function main() {
@@ -385,8 +516,11 @@ if (require.main === module) {
 module.exports = {
   pathDirectories,
   postgresBinIsComplete,
+  containerBelongsToCompose,
+  dockerPortsExposeAllInterfaces,
   readPostmasterRecord,
   reconcilePostmasterPid,
+  redisDockerBindingIsLoopback,
   redisPing,
   resolvePostgresBin
 };

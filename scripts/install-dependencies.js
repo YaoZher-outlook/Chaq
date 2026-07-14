@@ -1,6 +1,7 @@
 const { mkdirSync } = require("node:fs");
 const { spawnSync } = require("node:child_process");
 const { electronCache, npmCache, projectRoot } = require("./env-paths");
+const { recordDependencyState } = require("./dependency-state");
 
 const serverOnly = process.argv.includes("--server-only");
 const cleanInstall = process.argv.includes("--ci");
@@ -51,6 +52,9 @@ if (!serverOnly) {
 
   if (electronResult.error) throw electronResult.error;
   if (electronResult.status !== 0) process.exit(electronResult.status ?? 1);
+
+  const dependencyState = recordDependencyState();
+  console.log(`[dependencies] Recorded installed dependency state: ${dependencyState.stateFile}`);
 }
 
 process.exit(0);

@@ -1,6 +1,19 @@
 const fs = require("node:fs");
 const { randomBytes } = require("node:crypto");
 const path = require("node:path");
+
+function previewProjectPaths(projectRoot = path.resolve(__dirname, "..")) {
+  const chaqEnvironmentRoot = path.join(projectRoot, ".chaq-data");
+  return {
+    chaqEnvironmentRoot,
+    dockerConfig: path.join(chaqEnvironmentRoot, "docker-config"),
+    postgresData: path.join(chaqEnvironmentRoot, "postgres-data"),
+    previewEnv: path.join(chaqEnvironmentRoot, "preview.env"),
+    projectLogs: path.join(projectRoot, ".logs"),
+    redisData: path.join(chaqEnvironmentRoot, "redis-data")
+  };
+}
+
 const {
   chaqEnvironmentRoot,
   dockerConfig,
@@ -8,7 +21,7 @@ const {
   previewEnv,
   projectLogs,
   redisData
-} = require("./env-paths");
+} = previewProjectPaths();
 
 function parseEnv(text) {
   const values = {};
@@ -119,13 +132,22 @@ function writePreviewEnvironment(filePath = previewEnv) {
   return { filePath, values };
 }
 
+function readPreviewLogin(filePath = previewEnv) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`Local preview environment does not exist yet: ${filePath}`);
+  }
+  const values = parseEnv(fs.readFileSync(filePath, "utf8"));
+  if (!validUsername(values.CHAQ_PREVIEW_USERNAME) || !validPreviewPassword(values.CHAQ_PREVIEW_PASSWORD)) {
+    throw new Error(`Local preview login is missing or invalid in ${filePath}`);
+  }
+  return { filePath, values };
+}
+
 function main() {
-  const showOnly = process.argv.includes("--show-login") && fs.existsSync(previewEnv);
-  const result = showOnly
-    ? { filePath: previewEnv, values: parseEnv(fs.readFileSync(previewEnv, "utf8")) }
-    : writePreviewEnvironment();
+  const showOnly = process.argv.includes("--show-login");
+  const result = showOnly ? readPreviewLogin() : writePreviewEnvironment();
   console.log(`[Chaq] Local preview environment: ${result.filePath}`);
-  if (process.argv.includes("--show-login")) {
+  if (showOnly) {
     console.log(`[Chaq] Preview login: ${result.values.CHAQ_PREVIEW_USERNAME} / ${result.values.CHAQ_PREVIEW_PASSWORD}`);
   }
 }
@@ -139,4 +161,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { parseEnv, previewValues, serializePreviewEnv, writePreviewEnvironment };
+module.exports = { parseEnv, previewProjectPaths, previewValues, readPreviewLogin, serializePreviewEnv, writePreviewEnvironment };

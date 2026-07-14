@@ -4,8 +4,11 @@ const net = require("node:net");
 const path = require("node:path");
 const test = require("node:test");
 const {
+  containerBelongsToCompose,
+  dockerPortsExposeAllInterfaces,
   postgresBinIsComplete,
   reconcilePostmasterPid,
+  redisDockerBindingIsLoopback,
   redisPing,
   resolvePostgresBin
 } = require("./start-local-infra");
@@ -139,4 +142,48 @@ test("an arbitrary TCP listener is not accepted as Redis", async () => {
   }, async (port) => {
     assert.equal(await redisPing(port), false);
   });
+});
+
+test("local preview accepts only loopback Docker Redis port mappings", () => {
+  assert.equal(redisDockerBindingIsLoopback({
+    "6379/tcp": [{ HostIp: "127.0.0.1", HostPort: "46379" }]
+  }, 46379), true);
+  assert.equal(redisDockerBindingIsLoopback(JSON.stringify({
+    "6379/tcp": [{ HostIp: "0.0.0.0", HostPort: "46379" }]
+  }), 46379), false);
+  assert.equal(redisDockerBindingIsLoopback({
+    "6379/tcp": [
+      { HostIp: "127.0.0.1", HostPort: "46379" },
+      { HostIp: "::", HostPort: "46379" }
+    ]
+  }, 46379), false);
+  assert.equal(redisDockerBindingIsLoopback({}, 46379), false);
+});
+
+test("legacy Redis migration accepts only the exact local Compose project", () => {
+  const composeFile = path.resolve("E:\\workspace\\Chaq\\docker-compose.yml");
+  const metadata = {
+    Config: {
+      Labels: {
+        "com.docker.compose.project": "chaq",
+        "com.docker.compose.service": "redis",
+        "com.docker.compose.project.config_files": composeFile
+      }
+    }
+  };
+  assert.equal(containerBelongsToCompose(metadata, "chaq", "redis", composeFile), true);
+  assert.equal(containerBelongsToCompose(metadata, "chaq-preview", "redis", composeFile), false);
+  assert.equal(containerBelongsToCompose(metadata, "chaq", "redis", path.resolve("other-compose.yml")), false);
+});
+
+test("legacy container exposure detection identifies wildcard host bindings", () => {
+  assert.equal(dockerPortsExposeAllInterfaces({
+    NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "0.0.0.0", HostPort: "5432" }] } }
+  }), true);
+  assert.equal(dockerPortsExposeAllInterfaces({
+    NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "::", HostPort: "5432" }] } }
+  }), true);
+  assert.equal(dockerPortsExposeAllInterfaces({
+    NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5432" }] } }
+  }), false);
 });

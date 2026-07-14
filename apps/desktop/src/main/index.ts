@@ -16,13 +16,14 @@ let rememberedSessionVault: RememberedSessionVault;
 const utilityBootstrapTokens = new UtilityBootstrapTokenStore();
 
 const rendererFileUrl = pathToFileURL(join(__dirname, "../renderer/index.html"));
+const developmentRendererUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_URL;
 
 const storageReady = configureStoragePaths();
 
 // electron-vite shares electron.exe with other local apps, so its strict port
 // check is the reliable development lock. Packaged Chaq keeps the OS lock.
 const hasSingleInstanceLock = storageReady
-  && (Boolean(process.env.ELECTRON_RENDERER_URL) || app.requestSingleInstanceLock());
+  && (Boolean(developmentRendererUrl) || app.requestSingleInstanceLock());
 if (!hasSingleInstanceLock) app.quit();
 
 app.on("second-instance", () => {
@@ -58,7 +59,7 @@ function configureStoragePaths(): boolean {
     app.setPath("userData", layout.userData);
     app.setPath("sessionData", layout.sessionData);
     app.commandLine.appendSwitch("disk-cache-dir", layout.diskCache);
-    if (process.env.NODE_ENV !== "production" && /^\d{2,5}$/.test(process.env.CHAQ_DEVTOOLS_PORT ?? "")) {
+    if (!app.isPackaged && process.env.NODE_ENV !== "production" && /^\d{2,5}$/.test(process.env.CHAQ_DEVTOOLS_PORT ?? "")) {
       app.commandLine.appendSwitch("remote-debugging-port", process.env.CHAQ_DEVTOOLS_PORT);
     }
     return true;
@@ -74,8 +75,8 @@ function configureStoragePaths(): boolean {
 function isTrustedRendererUrl(target: string): boolean {
   try {
     const targetUrl = new URL(target);
-    if (process.env.ELECTRON_RENDERER_URL) {
-      return targetUrl.origin === new URL(process.env.ELECTRON_RENDERER_URL).origin;
+    if (developmentRendererUrl) {
+      return targetUrl.origin === new URL(developmentRendererUrl).origin;
     }
     return targetUrl.protocol === "file:" && targetUrl.pathname === rendererFileUrl.pathname;
   } catch {
@@ -142,8 +143,8 @@ function createWindow(): void {
   });
   hardenWindow(mainWindow);
 
-  if (process.env.ELECTRON_RENDERER_URL) {
-    void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
+  if (developmentRendererUrl) {
+    void mainWindow.loadURL(developmentRendererUrl);
   } else {
     void mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
   }
@@ -365,8 +366,8 @@ function openUtilityWindow(
     utilityBootstrapTokens.revoke(utilityWindow.webContents.id);
   });
   const query = new URLSearchParams(queryInput);
-  if (process.env.ELECTRON_RENDERER_URL) {
-    void utilityWindow.loadURL(`${process.env.ELECTRON_RENDERER_URL}?${query.toString()}`);
+  if (developmentRendererUrl) {
+    void utilityWindow.loadURL(`${developmentRendererUrl}?${query.toString()}`);
   } else {
     void utilityWindow.loadFile(join(__dirname, "../renderer/index.html"), { query: Object.fromEntries(query.entries()) });
   }

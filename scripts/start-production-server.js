@@ -1,4 +1,5 @@
 const fs = require("node:fs");
+const { createHash } = require("node:crypto");
 const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
@@ -51,6 +52,8 @@ const productionEntries = {
   api: path.join(root, "apps", "server", "dist", "src", "main.js"),
   worker: path.join(root, "apps", "server", "dist", "src", "worker.js")
 };
+const prismaSchema = path.join(root, "apps", "server", "prisma", "schema.prisma");
+const prismaStateFile = path.join(root, ".chaq-data", "prisma-client-state.json");
 
 function parseEnv(text) {
   const entries = {};
@@ -157,25 +160,46 @@ function run(file, args, env) {
 function prismaClientAvailable() {
   const clientIndex = path.join(root, "node_modules", ".prisma", "client", "index.js");
   const clientSchema = path.join(root, "node_modules", ".prisma", "client", "schema.prisma");
-  return fs.existsSync(clientIndex) && fs.existsSync(clientSchema);
+  if (!fs.existsSync(clientIndex) || !fs.existsSync(clientSchema) || !fs.existsSync(prismaSchema)) return false;
+  try {
+    const state = JSON.parse(fs.readFileSync(prismaStateFile, "utf8"));
+    const sourceHash = createHash("sha256").update(fs.readFileSync(prismaSchema)).digest("hex");
+    return state?.version === 1
+      && state.schemaSha256 === sourceHash
+      && state.prismaVersion === installedPackageVersion("prisma")
+      && state.prismaClientVersion === installedPackageVersion("@prisma/client");
+  } catch {
+    return false;
+  }
+}
+
+function recordPrismaClientState() {
+  const schemaSha256 = createHash("sha256").update(fs.readFileSync(prismaSchema)).digest("hex");
+  fs.mkdirSync(path.dirname(prismaStateFile), { recursive: true });
+  fs.writeFileSync(prismaStateFile, `${JSON.stringify({
+    version: 1,
+    schemaSha256,
+    prismaVersion: installedPackageVersion("prisma"),
+    prismaClientVersion: installedPackageVersion("@prisma/client"),
+    generatedAt: new Date().toISOString()
+  }, null, 2)}\r\n`, "utf8");
+}
+
+function installedPackageVersion(name) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(root, "node_modules", ...name.split("/"), "package.json"), "utf8")).version || null;
+  } catch {
+    return null;
+  }
 }
 
 function ensurePrismaClient(env) {
   if (env.FORCE_PRISMA_GENERATE === "1" || !prismaClientAvailable()) {
-    try {
-      run(command("npm"), ["run", "prisma:generate"], env);
-    } catch (error) {
-      const clientIndex = path.join(root, "node_modules", ".prisma", "client", "index.js");
-      if (fs.existsSync(clientIndex)) {
-        console.log("[WARN] Prisma generate failed, but an existing Prisma Client is available. Continuing startup.");
-        console.log(`[WARN] ${error instanceof Error ? error.message : String(error)}`);
-        return;
-      }
-      throw error;
-    }
+    run(command("npm"), ["run", "prisma:generate"], env);
+    recordPrismaClientState();
     return;
   }
-  console.log("[Chaq] Prisma Client is available. Skipping generate to avoid Windows DLL locks.");
+  console.log("[Chaq] Prisma Client matches the current schema. Skipping generate to avoid Windows DLL locks.");
 }
 
 function ensureEnvironmentFile() {
@@ -312,9 +336,9 @@ function findProjectNodePids(scriptName) {
   return findProjectNodeProcesses(scriptName === "worker.js" ? "worker" : "api").map((identity) => identity.pid);
 }
 
-function managedPidFileRunning(file, role) {
+function managedPidFileState(file, role, options = {}) {
   const record = readPidRecord(file);
-  if (!record) return false;
+  if (!record) return "missing";
   const identity = getProcessIdentity(record.pid);
   const assessment = assessManagedProcess(record, identity, {
     projectRoot: root,
@@ -325,14 +349,35 @@ function managedPidFileRunning(file, role) {
     requiredArgs: runtimeMarkerArgs,
     exclusiveArgPrefixes: runtimeMarkerPrefixes
   });
-  if (assessment.safe) return true;
+  if (assessment.safe) return "running";
+  const inspectionUnknown = assessment.reason === "process command line is unavailable"
+    || assessment.reason === "process does not exist or cannot be inspected";
+  if (inspectionUnknown) {
+    if (!identity && !processExists(record.pid)) {
+      console.log(`[WARN] Ignoring stale ${role} pid file for pid=${record.pid}: the process no longer exists.`);
+      if (options.mutate !== false) removePid(file);
+      return "stale";
+    }
+    console.log(
+      `[WARN] Could not verify ${role} pid=${record.pid}: ${assessment.reason}. `
+      + "Preserving the pid record because process inspection may be temporarily unavailable."
+    );
+    return "unknown";
+  }
   console.log(`[WARN] Ignoring stale ${role} pid file for pid=${record.pid}: ${assessment.reason}.`);
-  removePid(file);
-  return false;
+  if (options.mutate !== false) removePid(file);
+  return "stale";
 }
 
 function productionWorkerRunning() {
-  return managedPidFileRunning(workerPidFile, "worker") || findProjectNodePids("worker.js").length > 0;
+  const state = managedPidFileState(workerPidFile, "worker");
+  if (state === "unknown") {
+    throw new Error(
+      "The Agent worker pid exists but its process identity cannot be inspected. "
+      + "Run the launcher with the same account and permissions as the existing preview, or stop that process manually."
+    );
+  }
+  return state === "running" || findProjectNodePids("worker.js").length > 0;
 }
 
 function ensureProductionWorker(env) {
@@ -369,7 +414,7 @@ function terminateVerifiedPid(pid, label) {
 }
 
 function stopManagedPidFile(file, role, label) {
-  return stopManagedProcessRecord(readPidRecord(file), {
+  const result = stopManagedProcessRecord(readPidRecord(file), {
     projectRoot: root,
     role,
     label,
@@ -380,10 +425,15 @@ function stopManagedPidFile(file, role, label) {
     exclusiveArgPrefixes: runtimeMarkerPrefixes
   }, {
     inspect: (pid) => getProcessIdentity(pid),
+    exists: (pid) => processExists(pid),
     terminate: (pid, processLabel) => terminateVerifiedPid(pid, processLabel),
     clear: () => removePid(file),
     log: (message) => console.log(message)
   });
+  if (result.preserved) {
+    throw new Error(`Could not safely inspect ${label}; its pid record was preserved and no process was stopped.`);
+  }
+  return result;
 }
 
 function stopDiscoveredProcess(discoveredIdentity, role, label) {
@@ -576,6 +626,9 @@ async function printStatus() {
   const listenerPid = findListeningPid(port);
   const scannedApiPids = findProjectNodePids("main.js");
   const scannedWorkerPids = findProjectNodePids("worker.js");
+  const workerPidState = managedPidFileState(workerPidFile, "worker", { mutate: false });
+  const workerReady = workerPidState === "running" || scannedWorkerPids.length > 0;
+  const workerStatus = workerReady ? "yes" : workerPidState === "unknown" ? "unknown" : "no";
   console.log(`[Chaq] Production port: ${port}`);
   console.log(`[Chaq] API ready: ${readyForProfile ? "yes" : "no"}`);
   if (status.data) {
@@ -588,6 +641,7 @@ async function printStatus() {
   }
   console.log(`[Chaq] API pid file: ${apiPid ?? "missing"}${apiPid ? ` (${processExists(apiPid) ? "running" : "stale"})` : ""}`);
   console.log(`[Chaq] Worker pid file: ${workerPid ?? "missing"}${workerPid ? ` (${processExists(workerPid) ? "running" : "stale"})` : ""}`);
+  console.log(`[Chaq] Agent worker ready: ${workerStatus}`);
   console.log(`[Chaq] Listening pid on ${port}: ${listenerPid ?? "none"}`);
   if (scannedApiPids.length) console.log(`[Chaq] Project production API pids: ${scannedApiPids.join(", ")}`);
   if (scannedWorkerPids.length) console.log(`[Chaq] Project production worker pids: ${scannedWorkerPids.join(", ")}`);
@@ -596,7 +650,7 @@ async function printStatus() {
     console.log("[WARN] Close old production node processes once, then run tools\\start-server-prod.bat to adopt the managed startup scheme.");
   }
   console.log(`[Chaq] Logs: ${path.join(projectLogs, apiLogName)} ; ${path.join(projectLogs, workerLogName)}`);
-  return readyForProfile;
+  return readyForProfile && workerReady;
 }
 
 async function stopProduction() {

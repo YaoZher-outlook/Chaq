@@ -20,7 +20,7 @@ See [Agent runtime](docs/agent-runtime.md), [architecture](docs/architecture.md)
 
 ## Local Start
 
-Requirements: Node.js 22.12+, npm 11.18.0 (the version pinned in `package.json`), PostgreSQL binaries available under the repository-relative `.chaq-data\postgresql\bin` directory, through `CHAQ_PG_BIN`, or on `PATH`, and Docker Desktop for Redis when Redis is not already running.
+Requirements: Node.js 22.12+, npm 11.18.0 (the version pinned in `package.json`), PostgreSQL binaries available under the repository-relative `.chaq-data\postgresql\bin` directory, through `CHAQ_PG_BIN`, or on `PATH`, and Docker Desktop for the loopback-only Redis used by local production preview.
 
 On Windows, use:
 
@@ -31,14 +31,14 @@ tools\start-server-prod.bat
 tools\start-client.bat
 ```
 
-For the fastest complete preview, double-click `start-preview.bat`; `start-client.bat` is a compatibility alias for the same flow. It ignores machine-level Chaq path overrides so configuration, data and caches stay under this repository, creates an isolated `.chaq-data\preview.env`, starts project-local PostgreSQL and Redis, applies migrations, builds and starts the API plus Agent worker with production code on `127.0.0.1:24538`, creates an idempotent preview administrator, verifies login, builds a fingerprinted localhost-only client under `apps\desktop\release-preview`, and launches it. The generated login is printed in the launcher window. Use `tools\status-preview.bat` and `tools\stop-preview.bat` to inspect or stop the background services.
+For the fastest complete preview, double-click `start-preview.bat`; `start-client.bat` is a compatibility alias for the same flow. It ignores machine-level Chaq path and Electron development overrides so configuration, data and caches stay under this repository, creates an isolated `.chaq-data\preview.env`, starts project-local PostgreSQL and Redis, applies migrations, builds and starts the API plus Agent worker with production code on `127.0.0.1:24538`, creates an idempotent preview administrator, verifies login, builds a fingerprinted localhost-only client under `apps\desktop\release-preview`, and launches it. The generated login is printed in the launcher window. Durable preview-client data lives outside the replaceable build at `.chaq-data\desktop-preview\Chaq`. Use `tools\status-preview.bat` to inspect the API and worker, and `tools\stop-preview.bat` to stop those two background processes; PostgreSQL, Redis and the desktop window are left available for the next preview.
 
 `start-server-dev.bat` prepares the development environment, starts PostgreSQL and Redis, applies migrations, explicitly enables the idempotent demo seed for that one initialization step, then launches both the NestJS API and Agent worker in watch mode on `127.0.0.1:24537`. `start-server-prod.bat` is reserved for a completed formal production environment, starts the production API and Agent worker on `0.0.0.0:24538`, manages them in the background, and mirrors output into `.logs`.
 
 There are three server profiles:
 
 - Development server: `tools\start-server-dev.bat`, binding the API to `127.0.0.1:24537`.
-- Local production preview: `tools\start-preview.bat`, using production builds but strictly limited to `127.0.0.1:24538`; verification mail is written to `.logs\api-prod.log` and payment remains disabled.
+- Local production preview: `tools\start-preview.bat`, using production builds but strictly limited to `127.0.0.1:24538`; verification mail is written to `.logs\api-preview.log` and payment remains disabled.
 - Production server: `tools\start-server-prod.bat`, binding the API to `0.0.0.0:24538` so Cloudflare Tunnel, a reverse proxy, or another machine can reach it.
 
 For the live Chaq domain, point Cloudflared hostname `chaq.yaozher.com` to service `http://127.0.0.1:24538`. Do not include `/api` in the Cloudflared service target; the API prefix is handled by the server, so the public API URL is `https://chaq.yaozher.com/api`.

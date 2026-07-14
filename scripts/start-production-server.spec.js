@@ -99,7 +99,7 @@ test("the matching Linux process identity is allowed to stop", () => {
   assert.equal(cleared, 1);
 });
 
-test("an unavailable command line fails closed and only clears the stale pid", () => {
+test("an unavailable command line fails closed and preserves the pid record", () => {
   const { identity, options, record } = fixture("win32", {
     identity: { commandLine: null, argv: [] }
   });
@@ -115,7 +115,8 @@ test("an unavailable command line fails closed and only clears the stale pid", (
   assert.equal(result.stopped, false);
   assert.match(result.reason, /command line is unavailable/);
   assert.deepEqual(terminated, []);
-  assert.equal(cleared, 1);
+  assert.equal(result.preserved, true);
+  assert.equal(cleared, 0);
 });
 
 test("legacy numeric pid files cannot authorize termination", () => {
