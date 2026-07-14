@@ -34,6 +34,16 @@ export async function sendVerificationEmail(email: string, code: string, purpose
 }
 
 async function sendMail(options: MailOptions): Promise<void> {
+  const localPreviewLog = process.env.CHAQ_RUNTIME_PROFILE === "local-preview"
+    && process.env.CHAQ_MAIL_MODE === "log";
+  if (localPreviewLog) {
+    console.log(`[mail:preview] ${options.to} | ${options.subject}\n${options.text}`);
+    return;
+  }
+  if (process.env.CHAQ_MAIL_MODE === "log") {
+    throw new Error("Log mail delivery is restricted to the local-preview runtime profile.");
+  }
+
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || 587);
   const user = process.env.SMTP_USER;
@@ -41,6 +51,9 @@ async function sendMail(options: MailOptions): Promise<void> {
   const from = process.env.SMTP_FROM || user;
 
   if (!host || !from) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("SMTP_HOST and SMTP_FROM are required outside local preview.");
+    }
     console.log(`[mail:dev] ${options.to} | ${options.subject}\n${options.text}`);
     return;
   }

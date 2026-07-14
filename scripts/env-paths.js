@@ -17,10 +17,13 @@ module.exports = {
   electronBuilderCache: path.join(chaqEnvironmentRoot, "electron-builder-cache"),
   runtimeCache: path.join(chaqEnvironmentRoot, "runtime-cache-v2"),
   npmCache: path.join(chaqEnvironmentRoot, "npm-cache"),
+  dockerConfig: path.join(chaqEnvironmentRoot, "docker-config"),
   userData: path.join(chaqEnvironmentRoot, "user-data"),
   projectLogs: path.join(projectRoot, ".logs"),
   serverEnv: path.join(chaqEnvironmentRoot, "server.env"),
+  previewEnv: path.join(chaqEnvironmentRoot, "preview.env"),
   workspaceServerEnv: path.join(projectRoot, "apps", "server", ".env"),
   postgresData: path.join(chaqEnvironmentRoot, "postgres-data"),
-  postgresLog: path.join(chaqEnvironmentRoot, "logs", "postgres.log")
+  postgresLog: path.join(chaqEnvironmentRoot, "logs", "postgres.log"),
+  redisData: path.join(chaqEnvironmentRoot, "redis-data")
 };

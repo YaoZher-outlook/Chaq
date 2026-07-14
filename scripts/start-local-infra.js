@@ -4,12 +4,17 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const {
   chaqEnvironmentRoot,
+  dockerConfig,
   postgresData,
   postgresLog,
+  projectRoot,
   serverEnv
 } = require("./env-paths");
 
-require("./prepare-env");
+const requestedEnvFile = process.env.CHAQ_ENV_FILE || serverEnv;
+if (!fs.existsSync(requestedEnvFile)) require("./prepare-env");
+
+const postgresTools = ["initdb", "pg_ctl", "pg_isready", "psql", "createdb"];
 
 function parseEnv(text) {
   const entries = {};
@@ -42,6 +47,7 @@ function readEnv() {
 
 function run(file, args, options = {}) {
   const result = spawnSync(file, args, {
+    cwd: options.cwd || projectRoot,
     stdio: options.capture ? "pipe" : "inherit",
     encoding: "utf8",
     env: { ...process.env, ...options.env },
@@ -115,15 +121,44 @@ async function waitForPort(port, label) {
 }
 
 function postgresExe(pgBin, name) {
-  const fullPath = path.join(pgBin, `${name}.exe`);
+  const extension = process.platform === "win32" ? ".exe" : "";
+  const fullPath = path.join(pgBin, `${name}${extension}`);
   if (!fs.existsSync(fullPath)) {
     throw new Error(`${name}.exe not found in ${pgBin}`);
   }
   return fullPath;
 }
 
+function postgresBinIsComplete(directory, platform = process.platform, exists = fs.existsSync) {
+  if (!directory) return false;
+  const extension = platform === "win32" ? ".exe" : "";
+  return postgresTools.every((name) => exists(path.join(directory, `${name}${extension}`)));
+}
+
+function pathDirectories(environment = process.env, platform = process.platform) {
+  const raw = platform === "win32"
+    ? environment.Path || environment.PATH || ""
+    : environment.PATH || "";
+  return String(raw).split(path.delimiter).map((entry) => entry.trim().replace(/^"|"$/g, "")).filter(Boolean);
+}
+
+function resolvePostgresBin(env, options = {}) {
+  const platform = options.platform || process.platform;
+  const exists = options.exists || fs.existsSync;
+  const fallback = options.projectBin || path.join(chaqEnvironmentRoot, "postgresql", "bin");
+  const candidates = [env.CHAQ_PG_BIN, fallback, ...pathDirectories(options.environment || process.env, platform)]
+    .filter(Boolean)
+    .filter((candidate, index, list) => list.indexOf(candidate) === index);
+  const resolved = candidates.find((candidate) => postgresBinIsComplete(candidate, platform, exists));
+  if (resolved) return resolved;
+  throw new Error(
+    `PostgreSQL tools (${postgresTools.join(", ")}) were not found. `
+    + `Install PostgreSQL on a non-system drive or place its bin directory at ${fallback}, then add it to PATH.`
+  );
+}
+
 async function startPostgres(env) {
-  const pgBin = env.CHAQ_PG_BIN || path.join(chaqEnvironmentRoot, "postgresql", "bin");
+  const pgBin = resolvePostgresBin(env);
   const pgData = env.CHAQ_PG_DATA_DIR || postgresData;
   const pgUser = env.CHAQ_PG_USER || "chaq";
   const pgPassword = env.CHAQ_PG_PASSWORD || "chaq";
@@ -210,7 +245,10 @@ async function startRedis(env) {
   }
 
   console.log(`[Chaq] Starting Redis with Docker Compose on 127.0.0.1:${redisPort}`);
-  run("docker", ["compose", "up", "-d", "redis"]);
+  fs.mkdirSync(dockerConfig, { recursive: true });
+  run("docker", ["compose", "up", "-d", "redis"], {
+    env: { DOCKER_CONFIG: process.env.DOCKER_CONFIG || dockerConfig }
+  });
   await waitForPort(redisPort, "Redis");
 }
 
@@ -221,7 +259,11 @@ async function main() {
   await startRedis(values);
 }
 
-main().catch((error) => {
-  console.error(`[ERROR] ${error instanceof Error ? error.message : String(error)}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`[ERROR] ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  });
+}
+
+module.exports = { pathDirectories, postgresBinIsComplete, resolvePostgresBin };

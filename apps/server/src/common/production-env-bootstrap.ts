@@ -7,6 +7,7 @@ type ProductionValidationResult = {
 };
 
 type ProductionEnvironmentValidator = {
+  assertLocalPreviewEnv: (env: NodeJS.ProcessEnv) => ProductionValidationResult;
   assertProductionEnv: (env: NodeJS.ProcessEnv) => ProductionValidationResult;
 };
 
@@ -32,7 +33,9 @@ export function assertProductionEnvironmentOnBootstrap(
   const validatorPath = findValidatorPath();
   const validator = require(validatorPath) as ProductionEnvironmentValidator;
   try {
-    const result = validator.assertProductionEnv(env);
+    const result = env.CHAQ_RUNTIME_PROFILE === "local-preview"
+      ? validator.assertLocalPreviewEnv(env)
+      : validator.assertProductionEnv(env);
     for (const warning of result.warnings) warn(`[env:warn] ${warning}`);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);

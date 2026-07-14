@@ -9,6 +9,7 @@ coverage
 node_modules
 apps/desktop/out
 apps/desktop/release
+apps/desktop/release-preview
 apps/server/dist
 packages/shared/dist
 *.log

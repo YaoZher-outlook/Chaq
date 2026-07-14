@@ -2,6 +2,7 @@ node_modules/
 dist/
 out/
 release/
+release-preview/
 .vite/
 .turbo/
 .cache/

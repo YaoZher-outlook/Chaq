@@ -36,7 +36,8 @@ function loadEnvironment(argv = process.argv.slice(2), baseEnvironment = process
   };
 }
 
-function validateProductionEnv(env) {
+function validateEnvironment(env, options = {}) {
+  const localPreview = options.localPreview === true;
   const errors = [];
   const warnings = [];
 
@@ -123,7 +124,7 @@ function validateProductionEnv(env) {
       warnings.push("DATABASE_URL uses a short password; use a long random password outside local-only deployments.");
     }
   }
-  url("REDIS_URL", ["redis:", "rediss:"]);
+  const redis = url("REDIS_URL", ["redis:", "rediss:"]);
 
   const origins = required("CLIENT_ORIGIN").split(",").map((item) => item.trim()).filter(Boolean);
   for (const origin of origins) {
@@ -158,23 +159,36 @@ function validateProductionEnv(env) {
     errors.push("MODEL_SECRET_KEY and SESSION_HASH_SECRET must be different secrets.");
   }
 
-  const smtpHost = required("SMTP_HOST");
-  const smtpUser = required("SMTP_USER");
-  const smtpPass = required("SMTP_PASS");
-  const smtpFrom = required("SMTP_FROM");
-  for (const [name, current] of [["SMTP_HOST", smtpHost], ["SMTP_USER", smtpUser], ["SMTP_PASS", smtpPass], ["SMTP_FROM", smtpFrom]]) {
-    rejectPlaceholder(name, current);
-  }
-  port("SMTP_PORT", 465);
-  const smtpSecure = value("SMTP_SECURE") || "1";
-  const smtpStartTls = value("SMTP_STARTTLS") || "0";
-  if (!["0", "1"].includes(smtpSecure)) errors.push("SMTP_SECURE must be 0 or 1.");
-  if (!["0", "1"].includes(smtpStartTls)) errors.push("SMTP_STARTTLS must be 0 or 1.");
-  if (smtpSecure === "0" && smtpStartTls === "0") {
-    errors.push("SMTP must use either implicit TLS or STARTTLS in production.");
+  const runtimeProfile = value("CHAQ_RUNTIME_PROFILE");
+  const mailMode = value("CHAQ_MAIL_MODE");
+  if (localPreview) {
+    if (runtimeProfile !== "local-preview") errors.push("CHAQ_RUNTIME_PROFILE must be local-preview.");
+    if (mailMode !== "log") errors.push("CHAQ_MAIL_MODE must be log in local preview.");
+    for (const name of ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "SMTP_FROM"]) {
+      if (value(name)) errors.push(`${name} must be empty in local preview.`);
+    }
+    warnings.push("Local preview mail delivery writes verification codes to the project API log.");
+  } else {
+    if (runtimeProfile === "local-preview") errors.push("Local preview profile is not valid for a formal production environment.");
+    if (mailMode === "log") errors.push("CHAQ_MAIL_MODE=log is not allowed in formal production.");
+    const smtpHost = required("SMTP_HOST");
+    const smtpUser = required("SMTP_USER");
+    const smtpPass = required("SMTP_PASS");
+    const smtpFrom = required("SMTP_FROM");
+    for (const [name, current] of [["SMTP_HOST", smtpHost], ["SMTP_USER", smtpUser], ["SMTP_PASS", smtpPass], ["SMTP_FROM", smtpFrom]]) {
+      rejectPlaceholder(name, current);
+    }
+    port("SMTP_PORT", 465);
+    const smtpSecure = value("SMTP_SECURE") || "1";
+    const smtpStartTls = value("SMTP_STARTTLS") || "0";
+    if (!["0", "1"].includes(smtpSecure)) errors.push("SMTP_SECURE must be 0 or 1.");
+    if (!["0", "1"].includes(smtpStartTls)) errors.push("SMTP_STARTTLS must be 0 or 1.");
+    if (smtpSecure === "0" && smtpStartTls === "0") {
+      errors.push("SMTP must use either implicit TLS or STARTTLS in production.");
+    }
   }
 
-  required("SERVER_HOST");
+  const serverHost = required("SERVER_HOST");
   port("SERVER_PORT", 24537);
   const trustProxy = value("TRUST_PROXY");
   if (trustProxy.toLowerCase() === "true") {
@@ -198,7 +212,37 @@ function validateProductionEnv(env) {
     positiveInteger("PAYMENT_ORDER_EXPIRES_MINUTES", 1440);
   }
 
+  if (localPreview) {
+    if (!isLoopbackHostname(serverHost)) errors.push("SERVER_HOST must be a loopback host in local preview.");
+    if (database && !isLoopbackHostname(database.hostname)) errors.push("DATABASE_URL must use a loopback host in local preview.");
+    if (redis && !isLoopbackHostname(redis.hostname)) errors.push("REDIS_URL must use a loopback host in local preview.");
+    if (publicApi && !isLoopbackHostname(publicApi.hostname)) errors.push("PUBLIC_API_URL must use a loopback host in local preview.");
+    if (origins.some((origin) => {
+      try {
+        return !isLoopbackHostname(new URL(origin).hostname);
+      } catch {
+        return true;
+      }
+    })) {
+      errors.push("CLIENT_ORIGIN must contain only loopback origins in local preview.");
+    }
+    if (trustProxy) errors.push("TRUST_PROXY must be empty in local preview.");
+    if (value("PAYMENT_ACCOUNT_NUMBER")) errors.push("Payments must remain disabled in local preview.");
+  }
+
   return { errors: [...new Set(errors)], warnings: [...new Set(warnings)] };
+}
+
+function isLoopbackHostname(hostname) {
+  return ["127.0.0.1", "localhost", "::1", "[::1]"].includes(String(hostname || "").trim().toLowerCase());
+}
+
+function validateProductionEnv(env) {
+  return validateEnvironment(env, { localPreview: false });
+}
+
+function validateLocalPreviewEnv(env) {
+  return validateEnvironment(env, { localPreview: true });
 }
 
 function assertProductionEnv(env) {
@@ -206,6 +250,18 @@ function assertProductionEnv(env) {
   if (result.errors.length) {
     const error = new Error(
       `Production environment validation failed with ${result.errors.length} error(s): ${result.errors.join(" ")}`
+    );
+    error.validationResult = result;
+    throw error;
+  }
+  return result;
+}
+
+function assertLocalPreviewEnv(env) {
+  const result = validateLocalPreviewEnv(env);
+  if (result.errors.length) {
+    const error = new Error(
+      `Local preview environment validation failed with ${result.errors.length} error(s): ${result.errors.join(" ")}`
     );
     error.validationResult = result;
     throw error;
@@ -222,16 +278,24 @@ function main() {
     process.exit(1);
   }
 
-  const result = validateProductionEnv(loaded.env);
+  const localPreview = process.argv.includes("--local-preview");
+  const result = localPreview ? validateLocalPreviewEnv(loaded.env) : validateProductionEnv(loaded.env);
   for (const warning of result.warnings) console.warn(`[env:warn] ${warning}`);
   if (result.errors.length) {
     for (const error of result.errors) console.error(`[env:error] ${error}`);
-    console.error(`[env:error] Production environment validation failed with ${result.errors.length} error(s).`);
+    console.error(`[env:error] ${localPreview ? "Local preview" : "Production"} environment validation failed with ${result.errors.length} error(s).`);
     process.exit(1);
   }
-  console.log(`[env] Production environment is valid (${loaded.source}).`);
+  console.log(`[env] ${localPreview ? "Local preview" : "Production"} environment is valid (${loaded.source}).`);
 }
 
 if (require.main === module) main();
 
-module.exports = { assertProductionEnv, loadEnvironment, parseEnv, validateProductionEnv };
+module.exports = {
+  assertLocalPreviewEnv,
+  assertProductionEnv,
+  loadEnvironment,
+  parseEnv,
+  validateLocalPreviewEnv,
+  validateProductionEnv
+};
