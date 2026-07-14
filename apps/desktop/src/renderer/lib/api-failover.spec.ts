@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { api, getServerUrl } from "./api";
+import { api, getServerUrl, selectAuthenticatedServerCandidates } from "./api";
 
 const PRIMARY_SERVER = "https://primary.example.test/api";
 const OTHER_SERVER = "https://other.example.test/api";
@@ -33,6 +33,17 @@ class MemoryStorage implements Storage {
     this.values.set(key, String(value));
   }
 }
+
+test("forced preview URL wins over a stale authenticated server affinity", () => {
+  assert.deepEqual(
+    selectAuthenticatedServerCandidates(
+      ["http://127.0.0.1:24538/api"],
+      "https://old-public.example.test/api",
+      true
+    ),
+    ["http://127.0.0.1:24538/api"]
+  );
+});
 
 function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {

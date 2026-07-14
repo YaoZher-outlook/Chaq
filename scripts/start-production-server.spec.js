@@ -19,11 +19,17 @@ function fixture(platform, overrides = {}) {
   const entry = productionEntry(projectRoot, role, platform);
   const pid = overrides.pid || 4242;
   const startIdentity = overrides.startIdentity || `${platform}:start-100`;
+  const runtimeProfile = overrides.runtimeProfile || "standard";
+  const port = overrides.port || 24538;
+  const requiredArgs = [
+    `--chaq-runtime-profile=${runtimeProfile}`,
+    `--chaq-runtime-port=${port}`
+  ];
   const identity = {
     pid,
     executable,
-    commandLine: `"${executable}" "${entry}"`,
-    argv: [executable, entry],
+    commandLine: `"${executable}" "${entry}" ${requiredArgs.join(" ")}`,
+    argv: [executable, entry, ...requiredArgs],
     startIdentity,
     ...overrides.identity
   };
@@ -33,12 +39,24 @@ function fixture(platform, overrides = {}) {
     role,
     projectRoot,
     entry,
+    runtimeProfile,
+    port,
     executable,
     startIdentity,
     recordedAt: "2026-07-13T00:00:00.000Z",
     ...overrides.record
   };
-  const options = { platform, projectRoot, role, executablePath: executable, label: `production ${role}` };
+  const options = {
+    platform,
+    projectRoot,
+    role,
+    executablePath: executable,
+    label: `production ${role}`,
+    runtimeProfile,
+    port,
+    requiredArgs,
+    exclusiveArgPrefixes: ["--chaq-runtime-profile=", "--chaq-runtime-port="]
+  };
   return { identity, options, record };
 }
 
@@ -128,12 +146,26 @@ test("command matching requires the exact executable and absolute role entry", (
   assert.equal(isExpectedProjectProcess({ ...identity, commandLine: identity.executable, argv: [identity.executable] }, options), false);
   assert.equal(isExpectedProjectProcess({ ...identity, argv: [identity.executable, `${identity.argv[1]}.other`] }, options), false);
   assert.equal(isExpectedProjectProcess({ ...identity, executable: "Y:\\other\\node.exe" }, options), false);
+  assert.equal(isExpectedProjectProcess({
+    ...identity,
+    argv: identity.argv.map((arg) => arg === "--chaq-runtime-profile=standard" ? "--chaq-runtime-profile=local-preview" : arg)
+  }, options), false);
+  assert.equal(isExpectedProjectProcess({
+    ...identity,
+    argv: identity.argv.map((arg) => arg === "--chaq-runtime-port=24538" ? "--chaq-runtime-port=24539" : arg)
+  }, options), false);
+  assert.equal(isExpectedProjectProcess({
+    ...identity,
+    argv: [...identity.argv, "--chaq-runtime-profile=local-preview"]
+  }, options), false);
 });
 
 test("managed identity assessment rejects every mismatched ownership field", () => {
   const { identity, options, record } = fixture("linux");
   const unsafe = [
     [{ ...record, role: "worker" }, identity, /role/],
+    [{ ...record, runtimeProfile: "local-preview" }, identity, /runtime profile/],
+    [{ ...record, port: 24539 }, identity, /runtime port/],
     [{ ...record, projectRoot: "/srv/other" }, identity, /project root/],
     [{ ...record, entry: "/srv/other/main.js" }, identity, /entry/],
     [record, null, /does not exist/],

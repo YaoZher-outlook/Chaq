@@ -71,9 +71,15 @@ test("local preview accepts log mail only when every service is loopback-only", 
 
 test("formal production never accepts the local preview mail escape hatch", () => {
   const result = validateProductionEnv(validPreviewEnvironment());
-  assert.ok(result.errors.some((error) => error.includes("Local preview profile")));
-  assert.ok(result.errors.some((error) => error.includes("CHAQ_MAIL_MODE=log")));
+  assert.ok(result.errors.some((error) => error.includes("CHAQ_RUNTIME_PROFILE")));
+  assert.ok(result.errors.some((error) => error.includes("CHAQ_MAIL_MODE")));
   assert.ok(result.errors.some((error) => error.includes("SMTP_HOST is required")));
+});
+
+test("formal production rejects unknown runtime profiles", () => {
+  const env = validEnvironment();
+  env.CHAQ_RUNTIME_PROFILE = "mystery";
+  assert.ok(validateProductionEnv(env).errors.some((error) => error.includes("empty or standard")));
 });
 
 test("local preview rejects remote exposure, proxy trust, payment and SMTP inheritance", () => {

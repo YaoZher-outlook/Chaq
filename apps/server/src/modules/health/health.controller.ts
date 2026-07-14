@@ -15,6 +15,7 @@ export class HealthController {
       status: "ok",
       service: "chaq-api",
       mode: process.env.NODE_ENV || "development",
+      profile: process.env.CHAQ_RUNTIME_PROFILE || "standard",
       host: process.env.SERVER_HOST || "127.0.0.1",
       time: new Date().toISOString()
     };
@@ -31,6 +32,7 @@ export class HealthController {
         redis: "ready",
         queue,
         mode: process.env.NODE_ENV || "development",
+        profile: process.env.CHAQ_RUNTIME_PROFILE || "standard",
         host: process.env.SERVER_HOST || "127.0.0.1",
         time: new Date().toISOString()
       };

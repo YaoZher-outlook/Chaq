@@ -11,10 +11,9 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "prepackage": "node ../../scripts/ensure-electron-runtime.js",
-    "package": "node ../../scripts/run-electron-builder.js --dir -c.win.signAndEditExecutable=false",
-    "predist": "node ../../scripts/ensure-electron-runtime.js",
-    "dist": "node ../../scripts/run-electron-builder.js"
+    "package": "node ../../scripts/ensure-electron-runtime.js && npm run build && node ../../scripts/run-electron-builder.js --dir -c.win.signAndEditExecutable=false",
+    "package:preview": "node ../../scripts/package-preview-client.js",
+    "dist": "node ../../scripts/ensure-electron-runtime.js && npm run build && node ../../scripts/run-electron-builder.js"
   },
   "dependencies": {
     "sql.js": "^1.12.0"

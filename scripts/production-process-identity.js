@@ -55,6 +55,16 @@ function isExpectedProjectProcess(identity, options) {
   if (argv.length < 2) return false;
   if (normalizeIdentityPath(argv[1], platform) !== normalizeIdentityPath(expectedEntry, platform)) return false;
 
+  const requiredArgs = Array.isArray(options.requiredArgs) ? options.requiredArgs.map(String) : [];
+  if (requiredArgs.some((arg) => !argv.includes(arg))) return false;
+  const exclusiveArgPrefixes = Array.isArray(options.exclusiveArgPrefixes)
+    ? options.exclusiveArgPrefixes.map(String)
+    : [];
+  for (const prefix of exclusiveArgPrefixes) {
+    const matches = argv.filter((arg) => arg.startsWith(prefix));
+    if (matches.length !== 1 || !requiredArgs.includes(matches[0])) return false;
+  }
+
   const expectedExecutable = options.executablePath || process.execPath;
   const actualExecutable = identity.executable || argv[0];
   return normalizeIdentityPath(actualExecutable, platform) === normalizeIdentityPath(expectedExecutable, platform);
@@ -66,6 +76,12 @@ function assessManagedProcess(record, identity, options) {
     || productionEntry(options.projectRoot, options.role, platform);
   if (!record || record.version !== 1) return { safe: false, reason: "legacy or invalid pid record" };
   if (record.role !== options.role) return { safe: false, reason: "pid role does not match" };
+  if (options.runtimeProfile != null && record.runtimeProfile !== options.runtimeProfile) {
+    return { safe: false, reason: "pid runtime profile does not match" };
+  }
+  if (options.port != null && record.port !== options.port) {
+    return { safe: false, reason: "pid runtime port does not match" };
+  }
   if (normalizeIdentityPath(record.projectRoot, platform) !== normalizeIdentityPath(options.projectRoot, platform)) {
     return { safe: false, reason: "pid project root does not match" };
   }

@@ -20,26 +20,30 @@ See [Agent runtime](docs/agent-runtime.md), [architecture](docs/architecture.md)
 
 ## Local Start
 
-Requirements: Node.js 22.12+, npm 11.18.0 (the version pinned in `package.json`), PostgreSQL binaries available under the repository-relative `.chaq-data\postgresql\bin` directory (or configured with `CHAQ_PG_BIN`), and Docker Desktop for Redis.
+Requirements: Node.js 22.12+, npm 11.18.0 (the version pinned in `package.json`), PostgreSQL binaries available under the repository-relative `.chaq-data\postgresql\bin` directory, through `CHAQ_PG_BIN`, or on `PATH`, and Docker Desktop for Redis when Redis is not already running.
 
 On Windows, use:
 
 ```bat
+tools\start-preview.bat
 tools\start-server-dev.bat
 tools\start-server-prod.bat
 tools\start-client.bat
 ```
 
-Start the server first. `start-server-dev.bat` prepares the environment, starts PostgreSQL and Redis, applies migrations, explicitly enables the idempotent demo seed for that one initialization step, then launches both the NestJS API and Agent worker in watch mode on `127.0.0.1:24537`. `start-server-prod.bat` builds and starts the production API and Agent worker on `0.0.0.0:24538`, manages them in the background, and mirrors output into `.logs`. `start-client.bat` launches the packaged Electron desktop app and rebuilds it when desktop source files are newer than the packaged executable.
+For the fastest complete preview, double-click `start-preview.bat`; `start-client.bat` is a compatibility alias for the same flow. It ignores machine-level Chaq path overrides so configuration, data and caches stay under this repository, creates an isolated `.chaq-data\preview.env`, starts project-local PostgreSQL and Redis, applies migrations, builds and starts the API plus Agent worker with production code on `127.0.0.1:24538`, creates an idempotent preview administrator, verifies login, builds a fingerprinted localhost-only client under `apps\desktop\release-preview`, and launches it. The generated login is printed in the launcher window. Use `tools\status-preview.bat` and `tools\stop-preview.bat` to inspect or stop the background services.
 
-There are two server modes:
+`start-server-dev.bat` prepares the development environment, starts PostgreSQL and Redis, applies migrations, explicitly enables the idempotent demo seed for that one initialization step, then launches both the NestJS API and Agent worker in watch mode on `127.0.0.1:24537`. `start-server-prod.bat` is reserved for a completed formal production environment, starts the production API and Agent worker on `0.0.0.0:24538`, manages them in the background, and mirrors output into `.logs`.
+
+There are three server profiles:
 
 - Development server: `tools\start-server-dev.bat`, binding the API to `127.0.0.1:24537`.
+- Local production preview: `tools\start-preview.bat`, using production builds but strictly limited to `127.0.0.1:24538`; verification mail is written to `.logs\api-prod.log` and payment remains disabled.
 - Production server: `tools\start-server-prod.bat`, binding the API to `0.0.0.0:24538` so Cloudflare Tunnel, a reverse proxy, or another machine can reach it.
 
 For the live Chaq domain, point Cloudflared hostname `chaq.yaozher.com` to service `http://127.0.0.1:24538`. Do not include `/api` in the Cloudflared service target; the API prefix is handled by the server, so the public API URL is `https://chaq.yaozher.com/api`.
 
-The development launcher keeps its console window open while the API and Agent worker are running. The production launcher manages API and worker pids in `.logs\pids`; use `node scripts\start-production-server.js --stop` to stop them. Running a launcher again while Chaq is already healthy exits successfully instead of starting duplicate API or worker processes. A port owned by a non-Chaq process is still reported as a real conflict.
+The development launcher keeps its console window open while the API and Agent worker are running. Preview and production launchers manage API and worker pids in `.logs\pids`. Preview and formal production intentionally cannot replace or stop each other's runtime profile. Running a launcher again safely restarts its own managed profile; a port owned by another profile or a non-Chaq process is reported as a conflict.
 
 Default ports:
 
@@ -148,6 +152,8 @@ docker compose --env-file .env.production -f docker-compose.production.yml up -d
 ```
 
 `MODEL_SECRET_KEY` is mandatory in production and encrypts provider credentials with AES-256-GCM. Both the API and Agent worker validate the production environment inside their own bootstrap and fail before creating a NestJS container when configuration is invalid, including when launched without the provided wrapper. Put the API behind TLS and set `CLIENT_ORIGIN` to the exact desktop/web origin allowed by CORS. See [deployment](docs/deployment.md) before exposing the service publicly.
+
+The `local-preview` profile is not an Internet deployment shortcut. Its validator requires loopback API, PostgreSQL, Redis and client origins, rejects proxy trust and payment configuration, and permits log-only verification mail solely for local UI review. Formal production continues to require encrypted SMTP and all production secrets.
 
 For a self-hosted Windows production server, run `tools\start-server-prod.bat` and route Cloudflared to `http://127.0.0.1:24538`. Packaged desktop builds default to `https://chaq.yaozher.com/api`; local API fallbacks are used only in development or when `VITE_ALLOW_LOCAL_API_FALLBACK=1` is set.
 

@@ -78,6 +78,7 @@ const RESOLVED_SERVER_URL_KEY = "chaq.resolvedServerUrl";
 const AUTHENTICATED_SERVER_URL_KEY = "chaq.authenticatedServerUrl";
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "0.0.0.0", "::1", "[::1]"]);
 const RENDERER_ENV = import.meta.env ?? {};
+const FORCE_CONFIGURED_SERVER_URL = RENDERER_ENV.VITE_FORCE_SERVER_URL === "1";
 const REQUEST_TIMEOUT_MS = positiveNumber(RENDERER_ENV.VITE_REQUEST_TIMEOUT_MS, 15_000);
 const HEALTH_TIMEOUT_MS = positiveNumber(RENDERER_ENV.VITE_HEALTH_TIMEOUT_MS, 5_000);
 
@@ -149,6 +150,7 @@ function uniqueUrls(urls: Array<string | null>): string[] {
 
 function getServerCandidates(): string[] {
   const defaults = defaultServerUrls();
+  if (FORCE_CONFIGURED_SERVER_URL) return defaults.slice(0, 1);
   const stored = normalizeUsableServerUrl(localStorage.getItem("chaq.serverUrl"));
   const customStored = stored && !defaults.includes(stored) ? stored : null;
   return uniqueUrls([
@@ -179,15 +181,26 @@ function requestServerCandidates(
       ?? normalizeUsableServerUrl(sessionStorage.getItem(RESOLVED_SERVER_URL_KEY))
     : null;
 
+  if (FORCE_CONFIGURED_SERVER_URL || authenticatedAffinity) {
+    return selectAuthenticatedServerCandidates(candidates, authenticatedAffinity, FORCE_CONFIGURED_SERVER_URL);
+  }
+
   // Never spray a session credential across candidate services. Once a server
   // succeeds for the session, it remains the session's only destination.
-  if (authenticatedAffinity) return [authenticatedAffinity];
-
   const method = requestMethod(init);
   const mayFailOver = !sessionToken
     && !security.containsUnauthenticatedSecrets
     && (method === "GET" || method === "HEAD");
   return mayFailOver ? candidates : candidates.slice(0, 1);
+}
+
+export function selectAuthenticatedServerCandidates(
+  candidates: string[],
+  authenticatedAffinity: string | null,
+  forceConfiguredServer: boolean
+): string[] {
+  if (forceConfiguredServer) return candidates.slice(0, 1);
+  return authenticatedAffinity ? [authenticatedAffinity] : candidates;
 }
 
 export function getServerUrl(): string {

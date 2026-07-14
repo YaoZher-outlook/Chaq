@@ -13,6 +13,8 @@ test("local preview environment is loopback-only and preserves generated credent
   assert.equal(first.CHAQ_MAIL_MODE, "log");
   assert.equal(first.SERVER_HOST, "127.0.0.1");
   assert.match(first.PUBLIC_API_URL, /^http:\/\/127\.0\.0\.1:24538\/api$/);
+  assert.match(first.DATABASE_URL, /\/chaq_preview\?schema=public$/);
+  assert.equal(first.REDIS_URL, "redis://127.0.0.1:46379/1");
   assert.equal(first.TRUST_PROXY, "");
   assert.equal(first.PAYMENT_ACCOUNT_NUMBER, "");
   assert.equal(second.MODEL_SECRET_KEY, first.MODEL_SECRET_KEY);

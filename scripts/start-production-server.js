@@ -3,6 +3,17 @@ const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
+
+const root = path.resolve(__dirname, "..");
+const localPreview = process.argv.includes("--local-preview") || process.argv.includes("--preview");
+if (localPreview) {
+  // A preview is self-contained by definition. Machine-level path overrides
+  // must never redirect generated configuration or service data elsewhere.
+  delete process.env.CHAQ_ENV_ROOT;
+  delete process.env.CHAQ_ENV_FILE;
+  delete process.env.DOCKER_CONFIG;
+}
+
 const { previewEnv, serverEnv, projectLogs } = require("./env-paths");
 const {
   assessManagedProcess,
@@ -15,8 +26,6 @@ const {
   stopManagedProcessRecord
 } = require("./production-process-identity");
 
-const root = path.resolve(__dirname, "..");
-const localPreview = process.argv.includes("--local-preview") || process.argv.includes("--preview");
 const publicBind = process.argv.includes("--public");
 const skipBuild = process.argv.includes("--skip-build");
 const statusOnly = process.argv.includes("--status");
@@ -24,12 +33,20 @@ const stopOnly = process.argv.includes("--stop");
 const restart = process.argv.includes("--restart");
 const foreground = process.argv.includes("--foreground");
 const host = localPreview ? "127.0.0.1" : publicBind ? "0.0.0.0" : "127.0.0.1";
-const port = Number(process.env.CHAQ_PROD_SERVER_PORT || process.env.SERVER_PORT || 24538);
+const port = localPreview ? 24538 : Number(process.env.CHAQ_PROD_SERVER_PORT || process.env.SERVER_PORT || 24538);
+const runtimeProfile = localPreview ? "local-preview" : "standard";
+const runtimeMarkerArgs = [
+  `--chaq-runtime-profile=${runtimeProfile}`,
+  `--chaq-runtime-port=${port}`
+];
+const runtimeMarkerPrefixes = ["--chaq-runtime-profile=", "--chaq-runtime-port="];
 const defaultPublicApiUrl = "https://chaq.yaozher.com/api";
 const defaultClientOrigin = "https://chaq.yaozher.com";
 const pidDir = path.join(projectLogs, "pids");
-const apiPidFile = path.join(pidDir, `api-${port}.pid`);
-const workerPidFile = path.join(pidDir, `worker-${port}.pid`);
+const apiPidFile = path.join(pidDir, `api-${runtimeProfile}-${port}.pid`);
+const workerPidFile = path.join(pidDir, `worker-${runtimeProfile}-${port}.pid`);
+const apiLogName = localPreview ? "api-preview.log" : "api-prod.log";
+const workerLogName = localPreview ? "worker-preview.log" : "worker-prod.log";
 const productionEntries = {
   api: path.join(root, "apps", "server", "dist", "src", "main.js"),
   worker: path.join(root, "apps", "server", "dist", "src", "worker.js")
@@ -236,6 +253,8 @@ function createPidRecord(pid, role, identity, projectRoot = root) {
     role,
     projectRoot,
     entry: productionEntry(projectRoot, role),
+    runtimeProfile,
+    port,
     executable: identity.executable || process.execPath,
     startIdentity: identity.startIdentity,
     recordedAt: new Date().toISOString()
@@ -283,7 +302,9 @@ function findProjectNodeProcesses(role) {
   return identities.filter((identity) => isExpectedProjectProcess(identity, {
     projectRoot: root,
     role,
-    executablePath: process.execPath
+    executablePath: process.execPath,
+    requiredArgs: runtimeMarkerArgs,
+    exclusiveArgPrefixes: runtimeMarkerPrefixes
   }));
 }
 
@@ -298,7 +319,11 @@ function managedPidFileRunning(file, role) {
   const assessment = assessManagedProcess(record, identity, {
     projectRoot: root,
     role,
-    executablePath: process.execPath
+    executablePath: process.execPath,
+    runtimeProfile,
+    port,
+    requiredArgs: runtimeMarkerArgs,
+    exclusiveArgPrefixes: runtimeMarkerPrefixes
   });
   if (assessment.safe) return true;
   console.log(`[WARN] Ignoring stale ${role} pid file for pid=${record.pid}: ${assessment.reason}.`);
@@ -320,7 +345,12 @@ function ensureProductionWorker(env) {
     run(command("npm"), ["run", "build", "-w", "@chaq/shared"], env);
     run(command("npm"), ["run", "build", "-w", "@chaq/server"], env);
   }
-  const workerPid = startProcess("Chaq production Agent worker", [workerEntry], "worker-prod.log", env);
+  const workerPid = startProcess(
+    `Chaq ${localPreview ? "preview" : "production"} Agent worker`,
+    [workerEntry, ...runtimeMarkerArgs],
+    workerLogName,
+    env
+  );
   writePid(workerPidFile, workerPid, "worker");
 }
 
@@ -343,7 +373,11 @@ function stopManagedPidFile(file, role, label) {
     projectRoot: root,
     role,
     label,
-    executablePath: process.execPath
+    executablePath: process.execPath,
+    runtimeProfile,
+    port,
+    requiredArgs: runtimeMarkerArgs,
+    exclusiveArgPrefixes: runtimeMarkerPrefixes
   }, {
     inspect: (pid) => getProcessIdentity(pid),
     terminate: (pid, processLabel) => terminateVerifiedPid(pid, processLabel),
@@ -357,7 +391,9 @@ function stopDiscoveredProcess(discoveredIdentity, role, label) {
   const commandMatches = isExpectedProjectProcess(currentIdentity, {
     projectRoot: root,
     role,
-    executablePath: process.execPath
+    executablePath: process.execPath,
+    requiredArgs: runtimeMarkerArgs,
+    exclusiveArgPrefixes: runtimeMarkerPrefixes
   });
   const sameStart = Boolean(
     discoveredIdentity.startIdentity
@@ -419,8 +455,15 @@ async function assertPortAvailableOrReady() {
   const status = await readReady();
   if (status.ready) {
     const mode = status.data && typeof status.data.mode === "string" ? status.data.mode : "unknown";
+    const profile = status.data && typeof status.data.profile === "string" ? status.data.profile : "standard";
     if (mode !== "production" && mode !== "unknown") {
       throw new Error(`Port ${port} already has a Chaq API in ${mode} mode. Stop that process before starting production.`);
+    }
+    if (localPreview && profile !== "local-preview") {
+      throw new Error(`Port ${port} already has a standard production API. Refusing to replace it with local preview.`);
+    }
+    if (!localPreview && profile === "local-preview") {
+      throw new Error(`Port ${port} already has a local preview API. Stop it with tools\\stop-preview.bat first.`);
     }
     console.log(`[Chaq] API is already ready on http://127.0.0.1:${port}/api.`);
     if (mode === "unknown") {
@@ -526,28 +569,34 @@ function keepForegroundAlive(children) {
 
 async function printStatus() {
   const status = await readReady();
+  const reportedProfile = status.data?.profile || "standard";
+  const readyForProfile = status.ready && reportedProfile === runtimeProfile;
   const apiPid = readPid(apiPidFile);
   const workerPid = readPid(workerPidFile);
   const listenerPid = findListeningPid(port);
   const scannedApiPids = findProjectNodePids("main.js");
   const scannedWorkerPids = findProjectNodePids("worker.js");
   console.log(`[Chaq] Production port: ${port}`);
-  console.log(`[Chaq] API ready: ${status.ready ? "yes" : "no"}`);
+  console.log(`[Chaq] API ready: ${readyForProfile ? "yes" : "no"}`);
   if (status.data) {
     console.log(`[Chaq] API mode: ${status.data.mode || "unknown"}; host: ${status.data.host || "unknown"}`);
+    console.log(`[Chaq] Runtime profile: ${reportedProfile}`);
     console.log(`[Chaq] Database: ${status.data.database || "unknown"}; Redis: ${status.data.redis || "unknown"}`);
+  }
+  if (status.ready && !readyForProfile) {
+    console.log(`[WARN] Port ${port} is ready for runtime profile ${reportedProfile}, not ${runtimeProfile}.`);
   }
   console.log(`[Chaq] API pid file: ${apiPid ?? "missing"}${apiPid ? ` (${processExists(apiPid) ? "running" : "stale"})` : ""}`);
   console.log(`[Chaq] Worker pid file: ${workerPid ?? "missing"}${workerPid ? ` (${processExists(workerPid) ? "running" : "stale"})` : ""}`);
   console.log(`[Chaq] Listening pid on ${port}: ${listenerPid ?? "none"}`);
   if (scannedApiPids.length) console.log(`[Chaq] Project production API pids: ${scannedApiPids.join(", ")}`);
   if (scannedWorkerPids.length) console.log(`[Chaq] Project production worker pids: ${scannedWorkerPids.join(", ")}`);
-  if (status.ready && (!apiPid || !workerPid) && !scannedWorkerPids.length) {
+  if (readyForProfile && (!apiPid || !workerPid) && !scannedWorkerPids.length) {
     console.log("[WARN] Production API is ready, but pid files are missing. This process was probably started by an older launcher.");
     console.log("[WARN] Close old production node processes once, then run tools\\start-server-prod.bat to adopt the managed startup scheme.");
   }
-  console.log(`[Chaq] Logs: ${path.join(projectLogs, "api-prod.log")} ; ${path.join(projectLogs, "worker-prod.log")}`);
-  return status.ready;
+  console.log(`[Chaq] Logs: ${path.join(projectLogs, apiLogName)} ; ${path.join(projectLogs, workerLogName)}`);
+  return readyForProfile;
 }
 
 async function stopProduction() {
@@ -560,26 +609,36 @@ async function stopProduction() {
   if (listenerPid && status.ready && status.data?.mode !== "production") {
     throw new Error(`Port ${port} is used by a ${status.data?.mode || "non-production"} Chaq API. Refusing to stop it as production.`);
   }
-  const pidFilePids = new Set([apiRecord?.pid, workerRecord?.pid].filter(Boolean));
-  const seen = new Set(pidFilePids);
+  if (listenerPid && status.ready) {
+    const profile = status.data?.profile || "standard";
+    if (localPreview && profile !== "local-preview") {
+      throw new Error(`Port ${port} is used by a standard production API. Refusing to stop it as local preview.`);
+    }
+    if (!localPreview && profile === "local-preview") {
+      throw new Error(`Port ${port} is used by local preview. Refusing to stop it as formal production.`);
+    }
+  }
+  const seen = new Set();
   let candidates = 0;
 
   if (workerRecord) {
     candidates += 1;
-    stopManagedPidFile(workerPidFile, "worker", "production Agent worker");
+    const result = stopManagedPidFile(workerPidFile, "worker", `${localPreview ? "preview" : "production"} Agent worker`);
+    if (result.stopped) seen.add(workerRecord.pid);
   } else {
     removePid(workerPidFile);
   }
   if (apiRecord) {
     candidates += 1;
-    stopManagedPidFile(apiPidFile, "api", "production API");
+    const result = stopManagedPidFile(apiPidFile, "api", `${localPreview ? "preview" : "production"} API`);
+    if (result.stopped) seen.add(apiRecord.pid);
   } else {
     removePid(apiPidFile);
   }
 
   const discovered = [
-    ...scannedWorkerProcesses.map((identity) => ({ identity, role: "worker", label: "production Agent worker" })),
-    ...scannedApiProcesses.map((identity) => ({ identity, role: "api", label: "production API" }))
+    ...scannedWorkerProcesses.map((identity) => ({ identity, role: "worker", label: `${localPreview ? "preview" : "production"} Agent worker` })),
+    ...scannedApiProcesses.map((identity) => ({ identity, role: "api", label: `${localPreview ? "preview" : "production"} API` }))
   ];
   if (listenerPid && status.ready && !seen.has(listenerPid)) {
     const listenerIdentity = getProcessIdentity(listenerPid);
@@ -604,7 +663,10 @@ async function stopProduction() {
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  console.log(`[WARN] Port ${port} is still reachable after stop. Check .logs\\api-prod.log and .logs\\worker-prod.log for details.`);
+  throw new Error(
+    `Port ${port} is still reachable after stop. `
+    + `Check .logs\\${apiLogName} and .logs\\${workerLogName} for details.`
+  );
 }
 
 async function waitForReady() {
@@ -617,9 +679,18 @@ async function waitForReady() {
   throw new Error(`Chaq API did not become ready on http://127.0.0.1:${port}/api within 90 seconds.`);
 }
 
+function assertManagedWorkerRunning() {
+  if (!productionWorkerRunning()) {
+    throw new Error(`Chaq ${localPreview ? "preview" : "production"} Agent worker exited during startup. Check .logs\\${workerLogName}.`);
+  }
+}
+
 async function main() {
+  if (localPreview && publicBind) {
+    throw new Error("--local-preview cannot be combined with --public; preview is loopback-only.");
+  }
   if (statusOnly) {
-    await printStatus();
+    if (!(await printStatus())) process.exitCode = 1;
     return;
   }
   if (stopOnly || restart) {
@@ -628,27 +699,40 @@ async function main() {
   }
 
   ensureEnvironmentFile();
-  const envFile = process.env.CHAQ_ENV_FILE || serverEnv;
+  const envFile = localPreview ? previewEnv : process.env.CHAQ_ENV_FILE || serverEnv;
   const fileEnv = fs.existsSync(envFile) ? parseEnv(fs.readFileSync(envFile, "utf8")) : {};
-  const publicApiUrl = resolvePublicApiUrl(fileEnv);
+  const publicApiUrl = localPreview ? "http://127.0.0.1:24538/api" : resolvePublicApiUrl(fileEnv);
+  const sourceEnv = localPreview ? { ...process.env, ...fileEnv } : { ...fileEnv, ...process.env };
   const env = {
-    ...fileEnv,
-    ...process.env,
+    ...sourceEnv,
     NODE_ENV: "production",
+    CHAQ_RUNTIME_PROFILE: runtimeProfile,
+    CHAQ_ENV_FILE: envFile,
     CHAQ_SERVER_BIND: host,
     CHAQ_PROD_SERVER_PORT: String(port),
     SERVER_HOST: host,
     SERVER_PORT: String(port),
-    CLIENT_ORIGIN: resolveProductionClientOrigin(fileEnv),
+    CLIENT_ORIGIN: localPreview ? "http://127.0.0.1:27337" : resolveProductionClientOrigin(fileEnv),
     PUBLIC_API_URL: publicApiUrl,
-    CHAQ_LOG_DIR: projectLogs
+    CHAQ_LOG_DIR: projectLogs,
+    ...(localPreview ? {
+      CHAQ_MAIL_MODE: "log",
+      CHAQ_ALLOW_DEMO_SEED: "0",
+      TRUST_PROXY: "",
+      PAYMENT_ACCOUNT_NUMBER: "",
+      SMTP_HOST: "",
+      SMTP_USER: "",
+      SMTP_PASS: "",
+      SMTP_FROM: ""
+    } : {})
   };
-  run(process.execPath, ["scripts/validate-production-env.js"], env);
+  run(process.execPath, ["scripts/validate-production-env.js", ...(localPreview ? ["--local-preview"] : [])], env);
 
-  console.log(`[Chaq] Starting production API server and Agent worker (${host}:${port}).`);
+  console.log(`[Chaq] Starting ${localPreview ? "local production preview" : "production"} API server and Agent worker (${host}:${port}).`);
   console.log(`[Chaq] Public API URL: ${publicApiUrl}`);
-  console.log(`[Chaq] Cloudflared service target: http://127.0.0.1:${port}`);
+  if (!localPreview) console.log(`[Chaq] Cloudflared service target: http://127.0.0.1:${port}`);
   if (await assertPortAvailableOrReady()) {
+    ensurePreviewAccount(env);
     ensureProductionWorker(env);
     return;
   }
@@ -660,6 +744,7 @@ async function main() {
   run(command("npm"), ["run", "infra:local"], env);
   ensurePrismaClient(env);
   run(command("npm"), ["exec", "-w", "@chaq/server", "--", "prisma", "migrate", "deploy"], env);
+  ensurePreviewAccount(env);
 
   if (!skipBuild || !fs.existsSync(path.join(root, "apps", "server", "dist", "src", "main.js"))) {
     run(command("npm"), ["run", "build", "-w", "@chaq/shared"], env);
@@ -668,13 +753,26 @@ async function main() {
 
   if (foreground) {
     const children = [
-      startForegroundProcess("Chaq production API", [productionEntries.api], "api-prod.log", env, "api"),
-      startForegroundProcess("Chaq production Agent worker", [productionEntries.worker], "worker-prod.log", env, "worker")
+      startForegroundProcess(
+        `Chaq ${localPreview ? "preview" : "production"} API`,
+        [productionEntries.api, ...runtimeMarkerArgs],
+        apiLogName,
+        env,
+        "api"
+      ),
+      startForegroundProcess(
+        `Chaq ${localPreview ? "preview" : "production"} Agent worker`,
+        [productionEntries.worker, ...runtimeMarkerArgs],
+        workerLogName,
+        env,
+        "worker"
+      )
     ];
     writePid(apiPidFile, children[0].child.pid, "api");
     writePid(workerPidFile, children[1].child.pid, "worker");
     await waitForReady();
-    console.log(`[Chaq] Production API is ready on http://127.0.0.1:${port}/api.`);
+    assertManagedWorkerRunning();
+    console.log(`[Chaq] ${localPreview ? "Local preview" : "Production"} API is ready on http://127.0.0.1:${port}/api.`);
     if (publicBind) {
       console.log(`[Chaq] Public bind is enabled on 0.0.0.0:${port}. Put Cloudflare Tunnel or a TLS reverse proxy in front of it before Internet exposure.`);
     }
@@ -683,12 +781,23 @@ async function main() {
     return;
   }
 
-  const apiPid = startProcess("Chaq production API", [productionEntries.api], "api-prod.log", env);
+  const apiPid = startProcess(
+    `Chaq ${localPreview ? "preview" : "production"} API`,
+    [productionEntries.api, ...runtimeMarkerArgs],
+    apiLogName,
+    env
+  );
   writePid(apiPidFile, apiPid, "api");
-  const workerPid = startProcess("Chaq production Agent worker", [productionEntries.worker], "worker-prod.log", env);
+  const workerPid = startProcess(
+    `Chaq ${localPreview ? "preview" : "production"} Agent worker`,
+    [productionEntries.worker, ...runtimeMarkerArgs],
+    workerLogName,
+    env
+  );
   writePid(workerPidFile, workerPid, "worker");
   await waitForReady();
-  console.log(`[Chaq] Production API is ready on http://127.0.0.1:${port}/api.`);
+  assertManagedWorkerRunning();
+  console.log(`[Chaq] ${localPreview ? "Local preview" : "Production"} API is ready on http://127.0.0.1:${port}/api.`);
   if (publicBind) {
     console.log(`[Chaq] Public bind is enabled on 0.0.0.0:${port}. Put Cloudflare Tunnel or a TLS reverse proxy in front of it before Internet exposure.`);
   }

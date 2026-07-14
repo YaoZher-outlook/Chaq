@@ -23,6 +23,7 @@
     "test:e2e:agent": "node scripts/e2e-agent.js",
     "test:e2e:billing": "node scripts/e2e-agent-contact-billing.js",
     "test:smoke:api": "node scripts/smoke-production-api.js",
+    "test:smoke:preview": "node scripts/smoke-local-preview.js",
     "admin:create": "node scripts/create-admin-user.js",
     "public:check": "node scripts/check-public-api.js",
     "electron:install": "node scripts/install-electron.js",

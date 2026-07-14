@@ -19,7 +19,13 @@ function parseEnv(text) {
     if (index < 1) continue;
     const key = line.slice(0, index).trim();
     let value = line.slice(index + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    if (value.startsWith('"') && value.endsWith('"')) {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        value = value.slice(1, -1);
+      }
+    } else if (value.startsWith("'") && value.endsWith("'")) {
       value = value.slice(1, -1);
     }
     values[key] = value;
@@ -28,12 +34,16 @@ function parseEnv(text) {
 }
 
 function previewValues(existing = {}, createSecret = () => randomBytes(48).toString("base64url")) {
+  const modelSecret = validSecret(existing.MODEL_SECRET_KEY) ? existing.MODEL_SECRET_KEY : createSecret();
+  const sessionSecret = validSecret(existing.SESSION_HASH_SECRET) && existing.SESSION_HASH_SECRET !== modelSecret
+    ? existing.SESSION_HASH_SECRET
+    : createSecret();
   return {
     NODE_ENV: "production",
     CHAQ_RUNTIME_PROFILE: "local-preview",
     CHAQ_MAIL_MODE: "log",
-    DATABASE_URL: "postgresql://chaq:chaq@127.0.0.1:45432/chaq?schema=public",
-    REDIS_URL: "redis://127.0.0.1:46379",
+    DATABASE_URL: "postgresql://chaq:chaq@127.0.0.1:45432/chaq_preview?schema=public",
+    REDIS_URL: "redis://127.0.0.1:46379/1",
     SERVER_PORT: "24538",
     SERVER_HOST: "127.0.0.1",
     CLIENT_ORIGIN: "http://127.0.0.1:27337",
@@ -46,15 +56,15 @@ function previewValues(existing = {}, createSecret = () => randomBytes(48).toStr
     CHAQ_PG_DATA_DIR: postgresData,
     CHAQ_PG_USER: "chaq",
     CHAQ_PG_PASSWORD: "chaq",
-    CHAQ_PG_DATABASE: "chaq",
+    CHAQ_PG_DATABASE: "chaq_preview",
     CHAQ_PG_PORT: "45432",
     CHAQ_PG_SERVICE_NAME: "ChaqPostgreSQL",
     CHAQ_REDIS_PORT: "46379",
     CHAQ_REDIS_DATA_DIR: redisData,
     DOCKER_CONFIG: dockerConfig,
     PAYMENT_ACCOUNT_NUMBER: "",
-    MODEL_SECRET_KEY: validSecret(existing.MODEL_SECRET_KEY) ? existing.MODEL_SECRET_KEY : createSecret(),
-    SESSION_HASH_SECRET: validSecret(existing.SESSION_HASH_SECRET) ? existing.SESSION_HASH_SECRET : createSecret(),
+    MODEL_SECRET_KEY: modelSecret,
+    SESSION_HASH_SECRET: sessionSecret,
     CHAQ_PREVIEW_USERNAME: validUsername(existing.CHAQ_PREVIEW_USERNAME) ? existing.CHAQ_PREVIEW_USERNAME : "preview",
     CHAQ_PREVIEW_PASSWORD: validPreviewPassword(existing.CHAQ_PREVIEW_PASSWORD)
       ? existing.CHAQ_PREVIEW_PASSWORD
@@ -110,7 +120,10 @@ function writePreviewEnvironment(filePath = previewEnv) {
 }
 
 function main() {
-  const result = writePreviewEnvironment();
+  const showOnly = process.argv.includes("--show-login") && fs.existsSync(previewEnv);
+  const result = showOnly
+    ? { filePath: previewEnv, values: parseEnv(fs.readFileSync(previewEnv, "utf8")) }
+    : writePreviewEnvironment();
   console.log(`[Chaq] Local preview environment: ${result.filePath}`);
   if (process.argv.includes("--show-login")) {
     console.log(`[Chaq] Preview login: ${result.values.CHAQ_PREVIEW_USERNAME} / ${result.values.CHAQ_PREVIEW_PASSWORD}`);

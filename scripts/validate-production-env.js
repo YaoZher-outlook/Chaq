@@ -169,8 +169,8 @@ function validateEnvironment(env, options = {}) {
     }
     warnings.push("Local preview mail delivery writes verification codes to the project API log.");
   } else {
-    if (runtimeProfile === "local-preview") errors.push("Local preview profile is not valid for a formal production environment.");
-    if (mailMode === "log") errors.push("CHAQ_MAIL_MODE=log is not allowed in formal production.");
+    if (runtimeProfile && runtimeProfile !== "standard") errors.push("CHAQ_RUNTIME_PROFILE must be empty or standard in formal production.");
+    if (mailMode) errors.push("CHAQ_MAIL_MODE must be empty in formal production.");
     const smtpHost = required("SMTP_HOST");
     const smtpUser = required("SMTP_USER");
     const smtpPass = required("SMTP_PASS");

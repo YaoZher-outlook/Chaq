@@ -84,14 +84,76 @@ function serviceUsesPort(name, port) {
   return result.stdout.includes(`-p ${port}`);
 }
 
-function runningPostgresPort(pgData) {
+function readPostmasterRecord(pgData) {
   const pidFile = path.join(pgData, "postmaster.pid");
   if (!fs.existsSync(pidFile)) {
     return null;
   }
-  const lines = fs.readFileSync(pidFile, "utf8").split(/\r?\n/);
+  const raw = fs.readFileSync(pidFile, "utf8");
+  const lines = raw.split(/\r?\n/);
+  const pid = Number(lines[0]);
   const port = Number(lines[3]);
-  return Number.isInteger(port) ? port : null;
+  return {
+    pidFile,
+    raw,
+    pid: Number.isInteger(pid) && pid > 0 ? pid : null,
+    port: Number.isInteger(port) && port > 0 ? port : null
+  };
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error && error.code === "ESRCH") return false;
+    // Access denied still means that a process owns the PID. Err on the side of
+    // preserving the file rather than deleting a live server's ownership record.
+    return true;
+  }
+}
+
+function postgresDataDirectoryIsRunning(pgCtl, pgData, spawn = spawnSync) {
+  const result = spawn(pgCtl, ["status", "-D", pgData], {
+    stdio: "pipe",
+    encoding: "utf8",
+    windowsHide: true
+  });
+  if (result.error) throw result.error;
+  return result.status === 0;
+}
+
+function reconcilePostmasterPid(pgData, pgCtl, options = {}) {
+  const record = readPostmasterRecord(pgData);
+  if (!record) return null;
+
+  const pgCtlRunning = (options.postgresDataDirectoryIsRunning || postgresDataDirectoryIsRunning)(
+    pgCtl,
+    pgData,
+    options.spawn || spawnSync
+  );
+  if (pgCtlRunning) {
+    return { ...record, running: true, staleRemoved: false };
+  }
+
+  const pidAlive = (options.processIsAlive || processIsAlive)(record.pid);
+  if (pidAlive) {
+    throw new Error(
+      `PostgreSQL ownership file ${record.pidFile} references live PID ${record.pid}, `
+      + "but pg_ctl does not recognize it. Refusing to remove the file; stop that process or verify the data directory manually."
+    );
+  }
+
+  // Re-read immediately before unlinking so a concurrently starting PostgreSQL
+  // cannot have its freshly written ownership record removed by this process.
+  const latest = fs.existsSync(record.pidFile) ? fs.readFileSync(record.pidFile, "utf8") : null;
+  if (latest !== record.raw) {
+    throw new Error(`PostgreSQL ownership file changed while it was being verified: ${record.pidFile}. Retry startup.`);
+  }
+  fs.rmSync(record.pidFile);
+  console.warn(`[WARN] Removed stale PostgreSQL ownership file after confirming pg_ctl is stopped and PID ${record.pid ?? "unknown"} is not alive: ${record.pidFile}`);
+  return { ...record, running: false, staleRemoved: true };
 }
 
 function canConnect(port, host = "127.0.0.1") {
@@ -110,6 +172,32 @@ function canConnect(port, host = "127.0.0.1") {
   });
 }
 
+function redisPing(port, host = "127.0.0.1", timeoutMs = 1200) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    let settled = false;
+    let response = "";
+    const finish = (ready) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ready);
+    };
+
+    socket.setEncoding("utf8");
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => socket.write("*1\r\n$4\r\nPING\r\n"));
+    socket.on("data", (chunk) => {
+      response += chunk;
+      if (response.startsWith("+PONG\r\n")) finish(true);
+      else if (response.includes("\r\n")) finish(false);
+    });
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+    socket.once("close", () => finish(response.startsWith("+PONG\r\n")));
+  });
+}
+
 async function waitForPort(port, label) {
   for (let index = 0; index < 25; index += 1) {
     if (await canConnect(port)) {
@@ -118,6 +206,14 @@ async function waitForPort(port, label) {
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   throw new Error(`${label} did not open 127.0.0.1:${port} in time.`);
+}
+
+async function waitForRedis(port) {
+  for (let index = 0; index < 25; index += 1) {
+    if (await redisPing(port)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  throw new Error(`Redis did not answer PING on 127.0.0.1:${port} in time. Check Docker Compose logs for the redis service.`);
 }
 
 function postgresExe(pgBin, name) {
@@ -139,7 +235,8 @@ function pathDirectories(environment = process.env, platform = process.platform)
   const raw = platform === "win32"
     ? environment.Path || environment.PATH || ""
     : environment.PATH || "";
-  return String(raw).split(path.delimiter).map((entry) => entry.trim().replace(/^"|"$/g, "")).filter(Boolean);
+  const delimiter = platform === "win32" ? ";" : ":";
+  return String(raw).split(delimiter).map((entry) => entry.trim().replace(/^"|"$/g, "")).filter(Boolean);
 }
 
 function resolvePostgresBin(env, options = {}) {
@@ -186,20 +283,24 @@ async function startPostgres(env) {
     }
   }
 
+  const postmaster = reconcilePostmasterPid(pgData, pgCtl);
+
   const ready = spawnSync(pgIsReady, ["-h", "127.0.0.1", "-p", String(pgPort), "-U", pgUser], {
     encoding: "utf8",
     env: { ...process.env, PGPASSWORD: pgPassword },
     windowsHide: true
   });
   if (ready.status !== 0) {
-    const runningPort = runningPostgresPort(pgData);
+    const runningPort = postmaster?.running ? postmaster.port : null;
     if (runningPort && runningPort !== pgPort) {
       console.warn(`[WARN] PostgreSQL is running from ${pgData} on port ${runningPort}, but Chaq now expects ${pgPort}.`);
       console.warn(`[WARN] Stop the old process with: "${pgCtl}" stop -D "${pgData}" -m fast -w`);
       throw new Error(`PostgreSQL is running on the old port ${runningPort}. Stop it before starting Chaq on ${pgPort}.`);
     }
 
-    if (serviceExists(serviceName) && serviceUsesPort(serviceName, pgPort)) {
+    if (postmaster?.running) {
+      console.log(`[Chaq] PostgreSQL process from ${pgData} is starting on 127.0.0.1:${pgPort}`);
+    } else if (serviceExists(serviceName) && serviceUsesPort(serviceName, pgPort)) {
       console.log(`[Chaq] Starting PostgreSQL Windows service ${serviceName} on 127.0.0.1:${pgPort}`);
       try {
         run("sc.exe", ["start", serviceName]);
@@ -239,17 +340,32 @@ async function startPostgres(env) {
 
 async function startRedis(env) {
   const redisPort = Number(env.CHAQ_REDIS_PORT || new URL(env.REDIS_URL).port || 46379);
-  if (await canConnect(redisPort)) {
-    console.log(`[Chaq] Docker Redis is already reachable on 127.0.0.1:${redisPort}`);
+  if (await redisPing(redisPort)) {
+    console.log(`[Chaq] Docker Redis answered PING on 127.0.0.1:${redisPort}`);
     return;
+  }
+  if (await canConnect(redisPort)) {
+    throw new Error(
+      `Port 127.0.0.1:${redisPort} is occupied, but the listener did not answer Redis PING. `
+      + "Stop the conflicting process or change CHAQ_REDIS_PORT before starting Chaq."
+    );
   }
 
   console.log(`[Chaq] Starting Redis with Docker Compose on 127.0.0.1:${redisPort}`);
   fs.mkdirSync(dockerConfig, { recursive: true });
+  const dockerEnvironment = { DOCKER_CONFIG: process.env.DOCKER_CONFIG || dockerConfig };
+  try {
+    run("docker", ["info"], { capture: true, env: dockerEnvironment });
+  } catch (error) {
+    throw new Error(
+      "Docker engine is unavailable. Start Docker Desktop (or another Docker engine) and wait until it is ready, then retry. "
+      + `Details: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
   run("docker", ["compose", "up", "-d", "redis"], {
-    env: { DOCKER_CONFIG: process.env.DOCKER_CONFIG || dockerConfig }
+    env: dockerEnvironment
   });
-  await waitForPort(redisPort, "Redis");
+  await waitForRedis(redisPort);
 }
 
 async function main() {
@@ -266,4 +382,11 @@ if (require.main === module) {
   });
 }
 
-module.exports = { pathDirectories, postgresBinIsComplete, resolvePostgresBin };
+module.exports = {
+  pathDirectories,
+  postgresBinIsComplete,
+  readPostmasterRecord,
+  reconcilePostmasterPid,
+  redisPing,
+  resolvePostgresBin
+};

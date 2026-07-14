@@ -1,5 +1,7 @@
 # Production Deployment
 
+For local UI review, use `tools\start-preview.bat` instead of this deployment procedure. The preview launcher uses production builds but enforces loopback-only services, log-only verification mail and disabled payments. It cannot be combined with `--public` and is not suitable for Internet exposure. Formal production validation below remains strict and requires SMTP.
+
 ## Required Configuration
 
 Use `.env.production.example` as a template. Required secrets:
